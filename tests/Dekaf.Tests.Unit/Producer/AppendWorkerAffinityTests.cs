@@ -50,8 +50,25 @@ public class AppendWorkerAffinityTests
         return (int)deques.GetType().GetProperty("Count")!.GetValue(deques)!;
     }
 
+    /// <summary>
+    /// Waits until <paramref name="condition"/> becomes true. The accumulator exposes no
+    /// awaitable completion signal at append time (completions are held for delivery), so
+    /// the worker-created batch state must be polled. The wait is bounded only by the test's
+    /// [Timeout] cancellation token, so it tolerates thread-pool starvation on loaded runners
+    /// instead of failing at an arbitrary fixed deadline.
+    /// </summary>
+    private static async Task WaitUntilAsync(Func<bool> condition, CancellationToken cancellationToken)
+    {
+        while (!condition())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await Task.Delay(25, cancellationToken);
+        }
+    }
+
     [Test]
-    public async Task EnqueueAppend_SamePartition_ProcessedSequentially()
+    [Timeout(120_000)]
+    public async Task EnqueueAppend_SamePartition_ProcessedSequentially(CancellationToken cancellationToken)
     {
         // Messages enqueued for the same partition should be appended in FIFO order.
         var options = CreateTestOptions();
@@ -82,11 +99,10 @@ public class AppendWorkerAffinityTests
         var deques = GetPartitionDeques(accumulator);
         var tp = new TopicPartition("test-topic", 0);
 
-        // Poll until workers have processed and created the batch.
-        // Use 30s timeout for slow CI runners (thread pool starvation on single-core).
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (!HasBatchForPartition(deques, tp) && sw.ElapsedMilliseconds < 30_000)
-            await Task.Delay(50);
+        // Wait deterministically for the worker to create the batch, bounded by the test's
+        // [Timeout] cancellation rather than an arbitrary fixed deadline that flakes when the
+        // append workers are thread-pool-starved on loaded runners.
+        await WaitUntilAsync(() => HasBatchForPartition(deques, tp), cancellationToken);
 
         await Assert.That(HasBatchForPartition(deques, tp)).IsTrue();
 
@@ -96,7 +112,8 @@ public class AppendWorkerAffinityTests
     }
 
     [Test]
-    public async Task EnqueueAppend_DifferentPartitions_RoutedToDifferentWorkers()
+    [Timeout(120_000)]
+    public async Task EnqueueAppend_DifferentPartitions_RoutedToDifferentWorkers(CancellationToken cancellationToken)
     {
         // Messages for different partitions should be routed to potentially different
         // worker channels, enabling parallel processing.
@@ -130,26 +147,18 @@ public class AppendWorkerAffinityTests
 
         var deques = GetPartitionDeques(accumulator);
 
-        // Poll until workers have created batches for ALL partitions.
-        // Use 30s timeout for slow CI runners (thread pool starvation on single-core).
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < 30_000)
+        // Wait deterministically until workers have created batches for ALL partitions,
+        // bounded by the test's [Timeout] cancellation rather than an arbitrary fixed deadline
+        // that flakes when the append workers are thread-pool-starved on loaded runners.
+        await WaitUntilAsync(() =>
         {
-            var allReady = true;
             for (var p = 0; p < partitionCount; p++)
             {
                 if (!HasBatchForPartition(deques, new TopicPartition("test-topic", p)))
-                {
-                    allReady = false;
-                    break;
-                }
+                    return false;
             }
-
-            if (allReady)
-                break;
-
-            await Task.Delay(50);
-        }
+            return true;
+        }, cancellationToken);
 
         for (var p = 0; p < partitionCount; p++)
         {

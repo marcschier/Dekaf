@@ -4,7 +4,11 @@ using Dekaf.Consumer;
 using Dekaf.Internal;
 using Dekaf.Producer;
 
-[NotInParallel("DekafMemoryBudget")]
+// Full isolation (keyless NotInParallel): these tests assert exact shares of the
+// process-global DekafMemoryBudget, which every producer/consumer Build() in the suite
+// mutates. A constraint key only serializes the budget classes against each other, not
+// against the hundreds of other tests that construct clients concurrently.
+[NotInParallel]
 public class KafkaConsumerBudgetTests
 {
     [Test]
