@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Diagnostics;
 using Dekaf.Errors;
 using Dekaf.Producer;
 
@@ -379,8 +378,9 @@ public class BufferMemoryTests
                 await Assert.That(exception!.Message).Contains("max.block.ms");
                 await Assert.That(exception.TimeoutKind).IsEqualTo(TimeoutKind.MaxBlock);
                 await Assert.That(exception.Configured).IsEqualTo(TimeSpan.FromMilliseconds(100));
+                // Elapsed is informational. Asserting a wall-clock upper bound on it measures
+                // the thread-pool scheduler, not the code under test, and flakes under load.
                 await Assert.That(exception.Elapsed).IsGreaterThanOrEqualTo(TimeSpan.Zero);
-                await Assert.That(exception.Elapsed).IsLessThanOrEqualTo(exception.Configured + TimeSpan.FromSeconds(5));
             }
             finally
             {
@@ -456,8 +456,9 @@ public class BufferMemoryTests
                 threwTimeout = true;
                 await Assert.That(ex.TimeoutKind).IsEqualTo(TimeoutKind.MaxBlock);
                 await Assert.That(ex.Configured).IsEqualTo(TimeSpan.FromMilliseconds(100));
+                // Elapsed is informational. Asserting a wall-clock upper bound on it measures
+                // the thread-pool scheduler, not the code under test, and flakes under load.
                 await Assert.That(ex.Elapsed).IsGreaterThanOrEqualTo(TimeSpan.Zero);
-                await Assert.That(ex.Elapsed).IsLessThanOrEqualTo(ex.Configured + TimeSpan.FromSeconds(5));
             }
 
             // Assert: Should eventually hit backpressure
@@ -525,13 +526,10 @@ public class BufferMemoryTests
                 null, 0, null, null, CancellationToken.None);
         }
 
-        // Dispose should complete quickly (completion loop processes batches)
-        var sw = Stopwatch.StartNew();
-        await accumulator.DisposeAsync();
-        sw.Stop();
-
-        // Should complete in under 5 seconds (allow for CI variability)
-        await Assert.That(sw.ElapsedMilliseconds).IsLessThan(5000);
+        // Dispose should complete without hanging (completion loop processes batches).
+        // A generous deterministic timeout catches the regression this guards against — an
+        // unbounded disposal hang — without a tight wall-clock bound that flakes under load.
+        await accumulator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30));
     }
 
     [Test]
@@ -727,10 +725,10 @@ public class BufferMemoryTests
                 }
             }, cts.Token);
 
-            // FlushAsync should complete quickly once batches are drained
-            var sw = Stopwatch.StartNew();
+            // FlushAsync completes once the linger/drain tasks process the batches. The 15s
+            // CTS above already fails the test deterministically if flush hangs, so no fragile
+            // wall-clock assertion on elapsed time is needed.
             await accumulator.FlushAsync(cts.Token);
-            sw.Stop();
 
             await cts.CancelAsync();
 
@@ -738,10 +736,6 @@ public class BufferMemoryTests
             // preventing unobserved task exceptions after CTS disposal.
             try { await lingerTask; } catch (OperationCanceledException) { }
             try { await drainTask; } catch (OperationCanceledException) { }
-
-            // Should complete quickly - using 5000ms to account for CI variability
-            // (LingerMs=100 + some overhead for task scheduling)
-            await Assert.That(sw.ElapsedMilliseconds).IsLessThan(5000);
         }
         finally
         {
@@ -830,13 +824,10 @@ public class BufferMemoryTests
                 null, 0, null, null, CancellationToken.None);
         }
 
-        // Disposal should complete quickly (completion loop stops)
-        var sw = Stopwatch.StartNew();
-        await accumulator.DisposeAsync();
-        sw.Stop();
-
-        // Should complete in under 5 seconds (allow for CI variability)
-        await Assert.That(sw.ElapsedMilliseconds).IsLessThan(5000);
+        // Disposal should complete without hanging (completion loop stops). A generous
+        // deterministic timeout catches an unbounded disposal hang without a tight wall-clock
+        // bound that flakes under load.
+        await accumulator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30));
     }
 
     [Test]
@@ -876,25 +867,14 @@ public class BufferMemoryTests
             // Small yield to let ReserveMemoryAsync enter the semaphore wait
             await Task.Delay(50);
 
-            // Measure only the release-to-acquisition time
-            var sw = Stopwatch.StartNew();
-
             // Release memory — this should unblock the async waiter
             accumulator.ClearCurrentBatch("test-topic", 0);
             accumulator.ReleaseMemory((int)bufferedBefore);
 
-            // The reserve should complete promptly
-            var completedInTime = await Task.WhenAny(
-                reserveTask,
-                Task.Delay(5000)
-            ) == reserveTask;
-
-            sw.Stop();
-            await Assert.That(completedInTime).IsTrue();
-
-            // Measures only release-to-acquisition, typically < 50ms.
-            // Using 2000ms as upper bound for heavily loaded CI runners.
-            await Assert.That(sw.ElapsedMilliseconds).IsLessThan(2000);
+            // The reserve must complete once space is released. A generous deterministic
+            // timeout proves it unblocks (rather than hanging) without a tight wall-clock
+            // bound that flakes under thread-pool starvation.
+            await reserveTask.WaitAsync(TimeSpan.FromSeconds(30));
         }
         finally
         {

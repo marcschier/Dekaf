@@ -66,9 +66,14 @@ public class ProducerCancellationTests
                 "test-topic", 0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 pooledKey, pooledValue, null, 0, null, null, CancellationToken.None);
 
-            // Start a background task to drain batches (simulates sender loop)
+            // Start a dedicated background thread to drain batches (simulates sender loop).
+            // A real Thread (not a thread-pool Task) is used deliberately: when this test
+            // runs alongside thousands of others on CI's few cores, thread pool starvation
+            // can stall the post-await continuations of a pooled drain loop, leaving the
+            // batch undrained until the CTS expires. A dedicated thread drains regardless
+            // of pool pressure, making the test deterministic.
             using var cts = new CancellationTokenSource(30000);
-            var drainTask = Task.Factory.StartNew(async () =>
+            var drainThread = new Thread(() =>
             {
                 while (!cts.Token.IsCancellationRequested)
                 {
@@ -81,29 +86,23 @@ public class ProducerCancellationTests
                     }
                     else
                     {
-                        await accumulator.WaitForWakeupAsync(10);
+                        Thread.Sleep(1);
                     }
                 }
-            }, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+            })
+            {
+                IsBackground = true,
+                Name = "test-batch-drainer"
+            };
+            drainThread.Start();
 
-            // Act - FlushAsync completes when the drain task processes the batch.
-            // No timing assertion: on CI with 3000+ parallel tests on 4 cores,
-            // thread pool starvation can delay the continuation of this await by minutes
-            // even though FlushAsync internally completes in milliseconds.
+            // Act - FlushAsync completes once the drain thread processes the batch.
             // The CTS timeout (30s) guards against genuine hangs via OperationCanceledException.
             await accumulator.FlushAsync(cts.Token);
 
-            // Cancel to stop the drain task and await it before CTS is disposed
+            // Stop the drain thread and join it before the CTS is disposed
             await cts.CancelAsync();
-
-            try
-            {
-                await drainTask;
-            }
-            catch (OperationCanceledException)
-            {
-                // Expected — drain task observes the cancellation
-            }
+            drainThread.Join();
         }
         finally
         {
