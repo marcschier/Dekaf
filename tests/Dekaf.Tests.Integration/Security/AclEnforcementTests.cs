@@ -15,7 +15,7 @@ namespace Dekaf.Tests.Integration.Security;
 /// - Operations succeed after ACLs are granted
 /// - Different resource types (topic, group, cluster) enforce ACLs independently
 /// </summary>
-[Category("Security")]
+[Category("Authorization")]
 [NotInParallel("AclKafka")]
 [ClassDataSource<AclKafkaContainer>(Shared = SharedType.PerTestSession)]
 public class AclEnforcementTests(AclKafkaContainer kafka)
@@ -440,17 +440,12 @@ public class AclEnforcementTests(AclKafkaContainer kafka)
             .WithClientId("acl-test-restricted-admin-describe")
             .Build();
 
-        // Act & Assert: describing topic without DESCRIBE permission should fail
-        var exception = await Assert.ThrowsAsync<KafkaException>(async () =>
-        {
-            await restrictedAdmin.DescribeTopicsAsync([topic]);
-        });
+        // Act & Assert: describing a topic without DESCRIBE permission reports the per-topic
+        // authorization failure on the description rather than failing the whole batch.
+        var descriptions = await restrictedAdmin.DescribeTopicsAsync([topic]);
 
-        await Assert.That(exception).IsNotNull();
-        await Assert.That(
-            exception is AuthorizationException ||
-            exception.ErrorCode == Dekaf.Protocol.ErrorCode.TopicAuthorizationFailed
-        ).IsTrue();
+        await Assert.That(descriptions.TryGetValue(topic, out var description)).IsTrue();
+        await Assert.That(description!.ErrorCode).IsEqualTo(Dekaf.Protocol.ErrorCode.TopicAuthorizationFailed);
     }
 
     #endregion

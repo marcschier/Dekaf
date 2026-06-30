@@ -51,9 +51,10 @@ if (!skipIntegrationTests)
         ["MultiInFlightProducer"] = () => builder.Services.AddModule<RunMultiInFlightProducerIntegrationTestsModule>(),
         ["Offsets"] = () => builder.Services.AddModule<RunOffsetsIntegrationTestsModule>(),
         ["Producer"] = () => builder.Services.AddModule<RunProducerIntegrationTestsModule>(),
+        ["Authorization"] = () => builder.Services.AddModule<RunAuthorizationIntegrationTestsModule>(),
         ["Resilience"] = () => builder.Services.AddModule<RunResilienceIntegrationTestsModule>(),
-        ["Security"] = () => builder.Services.AddModule<RunSecurityIntegrationTestsModule>(),
         ["Serialization"] = () => builder.Services.AddModule<RunSerializationIntegrationTestsModule>(),
+        ["Tls"] = () => builder.Services.AddModule<RunTlsIntegrationTestsModule>(),
         ["Transaction"] = () => builder.Services.AddModule<RunTransactionIntegrationTestsModule>(),
     };
 

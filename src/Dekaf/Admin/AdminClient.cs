@@ -273,20 +273,15 @@ public sealed class AdminClient : IAdminClient
                 continue;
             }
 
-            // Surface per-topic errors (e.g. TopicAuthorizationFailed when DESCRIBE is denied)
-            // instead of silently returning a topic with no partition data.
-            if (topic.ErrorCode != Protocol.ErrorCode.None)
-            {
-                throw KafkaException.FromErrorCode(topic.ErrorCode,
-                    $"Failed to describe topic '{name}': {topic.ErrorCode}");
-            }
-
+            // Report per-topic errors (e.g. TopicAuthorizationFailed when DESCRIBE is denied) on the
+            // description rather than throwing, so one inaccessible topic does not fail the whole batch.
             result[name] = new TopicDescription
             {
                 Name = topic.Name,
                 TopicId = topic.TopicId,
                 IsInternal = topic.IsInternal,
-                Partitions = topic.Partitions
+                Partitions = topic.Partitions,
+                ErrorCode = topic.ErrorCode
             };
         }
 
