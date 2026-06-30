@@ -66,7 +66,7 @@ public class NetworkPartitionKafkaContainer : KafkaTestContainer
 
     private DockerClient GetDockerClient()
     {
-        _dockerClient ??= new DockerClientConfiguration().CreateClient();
+        _dockerClient ??= new DockerClientBuilder().Build();
         return _dockerClient;
     }
 
