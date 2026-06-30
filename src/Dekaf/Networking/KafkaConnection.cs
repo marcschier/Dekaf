@@ -9,6 +9,7 @@ using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks.Sources;
+using Dekaf.Errors;
 using Dekaf.Internal;
 using Dekaf.Protocol;
 using Dekaf.Protocol.Messages;
@@ -1505,7 +1506,10 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
             var authBytes = authenticator.GetInitialResponse();
 
-            while (!authenticator.IsComplete)
+            // Always send the initial client response at least once. Single-round mechanisms
+            // (PLAIN, OAUTHBEARER) mark themselves complete in GetInitialResponse, so gating
+            // the send on !IsComplete would skip transmitting credentials entirely.
+            do
             {
                 var authResponse = await SendSaslMessageAsync<SaslAuthenticateRequest, SaslAuthenticateResponse>(
                     new SaslAuthenticateRequest { AuthBytes = authBytes },
@@ -1533,6 +1537,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
                 authBytes = response;
             }
+            while (!authenticator.IsComplete);
         }
         finally
         {
@@ -1715,7 +1720,8 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
             var authBytes = authenticator.GetInitialResponse();
 
-            while (!authenticator.IsComplete)
+            // Always send the initial client response at least once (see PerformSaslExchangeAsync).
+            do
             {
                 var authResponse = await SendAsync<SaslAuthenticateRequest, SaslAuthenticateResponse>(
                     new SaslAuthenticateRequest { AuthBytes = authBytes },
@@ -1742,6 +1748,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
                 authBytes = response;
             }
+            while (!authenticator.IsComplete);
         }
         finally
         {
