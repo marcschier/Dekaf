@@ -1620,28 +1620,24 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
                 return;
             }
 
-            var classification = TransactionErrorClassifier.Classify(response.ErrorCode, _currentTransactionUsesTV2);
+            // Fatal or abortable errors transition state and throw the matching typed exception;
+            // this returns only for retriable errors, which are handled with backoff below.
+            ThrowIfNonRetriableTransactionError(response.ErrorCode,
+                $"EndTxn ({(committed ? "commit" : "abort")})", _currentTransactionUsesTV2);
 
-            if (classification == TransactionErrorClassification.Retriable)
+            if (response.ErrorCode == ErrorCode.NotCoordinator)
             {
-                if (response.ErrorCode == ErrorCode.NotCoordinator)
-                {
-                    LogEndTxnNotCoordinator(attempt + 1, maxRetries);
-                    await Task.Delay(retryDelayMs, cancellationToken).ConfigureAwait(false);
-                    retryDelayMs = Math.Min(retryDelayMs * 2, 2000);
-                    await FindTransactionCoordinatorAsync(cancellationToken).ConfigureAwait(false);
-                    continue;
-                }
-
-                LogEndTxnRetriableError(response.ErrorCode, attempt + 1, maxRetries, retryDelayMs);
+                LogEndTxnNotCoordinator(attempt + 1, maxRetries);
                 await Task.Delay(retryDelayMs, cancellationToken).ConfigureAwait(false);
                 retryDelayMs = Math.Min(retryDelayMs * 2, 2000);
+                await FindTransactionCoordinatorAsync(cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
-            // Fatal or abortable: transition state and throw the matching typed exception.
-            ThrowIfNonRetriableTransactionError(response.ErrorCode,
-                $"EndTxn ({(committed ? "commit" : "abort")})", _currentTransactionUsesTV2);
+            LogEndTxnRetriableError(response.ErrorCode, attempt + 1, maxRetries, retryDelayMs);
+            await Task.Delay(retryDelayMs, cancellationToken).ConfigureAwait(false);
+            retryDelayMs = Math.Min(retryDelayMs * 2, 2000);
+            continue;
         }
 
         throw new TransactionException(ErrorCode.CoordinatorLoadInProgress,
@@ -3208,17 +3204,25 @@ internal sealed class Transaction<TKey, TValue> : ITransaction<TKey, TValue>
         }
         finally
         {
-            lock (_producer._partitionsInTransactionLock)
-            {
-                _producer._partitionsInTransaction.Clear();
-            }
+            FinalizeTransactionState();
+        }
+    }
 
-            // Preserve an error state set while ending the transaction (fail-fast relies on it);
-            // otherwise return to Ready for the next transaction.
-            if (_producer._transactionState is not (TransactionState.AbortableError or TransactionState.FatalError))
-            {
-                _producer._transactionState = TransactionState.Ready;
-            }
+    /// <summary>
+    /// Clears the transaction's partition set and returns the producer to
+    /// <see cref="TransactionState.Ready"/> for the next transaction — unless ending the transaction
+    /// left it in an error state, which the fail-fast produce guard relies on being preserved.
+    /// </summary>
+    private void FinalizeTransactionState()
+    {
+        lock (_producer._partitionsInTransactionLock)
+        {
+            _producer._partitionsInTransaction.Clear();
+        }
+
+        if (_producer._transactionState is not (TransactionState.AbortableError or TransactionState.FatalError))
+        {
+            _producer._transactionState = TransactionState.Ready;
         }
     }
 
@@ -3247,17 +3251,7 @@ internal sealed class Transaction<TKey, TValue> : ITransaction<TKey, TValue>
         }
         finally
         {
-            lock (_producer._partitionsInTransactionLock)
-            {
-                _producer._partitionsInTransaction.Clear();
-            }
-
-            // A successful abort clears the abortable state; only leave the producer non-Ready if
-            // ending the transaction itself failed fatally/abortably.
-            if (_producer._transactionState is not (TransactionState.AbortableError or TransactionState.FatalError))
-            {
-                _producer._transactionState = TransactionState.Ready;
-            }
+            FinalizeTransactionState();
         }
     }
 
