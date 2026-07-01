@@ -848,6 +848,14 @@ public sealed partial class MetadataManager : IAsyncDisposable
             {
                 break;
             }
+            catch (Exception ex) when (IsFatalMetadataError(ex))
+            {
+                // Credentials or authorization changed mid-session: retrying forever would mask the
+                // failure. Stop the background loop; the next foreground metadata operation will
+                // surface the fatal exception to the caller.
+                LogBackgroundMetadataRefreshFatal(ex);
+                break;
+            }
             catch (Exception ex)
             {
                 consecutiveFailures++;
@@ -942,6 +950,9 @@ public sealed partial class MetadataManager : IAsyncDisposable
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Background metadata refresh failed (attempt {Attempt}), continuing with existing metadata")]
     private partial void LogBackgroundMetadataRefreshFailed(Exception exception, int attempt);
+
+    [LoggerMessage(Level = LogLevel.Error, Message = "Background metadata refresh hit a fatal authentication/authorization error; stopping background refresh (foreground operations will surface it)")]
+    private partial void LogBackgroundMetadataRefreshFatal(Exception exception);
 
     [LoggerMessage(Level = LogLevel.Trace, Message = "Metadata cache hit for {Topic}-{Partition}")]
     private partial void LogMetadataCacheHit(string topic, int partition);

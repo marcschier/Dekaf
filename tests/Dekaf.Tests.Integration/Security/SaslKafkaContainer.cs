@@ -80,18 +80,7 @@ public class SaslKafkaContainer : KafkaTestContainer
     {
         await WaitForAdminReadyAsync("SASL/PLAIN").ConfigureAwait(false);
         await CreateScramCredentialsAsync(SaslUsername, SaslPassword).ConfigureAwait(false);
-        await WaitForAdminReadyAsync("SCRAM-SHA-256", () => CreateScramAdminClient(ScramMechanism.ScramSha256)).ConfigureAwait(false);
-        await WaitForAdminReadyAsync("SCRAM-SHA-512", () => CreateScramAdminClient(ScramMechanism.ScramSha512)).ConfigureAwait(false);
-    }
-
-    private IAdminClient CreateScramAdminClient(ScramMechanism mechanism)
-    {
-        var builder = Kafka.CreateAdminClient()
-            .WithBootstrapServers(BootstrapServers)
-            .WithLoggerFactory(GlobalTestSetup.GetLoggerFactory());
-        builder = mechanism == ScramMechanism.ScramSha256
-            ? builder.WithSaslScramSha256(SaslUsername, SaslPassword)
-            : builder.WithSaslScramSha512(SaslUsername, SaslPassword);
-        return builder.Build();
+        await WaitForAdminReadyAsync("SCRAM-SHA-256", () => CreateScramAdminClient(ScramMechanism.ScramSha256, SaslUsername, SaslPassword)).ConfigureAwait(false);
+        await WaitForAdminReadyAsync("SCRAM-SHA-512", () => CreateScramAdminClient(ScramMechanism.ScramSha512, SaslUsername, SaslPassword)).ConfigureAwait(false);
     }
 }

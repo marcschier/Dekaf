@@ -107,21 +107,13 @@ public class SaslSslKafkaContainer : KafkaTestContainer
     {
         await WaitForAdminReadyAsync("SASL_SSL/PLAIN").ConfigureAwait(false);
         await CreateScramCredentialsAsync(SaslUsername, SaslPassword).ConfigureAwait(false);
-        await WaitForAdminReadyAsync("SASL_SSL/SCRAM-SHA-256", () => CreateScramAdminClient(ScramMechanism.ScramSha256)).ConfigureAwait(false);
-        await WaitForAdminReadyAsync("SASL_SSL/SCRAM-SHA-512", () => CreateScramAdminClient(ScramMechanism.ScramSha512)).ConfigureAwait(false);
+        await WaitForAdminReadyAsync("SASL_SSL/SCRAM-SHA-256", () => CreateScramAdminClient(ScramMechanism.ScramSha256, SaslUsername, SaslPassword)).ConfigureAwait(false);
+        await WaitForAdminReadyAsync("SASL_SSL/SCRAM-SHA-512", () => CreateScramAdminClient(ScramMechanism.ScramSha512, SaslUsername, SaslPassword)).ConfigureAwait(false);
     }
 
-    private IAdminClient CreateScramAdminClient(ScramMechanism mechanism)
-    {
-        var builder = Kafka.CreateAdminClient()
-            .WithBootstrapServers(BootstrapServers)
-            .UseTls(DefaultTlsConfig)
-            .WithLoggerFactory(GlobalTestSetup.GetLoggerFactory());
-        builder = mechanism == ScramMechanism.ScramSha256
-            ? builder.WithSaslScramSha256(SaslUsername, SaslPassword)
-            : builder.WithSaslScramSha512(SaslUsername, SaslPassword);
-        return builder.Build();
-    }
+    /// <summary>Admin clients built by the base class connect over TLS.</summary>
+    protected override AdminClientBuilder ApplyTransportSecurity(AdminClientBuilder builder) =>
+        builder.UseTls(DefaultTlsConfig);
 
     public override async ValueTask DisposeAsync()
     {

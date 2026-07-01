@@ -256,6 +256,27 @@ public abstract class KafkaTestContainer : IAsyncInitializer, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Hook for subclasses to apply transport security (e.g. TLS) to admin clients the base class
+    /// builds. The default applies none.
+    /// </summary>
+    protected virtual AdminClientBuilder ApplyTransportSecurity(AdminClientBuilder builder) => builder;
+
+    /// <summary>
+    /// Builds an admin client authenticated with the given SCRAM mechanism, used to verify SCRAM
+    /// credentials have propagated after <see cref="CreateScramCredentialsAsync"/>.
+    /// </summary>
+    protected IAdminClient CreateScramAdminClient(ScramMechanism mechanism, string user, string password)
+    {
+        var builder = ApplyTransportSecurity(Kafka.CreateAdminClient()
+            .WithBootstrapServers(BootstrapServers)
+            .WithLoggerFactory(GlobalTestSetup.GetLoggerFactory()));
+        builder = mechanism == ScramMechanism.ScramSha256
+            ? builder.WithSaslScramSha256(user, password)
+            : builder.WithSaslScramSha512(user, password);
+        return builder.Build();
+    }
+
     private async Task<string> TryGetBrokerLogTailAsync()
     {
         if (_container is null)

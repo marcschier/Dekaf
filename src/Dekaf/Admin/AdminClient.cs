@@ -2238,7 +2238,7 @@ public sealed class AdminClientBuilder
     public AdminClientBuilder WithGssapi(GssapiConfig config)
     {
         _saslMechanism = SaslMechanism.Gssapi;
-        _gssapiConfig = config;
+        _gssapiConfig = config ?? throw new ArgumentNullException(nameof(config));
         return this;
     }
 
@@ -2249,7 +2249,8 @@ public sealed class AdminClientBuilder
     public AdminClientBuilder WithOAuthBearer(OAuthBearerConfig config)
     {
         _saslMechanism = SaslMechanism.OAuthBearer;
-        _oauthConfig = config;
+        _oauthConfig = config ?? throw new ArgumentNullException(nameof(config));
+        _oauthTokenProvider = null;
         return this;
     }
 
@@ -2260,7 +2261,8 @@ public sealed class AdminClientBuilder
     public AdminClientBuilder WithOAuthBearer(Func<CancellationToken, ValueTask<OAuthBearerToken>> tokenProvider)
     {
         _saslMechanism = SaslMechanism.OAuthBearer;
-        _oauthTokenProvider = tokenProvider;
+        _oauthTokenProvider = tokenProvider ?? throw new ArgumentNullException(nameof(tokenProvider));
+        _oauthConfig = null;
         return this;
     }
 

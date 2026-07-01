@@ -339,9 +339,13 @@ public sealed partial class KafkaConnection : IKafkaConnection
             }
             catch (System.Security.Authentication.AuthenticationException ex)
             {
-                // A rejected certificate is a fatal authentication failure, not a transient network
-                // error. Surface it as a KafkaException (AuthenticationException) so callers can catch
-                // it and metadata refresh treats it as fatal rather than masking it.
+                // TLS handshake failures surface here — primarily a rejected certificate, but .NET
+                // also throws this type for negotiation/protocol mismatches. We deliberately treat
+                // them all as fatal: TLS configuration is cluster-wide, so the same failure would
+                // recur on every broker, and trying the rest only delays surfacing the real cause.
+                // Wrap as a Dekaf AuthenticationException (a KafkaException) so callers can catch it
+                // and metadata refresh treats it as fatal instead of masking it behind a generic
+                // "failed to refresh metadata" error.
                 await sslStream.DisposeAsync().ConfigureAwait(false);
                 throw new AuthenticationException($"TLS handshake failed: {ex.Message}", ex);
             }

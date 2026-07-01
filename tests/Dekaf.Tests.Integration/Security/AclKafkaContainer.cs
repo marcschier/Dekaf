@@ -54,9 +54,12 @@ public class AclKafkaContainer : KafkaTestContainer
             // Enable StandardAuthorizer for KRaft mode
             .WithEnvironment("KAFKA_AUTHORIZER_CLASS_NAME",
                 "org.apache.kafka.metadata.authorizer.StandardAuthorizer")
-            // Admin is a super user - bypasses all ACL checks. ANONYMOUS is also a super user so
-            // the PLAINTEXT controller listener's internal requests are authorized; the external
-            // SASL listener still authenticates real users, so ACLs on testuser are enforced.
+            // Admin is a super user - bypasses all ACL checks. ANONYMOUS is also a super user so the
+            // PLAINTEXT controller listener's internal requests are authorized. KAFKA_SUPER_USERS is
+            // cluster-wide, so this is only safe because every CLIENT-reachable listener requires
+            // real authentication (the external listener is SASL_PLAINTEXT; the PLAINTEXT listeners
+            // are internal broker/controller only). If a future change exposes an anonymous client
+            // listener, the ACL assertions below would silently stop enforcing — keep that invariant.
             .WithEnvironment("KAFKA_SUPER_USERS", "User:admin;User:ANONYMOUS")
             // Deny access by default when no ACLs match
             .WithEnvironment("KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND", "false")
