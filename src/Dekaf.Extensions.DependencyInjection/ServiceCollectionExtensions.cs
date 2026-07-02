@@ -12,6 +12,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using System.Globalization;
+using System.Xml;
 
 namespace Dekaf.Extensions.DependencyInjection;
 
@@ -565,8 +567,17 @@ internal static class DekafConfigurationBinding
             builder.WithOffsetCommitMode(offsetCommitMode);
         if (TryGetValue<int>(configuration, nameof(ConsumerOptions.AutoCommitIntervalMs), out var autoCommitIntervalMs))
             builder.WithAutoCommitInterval(TimeSpan.FromMilliseconds(autoCommitIntervalMs));
-        if (TryGetValue<AutoOffsetReset>(configuration, nameof(ConsumerOptions.AutoOffsetReset), out var autoOffsetReset))
-            builder.WithAutoOffsetReset(autoOffsetReset);
+        if (TryGetAutoOffsetReset(configuration, out var autoOffsetReset, out var autoOffsetResetDuration))
+        {
+            if (autoOffsetReset == AutoOffsetReset.ByDuration)
+            {
+                builder.WithAutoOffsetResetByDuration(autoOffsetResetDuration!.Value);
+            }
+            else
+            {
+                builder.WithAutoOffsetReset(autoOffsetReset);
+            }
+        }
         if (TryGetValue<int>(configuration, nameof(ConsumerOptions.FetchMinBytes), out var fetchMinBytes))
             builder.WithFetchMinBytes(fetchMinBytes);
         if (TryGetValue<int>(configuration, nameof(ConsumerOptions.FetchMaxBytes), out var fetchMaxBytes))
@@ -766,6 +777,115 @@ internal static class DekafConfigurationBinding
         }
 
         value = bound;
+        return true;
+    }
+
+    private static bool TryGetAutoOffsetReset(
+        IConfiguration configuration,
+        out AutoOffsetReset autoOffsetReset,
+        out TimeSpan? duration)
+    {
+        duration = null;
+
+        var section = configuration.GetSection(nameof(ConsumerOptions.AutoOffsetReset));
+        if (!section.Exists())
+        {
+            autoOffsetReset = default;
+            return false;
+        }
+
+        var rawValue = section.Value;
+        if (rawValue is not null &&
+            rawValue.StartsWith("by_duration:", StringComparison.OrdinalIgnoreCase))
+        {
+            autoOffsetReset = AutoOffsetReset.ByDuration;
+            duration = ParseDuration(
+                rawValue["by_duration:".Length..],
+                nameof(ConsumerOptions.AutoOffsetReset));
+            return true;
+        }
+
+        if (rawValue is not null &&
+            Enum.TryParse<AutoOffsetReset>(rawValue, ignoreCase: true, out var parsed))
+        {
+            autoOffsetReset = parsed;
+        }
+        else
+        {
+            autoOffsetReset = section.Get<AutoOffsetReset>();
+        }
+
+        if (autoOffsetReset == AutoOffsetReset.ByDuration)
+        {
+            var durationSection = configuration.GetSection(nameof(ConsumerOptions.AutoOffsetResetDuration));
+            if (!durationSection.Exists())
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(ConsumerOptions.AutoOffsetResetDuration)} is required when {nameof(ConsumerOptions.AutoOffsetReset)} is {nameof(AutoOffsetReset.ByDuration)}.");
+            }
+
+            duration = ParseDuration(durationSection.Value, nameof(ConsumerOptions.AutoOffsetResetDuration));
+        }
+
+        return true;
+    }
+
+    private static TimeSpan ParseDuration(string? value, string key)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new InvalidOperationException($"{key} must specify a duration.");
+        }
+
+        value = value.Trim();
+        if (TryParseHoursMinutesSeconds(value, out var hoursMinutesSeconds))
+        {
+            AutoOffsetResetStrategy.ValidateDuration(hoursMinutesSeconds);
+            return hoursMinutesSeconds;
+        }
+
+        if (TimeSpan.TryParse(value, CultureInfo.InvariantCulture, out var timeSpan))
+        {
+            AutoOffsetResetStrategy.ValidateDuration(timeSpan);
+            return timeSpan;
+        }
+
+        try
+        {
+            var duration = XmlConvert.ToTimeSpan(value);
+            AutoOffsetResetStrategy.ValidateDuration(duration);
+            return duration;
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidOperationException(
+                $"{key} must be a TimeSpan or ISO-8601 duration such as 'PT24H'.",
+                ex);
+        }
+    }
+
+    private static bool TryParseHoursMinutesSeconds(string value, out TimeSpan duration)
+    {
+        duration = default;
+
+        var parts = value.Split(':');
+        if (parts.Length != 3 ||
+            parts[0].Contains('.', StringComparison.Ordinal) ||
+            parts[0].Contains(',', StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var hours) ||
+            !int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var minutes) ||
+            !int.TryParse(parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out var seconds) ||
+            (uint)minutes > 59 ||
+            (uint)seconds > 59)
+        {
+            return false;
+        }
+
+        duration = new TimeSpan(hours, minutes, seconds);
         return true;
     }
 }

@@ -141,6 +141,43 @@ public class ConsumerBuilderValidationTests
     }
 
     [Test]
+    public async Task WithAutoOffsetResetByDuration_ReturnsSameBuilder()
+    {
+        var builder = Kafka.CreateConsumer<string, string>();
+        var result = builder.WithAutoOffsetResetByDuration(TimeSpan.FromHours(24));
+        await Assert.That(result).IsSameReferenceAs(builder);
+    }
+
+    [Test]
+    public async Task WithAutoOffsetResetByDuration_SetsOptions()
+    {
+        await using var consumer = Kafka.CreateConsumer<string, string>()
+            .WithBootstrapServers("localhost:9092")
+            .WithAutoOffsetResetByDuration(TimeSpan.FromHours(24))
+            .Build();
+
+        var options = GetConsumerOptions(consumer);
+        await Assert.That(options.AutoOffsetReset).IsEqualTo(AutoOffsetReset.ByDuration);
+        await Assert.That(options.AutoOffsetResetDuration).IsEqualTo(TimeSpan.FromHours(24));
+    }
+
+    [Test]
+    public async Task WithAutoOffsetReset_ByDuration_ThrowsArgumentException()
+    {
+        var builder = Kafka.CreateConsumer<string, string>();
+        await Assert.That(() => builder.WithAutoOffsetReset(AutoOffsetReset.ByDuration))
+            .Throws<ArgumentException>();
+    }
+
+    [Test]
+    public async Task WithAutoOffsetResetByDuration_NegativeDuration_ThrowsArgumentOutOfRangeException()
+    {
+        var builder = Kafka.CreateConsumer<string, string>();
+        await Assert.That(() => builder.WithAutoOffsetResetByDuration(TimeSpan.FromSeconds(-1)))
+            .Throws<ArgumentOutOfRangeException>();
+    }
+
+    [Test]
     public async Task WithMaxPollRecords_ReturnsSameBuilder()
     {
         var builder = Kafka.CreateConsumer<string, string>();

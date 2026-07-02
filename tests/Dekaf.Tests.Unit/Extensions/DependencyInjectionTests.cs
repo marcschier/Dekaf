@@ -540,6 +540,72 @@ public class DependencyInjectionTests
     }
 
     [Test]
+    public async Task AddConsumer_WithByDurationAutoOffsetReset_BindsIsoDuration()
+    {
+        var services = new ServiceCollection();
+        var configuration = BuildConfiguration(new Dictionary<string, string?>
+        {
+            ["Kafka:Consumers:Orders:BootstrapServers:0"] = "broker1:9092",
+            ["Kafka:Consumers:Orders:AutoOffsetReset"] = "by_duration:PT24H"
+        });
+
+        services.AddDekaf(builder =>
+        {
+            builder.AddConsumer<string, string>(configuration.GetSection("Kafka:Consumers:Orders"));
+        });
+
+        var provider = services.BuildServiceProvider();
+        var consumer = provider.GetRequiredService<IKafkaConsumer<string, string>>();
+        var options = GetConsumerOptions(consumer);
+
+        await Assert.That(options.AutoOffsetReset).IsEqualTo(AutoOffsetReset.ByDuration);
+        await Assert.That(options.AutoOffsetResetDuration).IsEqualTo(TimeSpan.FromHours(24));
+    }
+
+    [Test]
+    public async Task AddConsumer_WithByDurationAutoOffsetReset_BindsSplitDuration()
+    {
+        var services = new ServiceCollection();
+        var configuration = BuildConfiguration(new Dictionary<string, string?>
+        {
+            ["Kafka:Consumers:Orders:BootstrapServers:0"] = "broker1:9092",
+            ["Kafka:Consumers:Orders:AutoOffsetReset"] = "ByDuration",
+            ["Kafka:Consumers:Orders:AutoOffsetResetDuration"] = "24:00:00"
+        });
+
+        services.AddDekaf(builder =>
+        {
+            builder.AddConsumer<string, string>(configuration.GetSection("Kafka:Consumers:Orders"));
+        });
+
+        var provider = services.BuildServiceProvider();
+        var consumer = provider.GetRequiredService<IKafkaConsumer<string, string>>();
+        var options = GetConsumerOptions(consumer);
+
+        await Assert.That(options.AutoOffsetReset).IsEqualTo(AutoOffsetReset.ByDuration);
+        await Assert.That(options.AutoOffsetResetDuration).IsEqualTo(TimeSpan.FromHours(24));
+    }
+
+    [Test]
+    public async Task AddConsumer_WithByDurationAutoOffsetResetWithoutDuration_ThrowsInvalidOperationException()
+    {
+        var services = new ServiceCollection();
+        var configuration = BuildConfiguration(new Dictionary<string, string?>
+        {
+            ["Kafka:Consumers:Orders:BootstrapServers:0"] = "broker1:9092",
+            ["Kafka:Consumers:Orders:AutoOffsetReset"] = "ByDuration"
+        });
+
+        void Act() => services.AddDekaf(builder =>
+        {
+            builder.AddConsumer<string, string>(configuration.GetSection("Kafka:Consumers:Orders"));
+        });
+
+        await Assert.That(Act).Throws<InvalidOperationException>()
+            .WithMessageContaining("AutoOffsetResetDuration is required");
+    }
+
+    [Test]
     public async Task AddAdminClient_WithConfigurationSection_BindsConfiguredOptions()
     {
         var services = new ServiceCollection();

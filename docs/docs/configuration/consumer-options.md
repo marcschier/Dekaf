@@ -82,6 +82,7 @@ Configuration is applied before the optional fluent callback, so fluent calls ca
 | `WithOffsetCommitMode(...)` | `OffsetCommitMode` | `Auto` or `Manual` |
 | `WithAutoCommitInterval(...)` | `AutoCommitIntervalMs` | Milliseconds |
 | `WithAutoOffsetReset(...)` | `AutoOffsetReset` | `Latest`, `Earliest`, `None` |
+| `WithAutoOffsetResetByDuration(...)` | `AutoOffsetReset`, `AutoOffsetResetDuration` | Use `AutoOffsetReset: ByDuration` plus a duration, or Kafka-style `by_duration:PT24H` |
 | `WithFetchMinBytes(...)` | `FetchMinBytes` | Bytes |
 | `WithFetchMaxBytes(...)` | `FetchMaxBytes` | Bytes |
 | `WithMaxPartitionFetchBytes(...)` | `MaxPartitionFetchBytes` | Bytes |
@@ -171,6 +172,24 @@ Where to start when no committed offset exists:
 .WithAutoOffsetReset(AutoOffsetReset.Latest)    // New messages only (default)
 .WithAutoOffsetReset(AutoOffsetReset.Earliest)  // From beginning
 .WithAutoOffsetReset(AutoOffsetReset.None)      // Throw exception
+.WithAutoOffsetResetByDuration(TimeSpan.FromHours(24))
+```
+
+Configuration can use either a separate duration value:
+
+```json
+{
+  "AutoOffsetReset": "ByDuration",
+  "AutoOffsetResetDuration": "24:00:00"
+}
+```
+
+or Kafka's ISO-8601 form:
+
+```json
+{
+  "AutoOffsetReset": "by_duration:PT24H"
+}
 ```
 
 ## Fetch Settings
@@ -295,7 +314,7 @@ For transactional reads:
 | `WithGroupInstanceId` | null | Static membership ID |
 | `WithOffsetCommitMode` | Auto | Offset management mode |
 | `WithAutoCommitInterval` | 5000ms | Auto-commit interval |
-| `WithAutoOffsetReset` | Latest | Start position |
+| `WithAutoOffsetReset`, `WithAutoOffsetResetByDuration` | Latest | Start position |
 | `WithFetchMinBytes` | 1 | Minimum fetch bytes |
 | `WithFetchMaxBytes` | 52428800 | Maximum total fetch bytes |
 | `WithMaxPartitionFetchBytes` | 1048576 | Maximum fetch bytes per partition |

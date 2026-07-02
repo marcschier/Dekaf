@@ -910,6 +910,7 @@ public sealed class ConsumerBuilder<TKey, TValue>
     private OffsetCommitMode _offsetCommitMode = OffsetCommitMode.Auto;
     private int _autoCommitIntervalMs = 5000;
     private AutoOffsetReset _autoOffsetReset = AutoOffsetReset.Latest;
+    private TimeSpan? _autoOffsetResetDuration;
     private int _fetchMinBytes = 1;
     private int _fetchMaxBytes = 52428800;
     private int _maxPartitionFetchBytes = 1048576;
@@ -1049,7 +1050,23 @@ public sealed class ConsumerBuilder<TKey, TValue>
 
     public ConsumerBuilder<TKey, TValue> WithAutoOffsetReset(AutoOffsetReset autoOffsetReset)
     {
+        if (autoOffsetReset == AutoOffsetReset.ByDuration)
+        {
+            throw new ArgumentException(
+                "Use WithAutoOffsetResetByDuration(TimeSpan) to configure duration-based offset reset.",
+                nameof(autoOffsetReset));
+        }
+
         _autoOffsetReset = autoOffsetReset;
+        _autoOffsetResetDuration = null;
+        return this;
+    }
+
+    public ConsumerBuilder<TKey, TValue> WithAutoOffsetResetByDuration(TimeSpan duration)
+    {
+        AutoOffsetResetStrategy.ValidateDuration(duration);
+        _autoOffsetReset = AutoOffsetReset.ByDuration;
+        _autoOffsetResetDuration = duration;
         return this;
     }
 
@@ -1701,6 +1718,7 @@ public sealed class ConsumerBuilder<TKey, TValue>
             OffsetCommitMode = _offsetCommitMode,
             AutoCommitIntervalMs = _autoCommitIntervalMs,
             AutoOffsetReset = _autoOffsetReset,
+            AutoOffsetResetDuration = _autoOffsetResetDuration,
             FetchMinBytes = _fetchMinBytes,
             FetchMaxBytes = _fetchMaxBytes,
             MaxPartitionFetchBytes = _maxPartitionFetchBytes,
