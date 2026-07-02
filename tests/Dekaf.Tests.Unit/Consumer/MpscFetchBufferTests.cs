@@ -1,7 +1,8 @@
 using System.Collections.Concurrent;
-using System.Diagnostics;
+using System.Reflection;
 using Dekaf.Consumer;
 using Dekaf.Protocol.Records;
+using Dekaf.Tests.Unit;
 
 namespace Dekaf.Tests.Unit.Consumer;
 
@@ -15,18 +16,6 @@ public class MpscFetchBufferTests
     private static PendingFetchData CreateDummy(string topic = "test-topic", int partition = 0)
     {
         return PendingFetchData.Create(topic, partition, Array.Empty<RecordBatch>());
-    }
-
-    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
-    {
-        var stopwatch = Stopwatch.StartNew();
-        while (!condition())
-        {
-            if (stopwatch.Elapsed >= timeout)
-                throw new TimeoutException("Condition was not reached before the timeout.");
-
-            await Task.Delay(10);
-        }
     }
 
     #region TryWrite / TryRead basic operations
@@ -124,11 +113,12 @@ public class MpscFetchBufferTests
         var waiter1 = buffer.WaitToWriteAsync(cts.Token).AsTask();
         var waiter2 = buffer.WaitToWriteAsync(cts.Token).AsTask();
 
-        await WaitUntilAsync(() => buffer.ProducerWaiterCount == 2, TimeSpan.FromSeconds(10));
+        await TestWait.UntilAsync(() => buffer.ProducerWaiterCount == 2, TimeSpan.FromSeconds(10));
 
         await Assert.That(buffer.TryRead(out var readFirst)).IsTrue();
         readFirst!.Dispose();
 
+        // First read frees one slot -> exactly one waiter is released.
         var firstReleased = await Task.WhenAny(waiter1, waiter2).WaitAsync(cts.Token);
         await Assert.That(firstReleased.IsCompletedSuccessfully).IsTrue();
         var completedWaiterCount =
@@ -141,7 +131,43 @@ public class MpscFetchBufferTests
         await Assert.That(buffer.TryRead(out var readSecond)).IsTrue();
         readSecond!.Dispose();
 
+        // Second read frees the remaining slot -> both waiters are released.
         await Task.WhenAll(waiter1, waiter2).WaitAsync(cts.Token);
+    }
+
+    [Test]
+    public async Task WaitToWriteAsync_RecheckDrainsAllReleasedPermits()
+    {
+        PendingFetchData? readFirst = null;
+        PendingFetchData? readSecond = null;
+        MpscFetchBuffer? buffer = null;
+        var callbackCount = 0;
+
+        buffer = new MpscFetchBuffer(2, afterProducerWaiterCountIncrementedForTesting: () =>
+        {
+            if (Interlocked.Increment(ref callbackCount) != 1)
+                return;
+
+            if (!buffer!.TryRead(out readFirst))
+                throw new InvalidOperationException("Expected first read to free a slot.");
+
+            if (!buffer.TryRead(out readSecond))
+                throw new InvalidOperationException("Expected second read to free a slot.");
+        });
+
+        var first = CreateDummy("topic", 0);
+        var second = CreateDummy("topic", 1);
+        await Assert.That(buffer.TryWrite(first)).IsTrue();
+        await Assert.That(buffer.TryWrite(second)).IsTrue();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await buffer.WaitToWriteAsync(cts.Token).AsTask().WaitAsync(cts.Token);
+
+        await Assert.That(callbackCount).IsEqualTo(1);
+        await Assert.That(GetSpaceAvailableSignalCount(buffer)).IsEqualTo(0);
+
+        readFirst!.Dispose();
+        readSecond!.Dispose();
     }
 
     #endregion
@@ -411,4 +437,13 @@ public class MpscFetchBufferTests
     }
 
     #endregion
+
+    private static int GetSpaceAvailableSignalCount(MpscFetchBuffer buffer)
+    {
+        var field = typeof(MpscFetchBuffer).GetField(
+            "_spaceAvailable",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var semaphore = (SemaphoreSlim)field.GetValue(buffer)!;
+        return semaphore.CurrentCount;
+    }
 }

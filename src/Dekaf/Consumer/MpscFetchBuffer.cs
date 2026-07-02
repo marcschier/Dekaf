@@ -24,12 +24,18 @@ internal sealed class MpscFetchBuffer
 
     private readonly ManualResetEventSlim _dataAvailable = new(false);
     private readonly SemaphoreSlim _spaceAvailable = new(0, int.MaxValue);
+    private readonly Action? _afterProducerWaiterCountIncrementedForTesting;
     private int _producerWaiterCount;
     private int _consumerWaiting;
     private volatile bool _completed;
     private volatile Exception? _completionError;
 
     public MpscFetchBuffer(int capacity)
+        : this(capacity, afterProducerWaiterCountIncrementedForTesting: null)
+    {
+    }
+
+    internal MpscFetchBuffer(int capacity, Action? afterProducerWaiterCountIncrementedForTesting)
     {
         if (capacity < 1)
             throw new ArgumentOutOfRangeException(nameof(capacity), "Capacity must be positive.");
@@ -43,6 +49,7 @@ internal sealed class MpscFetchBuffer
         while (size < capacity) size <<= 1;
         _buffer = new PendingFetchData?[size];
         _mask = size - 1;
+        _afterProducerWaiterCountIncrementedForTesting = afterProducerWaiterCountIncrementedForTesting;
     }
 
     internal int Capacity => _buffer.Length;
@@ -99,9 +106,18 @@ internal sealed class MpscFetchBuffer
         Interlocked.Increment(ref _producerWaiterCount);
         try
         {
+            _afterProducerWaiterCountIncrementedForTesting?.Invoke();
+
             // Re-check after setting flag to avoid missed signal
             if (HasSpaceAvailable())
+            {
+                // Concurrent TryRead calls may have released permits for this waiter after
+                // it incremented _producerWaiterCount but before it registered with
+                // SemaphoreSlim. Drain every stale permit non-blockingly so future waiters
+                // are not spuriously woken while the buffer is full.
+                DrainAvailableSpaceSignals();
                 return;
+            }
 
             await _spaceAvailable.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
@@ -208,6 +224,13 @@ internal sealed class MpscFetchBuffer
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool HasSpaceAvailable() =>
         Volatile.Read(ref _headReserved.Value) - Volatile.Read(ref _tail.Value) < _buffer.Length;
+
+    private void DrainAvailableSpaceSignals()
+    {
+        while (_spaceAvailable.Wait(0, CancellationToken.None))
+        {
+        }
+    }
 
     /// <summary>
     /// Cache-line-padded index to prevent false sharing between producer and consumer.
