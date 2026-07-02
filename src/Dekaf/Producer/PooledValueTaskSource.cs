@@ -21,6 +21,7 @@ public sealed class PooledValueTaskSource<T> : IValueTaskSource<T>
     private ManualResetValueTaskSourceCore<T> _core = new() { RunContinuationsAsynchronously = true };
     private ValueTaskSourcePool<T>? _pool;
     private Action<T, Exception?>? _deliveryHandler;
+    private CancellationTokenRegistration _cancellationRegistration;
     private int _hasCompleted; // 0 = not completed, 1 = completed
 
     /// <summary>
@@ -131,6 +132,18 @@ public sealed class PooledValueTaskSource<T> : IValueTaskSource<T>
         return true;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void RegisterCancellation(CancellationToken cancellationToken)
+    {
+        if (!cancellationToken.CanBeCanceled)
+            return;
+
+        _cancellationRegistration.Dispose();
+        _cancellationRegistration = cancellationToken.UnsafeRegister(
+            static (state, token) => ((PooledValueTaskSource<T>)state!).TrySetCanceled(token),
+            this);
+    }
+
     /// <summary>
     /// Gets the result of the operation. Called by the awaiter.
     /// After this call, the source is reset and returned to the pool.
@@ -158,6 +171,9 @@ public sealed class PooledValueTaskSource<T> : IValueTaskSource<T>
         }
         finally
         {
+            _cancellationRegistration.Dispose();
+            _cancellationRegistration = default;
+
             // Clear handler before returning to pool
             _deliveryHandler = null;
 
