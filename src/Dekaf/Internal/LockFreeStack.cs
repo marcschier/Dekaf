@@ -4,9 +4,9 @@ using System.Runtime.CompilerServices;
 namespace Dekaf.Internal;
 
 /// <summary>
-/// Thread-safe bounded LIFO stack using a pre-allocated array with CAS-guarded index.
+/// Thread-safe bounded LIFO stack using pre-allocated striped arrays with CAS-guarded indices.
 /// Zero allocation in steady state: TryPush/TryPop only perform Interlocked operations
-/// on the stack pointer and array slots — no linked list nodes or wrapper objects.
+/// on stripe pointers and array slots — no linked list nodes or wrapper objects.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -21,19 +21,26 @@ namespace Dekaf.Internal;
 /// all per-operation allocations — only the fixed-size array is allocated at construction time.
 /// </para>
 /// <para>
-/// <b>Known trade-off:</b> A narrow race between concurrent TryPush and TryPop can strand
-/// an item in a slot below the current <c>_top</c> index, effectively shrinking the pool by
-/// one. Under sustained high-contention workloads, repeated occurrences could erode the
-/// effective pool depth. This is acceptable for pool use cases: the miss path re-creates
-/// items on demand, and the race window is extremely narrow (requires a TryPop CAS to
-/// interleave between TryPush's CAS and its subsequent slot write).
+/// Large pools are striped by processor so hot rent/return paths do not all contend on
+/// one cache line. A pop starts at the current processor's stripe and steals from other
+/// stripes on miss; this keeps the pool bounded while spreading CAS traffic.
 /// </para>
 /// </remarks>
 /// <typeparam name="T">The pooled item type. Must be a reference type for Interlocked.Exchange.</typeparam>
 internal sealed class LockFreeStack<T> where T : class
 {
-    private readonly T?[] _slots;
-    private int _top;
+    private const int MinCapacityForStriping = 64;
+    private const int MaxStripeCount = 32;
+    private const int MinSlotsPerStripe = 16;
+
+    private readonly Stripe[] _stripes;
+    private readonly int _capacity;
+
+    private sealed class Stripe(int capacity)
+    {
+        public readonly T?[] Slots = new T?[capacity];
+        public int Top;
+    }
 
     /// <summary>
     /// Creates a new stack with the specified capacity.
@@ -42,7 +49,15 @@ internal sealed class LockFreeStack<T> where T : class
     public LockFreeStack(int capacity)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity);
-        _slots = new T?[capacity];
+        _capacity = capacity;
+
+        var stripeCount = ComputeStripeCount(capacity);
+        _stripes = new Stripe[stripeCount];
+
+        var baseCapacity = capacity / stripeCount;
+        var extraSlots = capacity % stripeCount;
+        for (var i = 0; i < stripeCount; i++)
+            _stripes[i] = new Stripe(baseCapacity + (i < extraSlots ? 1 : 0));
     }
 
     /// <summary>
@@ -53,15 +68,28 @@ internal sealed class LockFreeStack<T> where T : class
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryPush(T item)
     {
+        var start = GetStartStripe();
+        for (var i = 0; i < _stripes.Length; i++)
+        {
+            if (TryPush(_stripes[(start + i) % _stripes.Length], item))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryPush(Stripe stripe, T item)
+    {
+        var slots = stripe.Slots;
         while (true)
         {
-            var top = Volatile.Read(ref _top);
-            if (top >= _slots.Length)
+            var top = Volatile.Read(ref stripe.Top);
+            if (top >= slots.Length)
                 return false; // Stack full
 
-            if (Interlocked.CompareExchange(ref _top, top + 1, top) == top)
+            if (Interlocked.CompareExchange(ref stripe.Top, top + 1, top) == top)
             {
-                Volatile.Write(ref _slots[top], item);
+                Volatile.Write(ref slots[top], item);
                 return true;
             }
             // CAS failed — retry.
@@ -76,29 +104,41 @@ internal sealed class LockFreeStack<T> where T : class
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryPop([NotNullWhen(true)] out T? item)
     {
+        var start = GetStartStripe();
+        for (var i = 0; i < _stripes.Length; i++)
+        {
+            if (TryPop(_stripes[(start + i) % _stripes.Length], out item))
+                return true;
+        }
+
+        item = null;
+        return false;
+    }
+
+    private static bool TryPop(Stripe stripe, [NotNullWhen(true)] out T? item)
+    {
+        var slots = stripe.Slots;
         while (true)
         {
-            var top = Volatile.Read(ref _top);
+            var top = Volatile.Read(ref stripe.Top);
             if (top <= 0)
             {
                 item = null;
                 return false;
             }
 
-            if (Interlocked.CompareExchange(ref _top, top - 1, top) == top)
+            if (Interlocked.CompareExchange(ref stripe.Top, top - 1, top) == top)
             {
                 // We own slot [top - 1]. Exchange it to null atomically to prevent
                 // another concurrent pop from seeing the same item.
-                item = Interlocked.Exchange(ref _slots[top - 1], null);
+                item = Interlocked.Exchange(ref slots[top - 1], null);
                 if (item is not null)
                     return true;
 
-                // Slot was null — a concurrent TryPush incremented _top (claiming this
-                // slot) but hadn't written its item yet when we exchanged the slot to
-                // null. TryPush will still write to _slots[top - 1], but since _top was
-                // already decremented, that item is stranded and will be overwritten by
-                // the next TryPush that claims the same index. The pool loses one item;
-                // for pool use cases this is benign — the miss path re-creates on demand.
+                // Slot was null — a concurrent TryPush advanced this stripe's top
+                // but had not written the item yet. That late write can strand one
+                // pooled item until a later TryPush overwrites the same slot; pool
+                // misses recreate on demand.
                 //
                 // Note: if TryPush writes BEFORE our Exchange, Exchange returns the item
                 // (non-null) and we return true at line 86 — that path never reaches here.
@@ -111,12 +151,21 @@ internal sealed class LockFreeStack<T> where T : class
     /// <summary>
     /// Approximate number of items currently in the stack.
     /// </summary>
-    public int Count => Volatile.Read(ref _top);
+    public int Count
+    {
+        get
+        {
+            var count = 0;
+            foreach (var stripe in _stripes)
+                count += Volatile.Read(ref stripe.Top);
+            return count;
+        }
+    }
 
     /// <summary>
     /// Maximum number of items the stack can hold.
     /// </summary>
-    public int Capacity => _slots.Length;
+    public int Capacity => _capacity;
 
     /// <summary>
     /// Clears all items from the stack.
@@ -124,9 +173,25 @@ internal sealed class LockFreeStack<T> where T : class
     /// </summary>
     public void Clear()
     {
-        var top = Volatile.Read(ref _top);
-        for (var i = 0; i < top; i++)
-            _slots[i] = null;
-        Volatile.Write(ref _top, 0);
+        foreach (var stripe in _stripes)
+        {
+            Array.Clear(stripe.Slots);
+            Volatile.Write(ref stripe.Top, 0);
+        }
     }
+
+    private static int ComputeStripeCount(int capacity)
+    {
+        if (capacity < MinCapacityForStriping)
+            return 1;
+
+        var maxByCapacity = capacity / MinSlotsPerStripe;
+        return Math.Min(Math.Min(Environment.ProcessorCount, MaxStripeCount), maxByCapacity);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int GetStartStripe()
+        => _stripes.Length == 1
+            ? 0
+            : (Thread.GetCurrentProcessorId() & int.MaxValue) % _stripes.Length;
 }
