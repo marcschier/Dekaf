@@ -74,6 +74,11 @@ public sealed class ConsumerOptions
     public AutoOffsetReset AutoOffsetReset { get; init; } = AutoOffsetReset.Latest;
 
     /// <summary>
+    /// Duration used when <see cref="AutoOffsetReset"/> is <see cref="AutoOffsetReset.ByDuration"/>.
+    /// </summary>
+    public TimeSpan? AutoOffsetResetDuration { get; init; }
+
+    /// <summary>
     /// Fetch minimum bytes.
     /// </summary>
     public int FetchMinBytes { get; init; } = 1;
@@ -370,7 +375,12 @@ public enum AutoOffsetReset
     /// <summary>
     /// Throw exception if no offset is found.
     /// </summary>
-    None
+    None,
+
+    /// <summary>
+    /// Start from the first offset at or after the current UTC time minus a configured duration.
+    /// </summary>
+    ByDuration
 }
 
 /// <summary>

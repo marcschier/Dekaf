@@ -54,6 +54,13 @@ public class ConsumerOptionsDefaultsTests
     }
 
     [Test]
+    public async Task AutoOffsetResetDuration_DefaultsTo_Null()
+    {
+        var options = CreateOptions();
+        await Assert.That(options.AutoOffsetResetDuration).IsNull();
+    }
+
+    [Test]
     public async Task FetchMinBytes_DefaultsTo_1()
     {
         var options = CreateOptions();

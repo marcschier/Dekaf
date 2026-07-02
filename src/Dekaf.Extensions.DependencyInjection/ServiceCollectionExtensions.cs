@@ -12,6 +12,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using System.Xml;
 
 namespace Dekaf.Extensions.DependencyInjection;
 
@@ -429,8 +430,17 @@ internal static class DekafConfigurationBinding
             builder.WithOffsetCommitMode(offsetCommitMode);
         if (TryGetValue<int>(configuration, nameof(ConsumerOptions.AutoCommitIntervalMs), out var autoCommitIntervalMs))
             builder.WithAutoCommitInterval(TimeSpan.FromMilliseconds(autoCommitIntervalMs));
-        if (TryGetValue<AutoOffsetReset>(configuration, nameof(ConsumerOptions.AutoOffsetReset), out var autoOffsetReset))
-            builder.WithAutoOffsetReset(autoOffsetReset);
+        if (TryGetAutoOffsetReset(configuration, out var autoOffsetReset, out var autoOffsetResetDuration))
+        {
+            if (autoOffsetReset == AutoOffsetReset.ByDuration)
+            {
+                builder.WithAutoOffsetResetByDuration(autoOffsetResetDuration!.Value);
+            }
+            else
+            {
+                builder.WithAutoOffsetReset(autoOffsetReset);
+            }
+        }
         if (TryGetValue<int>(configuration, nameof(ConsumerOptions.FetchMinBytes), out var fetchMinBytes))
             builder.WithFetchMinBytes(fetchMinBytes);
         if (TryGetValue<int>(configuration, nameof(ConsumerOptions.FetchMaxBytes), out var fetchMaxBytes))
@@ -631,5 +641,90 @@ internal static class DekafConfigurationBinding
 
         value = bound;
         return true;
+    }
+
+    private static bool TryGetAutoOffsetReset(
+        IConfiguration configuration,
+        out AutoOffsetReset autoOffsetReset,
+        out TimeSpan? duration)
+    {
+        duration = null;
+
+        var section = configuration.GetSection(nameof(ConsumerOptions.AutoOffsetReset));
+        if (!section.Exists())
+        {
+            autoOffsetReset = default;
+            return false;
+        }
+
+        var rawValue = section.Value;
+        if (rawValue is not null &&
+            rawValue.StartsWith("by_duration:", StringComparison.OrdinalIgnoreCase))
+        {
+            autoOffsetReset = AutoOffsetReset.ByDuration;
+            duration = ParseDuration(
+                rawValue["by_duration:".Length..],
+                nameof(ConsumerOptions.AutoOffsetReset));
+            return true;
+        }
+
+        if (rawValue is not null &&
+            Enum.TryParse<AutoOffsetReset>(rawValue, ignoreCase: true, out var parsed))
+        {
+            autoOffsetReset = parsed;
+        }
+        else
+        {
+            autoOffsetReset = section.Get<AutoOffsetReset>();
+        }
+
+        if (autoOffsetReset == AutoOffsetReset.ByDuration)
+        {
+            var durationSection = configuration.GetSection(nameof(ConsumerOptions.AutoOffsetResetDuration));
+            if (!durationSection.Exists())
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(ConsumerOptions.AutoOffsetResetDuration)} is required when {nameof(ConsumerOptions.AutoOffsetReset)} is {nameof(AutoOffsetReset.ByDuration)}.");
+            }
+
+            duration = ParseDuration(durationSection.Value, nameof(ConsumerOptions.AutoOffsetResetDuration));
+        }
+
+        return true;
+    }
+
+    private static TimeSpan ParseDuration(string? value, string key)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new InvalidOperationException($"{key} must specify a duration.");
+        }
+
+        if (TimeSpan.TryParse(value, out var timeSpan))
+        {
+            ValidateAutoOffsetResetDuration(timeSpan);
+            return timeSpan;
+        }
+
+        try
+        {
+            var duration = XmlConvert.ToTimeSpan(value);
+            ValidateAutoOffsetResetDuration(duration);
+            return duration;
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidOperationException(
+                $"{key} must be a TimeSpan or ISO-8601 duration such as 'PT24H'.",
+                ex);
+        }
+    }
+
+    private static void ValidateAutoOffsetResetDuration(TimeSpan duration)
+    {
+        if (duration < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(duration), duration, "Duration-based offset reset does not allow negative durations.");
+        }
     }
 }

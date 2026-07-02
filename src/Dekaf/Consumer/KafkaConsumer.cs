@@ -662,6 +662,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(options.ConnectionsPerBroker, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(options.ConnectionsPerBroker, options.MaxConnectionsPerBroker);
+        AutoOffsetResetStrategy.ValidateOptions(options);
 
         _options = options;
         _currentQueuedMaxBytes = (long)((ulong)options.QueuedMaxMessagesKbytes * 1024UL);
@@ -1890,18 +1891,20 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
                             {
                                 // CRITICAL: Reset fetch position based on auto.offset.reset policy
                                 // Without this, we would retry with the same invalid offset forever
-                                var (resetTimestamp, resetName) = _options.AutoOffsetReset switch
+                                var resetTimestamp = AutoOffsetResetStrategy.GetListOffsetsTimestamp(_options, DateTimeOffset.UtcNow);
+                                if (resetTimestamp == -1 || resetTimestamp == -2)
                                 {
-                                    AutoOffsetReset.Latest => (-1L, "latest"),
-                                    AutoOffsetReset.Earliest => (-2L, "earliest"),
-                                    AutoOffsetReset.None => throw new KafkaException(
-                                        ErrorCode.OffsetOutOfRange,
-                                        $"OffsetOutOfRange for {topic}-{partitionResponse.PartitionIndex} and auto.offset.reset is 'none'"),
-                                    _ => throw new InvalidOperationException($"Unknown AutoOffsetReset value: {_options.AutoOffsetReset}")
-                                };
-                                _fetchPositions[tp] = resetTimestamp;
-                                _positions[tp] = resetTimestamp;
-                                LogOffsetOutOfRangeReset(topic, partitionResponse.PartitionIndex, resetName);
+                                    _fetchPositions[tp] = resetTimestamp;
+                                    _positions[tp] = resetTimestamp;
+                                }
+                                else
+                                {
+                                    var resetOffset = await ResolveOffsetAsync(tp, resetTimestamp, cancellationToken).ConfigureAwait(false);
+                                    _fetchPositions[tp] = resetOffset;
+                                    _positions[tp] = resetOffset;
+                                }
+
+                                LogOffsetOutOfRangeReset(topic, partitionResponse.PartitionIndex, GetAutoOffsetResetName());
                             }
                             else if (partitionResponse.ErrorCode == ErrorCode.NotLeaderOrFollower)
                             {
@@ -2906,13 +2909,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
 
     private async ValueTask<long> GetResetOffsetAsync(TopicPartition partition, CancellationToken cancellationToken)
     {
-        // Get the offset based on auto offset reset policy
-        var timestamp = _options.AutoOffsetReset switch
-        {
-            AutoOffsetReset.Earliest => -2, // Earliest
-            AutoOffsetReset.Latest => -1,   // Latest
-            _ => -2 // Default to earliest
-        };
+        var timestamp = AutoOffsetResetStrategy.GetListOffsetsTimestamp(_options, DateTimeOffset.UtcNow);
 
         var connection = await GetPartitionLeaderConnectionAsync(partition, cancellationToken).ConfigureAwait(false);
         if (connection is null)
@@ -2969,6 +2966,11 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
 
         return partitionResponse?.Offset ?? 0;
     }
+
+    private string GetAutoOffsetResetName() =>
+        _options.AutoOffsetReset == AutoOffsetReset.ByDuration
+            ? $"by_duration:{_options.AutoOffsetResetDuration}"
+            : _options.AutoOffsetReset.ToString().ToLowerInvariant();
 
     private async ValueTask ResolveSpecialOffsetsAsync(
         List<TopicPartition> partitions, int startIndex, int count, CancellationToken cancellationToken)

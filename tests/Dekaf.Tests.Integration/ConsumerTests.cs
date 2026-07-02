@@ -1206,6 +1206,98 @@ public class ConsumerTests(KafkaTestContainer kafka) : KafkaIntegrationTest(kafk
     }
 
     [Test]
+    public async Task Consumer_AutoOffsetResetByDuration_StartsFromMatchingTimestamp()
+    {
+        var topic = await KafkaContainer.CreateTestTopicAsync();
+
+        await using var producer = await Kafka.CreateProducer<string, string>()
+            .WithBootstrapServers(KafkaContainer.BootstrapServers)
+            .WithClientId("test-producer")
+            .WithLoggerFactory(GlobalTestSetup.GetLoggerFactory())
+            .BuildAsync();
+
+        await producer.ProduceAsync(new ProducerMessage<string, string>
+        {
+            Topic = topic,
+            Key = "old-key",
+            Value = "old-value",
+            Timestamp = DateTimeOffset.UtcNow.AddHours(-2)
+        }, CancellationToken.None);
+        await producer.FlushAsync(CancellationToken.None);
+
+        await producer.ProduceAsync(new ProducerMessage<string, string>
+        {
+            Topic = topic,
+            Key = "recent-key",
+            Value = "recent-value",
+            Timestamp = DateTimeOffset.UtcNow.AddMinutes(-1)
+        }, CancellationToken.None);
+        await producer.FlushAsync(CancellationToken.None);
+
+        await using var consumer = await Kafka.CreateConsumer<string, string>()
+            .WithBootstrapServers(KafkaContainer.BootstrapServers)
+            .WithClientId("test-consumer")
+            .WithAutoOffsetResetByDuration(TimeSpan.FromMinutes(30))
+            .WithLoggerFactory(GlobalTestSetup.GetLoggerFactory())
+            .BuildAsync();
+
+        consumer.Assign(new TopicPartition(topic, 0));
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var result = await consumer.ConsumeOneAsync(TimeSpan.FromSeconds(30), cts.Token);
+
+        await Assert.That(result).IsNotNull();
+        await Assert.That(result!.Value.Key).IsEqualTo("recent-key");
+        await Assert.That(result.Value.Value).IsEqualTo("recent-value");
+    }
+
+    [Test]
+    public async Task Consumer_AutoOffsetResetByDuration_OlderThanLogStart_StartsFromBeginning()
+    {
+        var topic = await KafkaContainer.CreateTestTopicAsync();
+
+        await using var producer = await Kafka.CreateProducer<string, string>()
+            .WithBootstrapServers(KafkaContainer.BootstrapServers)
+            .WithClientId("test-producer")
+            .WithLoggerFactory(GlobalTestSetup.GetLoggerFactory())
+            .BuildAsync();
+
+        await producer.ProduceAsync(new ProducerMessage<string, string>
+        {
+            Topic = topic,
+            Key = "first-key",
+            Value = "first-value",
+            Timestamp = DateTimeOffset.UtcNow.AddHours(-2)
+        }, CancellationToken.None);
+        await producer.FlushAsync(CancellationToken.None);
+
+        await producer.ProduceAsync(new ProducerMessage<string, string>
+        {
+            Topic = topic,
+            Key = "second-key",
+            Value = "second-value",
+            Timestamp = DateTimeOffset.UtcNow.AddMinutes(-1)
+        }, CancellationToken.None);
+        await producer.FlushAsync(CancellationToken.None);
+
+        await using var consumer = await Kafka.CreateConsumer<string, string>()
+            .WithBootstrapServers(KafkaContainer.BootstrapServers)
+            .WithClientId("test-consumer")
+            .WithAutoOffsetResetByDuration(TimeSpan.FromDays(7))
+            .WithLoggerFactory(GlobalTestSetup.GetLoggerFactory())
+            .BuildAsync();
+
+        consumer.Assign(new TopicPartition(topic, 0));
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var result = await consumer.ConsumeOneAsync(TimeSpan.FromSeconds(30), cts.Token);
+
+        await Assert.That(result).IsNotNull();
+        await Assert.That(result!.Value.Key).IsEqualTo("first-key");
+        await Assert.That(result.Value.Value).IsEqualTo("first-value");
+    }
+
+    [Test]
     public async Task Consumer_OffsetOutOfRange_WithNone_ThrowsException()
     {
         // This tests that when AutoOffsetReset.None is configured and OffsetOutOfRange occurs,

@@ -105,6 +105,12 @@ var consumer = await Kafka.CreateConsumer<string, string>()
     .WithGroupId("my-group")
     .WithAutoOffsetReset(AutoOffsetReset.Earliest)  // Start from beginning
     .BuildAsync();
+
+var recentConsumer = await Kafka.CreateConsumer<string, string>()
+    .WithBootstrapServers("localhost:9092")
+    .WithGroupId("recent-only")
+    .WithAutoOffsetResetByDuration(TimeSpan.FromHours(24))
+    .BuildAsync();
 ```
 
 | Value | Behavior |
@@ -112,6 +118,7 @@ var consumer = await Kafka.CreateConsumer<string, string>()
 | `Earliest` | Start from the oldest available message |
 | `Latest` | Start from new messages only (default) |
 | `None` | Throw an exception if no offset is committed |
+| `ByDuration` | Start from the first offset at or after `DateTimeOffset.UtcNow - duration` |
 
 ## Error Handling
 
