@@ -15,7 +15,7 @@ namespace Dekaf.Benchmarks.Benchmarks.Client;
 /// Pre-allocated keys avoid string allocation noise.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RunStrategy.Throughput, warmupCount: 3, iterationCount: 10)]
+[SimpleJob(RunStrategy.Throughput, launchCount: 1, warmupCount: 3, iterationCount: 3)]
 [GroupBenchmarksBy(BenchmarkLogicalGroupRule.ByCategory)]
 [CategoriesColumn]
 public class ProducerModeBenchmarks

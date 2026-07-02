@@ -13,7 +13,7 @@ namespace Dekaf.Benchmarks.Benchmarks.Unit;
 /// (TryReserveMemory succeeds → synchronous append → zero async state machine).
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RunStrategy.Throughput, warmupCount: 3, iterationCount: 10)]
+[SimpleJob(RunStrategy.Throughput, launchCount: 1, warmupCount: 3, iterationCount: 3)]
 public class AccumulatorAppendBenchmarks
 {
     private RecordAccumulator _accumulator = null!;

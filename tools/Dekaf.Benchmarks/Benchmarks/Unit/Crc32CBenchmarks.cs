@@ -8,7 +8,7 @@ namespace Dekaf.Benchmarks.Benchmarks.Unit;
 /// Benchmarks CRC32C implementations across representative record-batch payload sizes.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(warmupCount: 3, iterationCount: 10)]
+[ShortRunJob]
 public class Crc32CBenchmarks
 {
     private byte[] _data = null!;

@@ -12,7 +12,7 @@ namespace Dekaf.Benchmarks.Benchmarks.Client;
 /// Confluent is marked as baseline for ratio comparison.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RunStrategy.Throughput, warmupCount: 3, iterationCount: 10)]
+[SimpleJob(RunStrategy.Throughput, launchCount: 1, warmupCount: 3, iterationCount: 3)]
 [GroupBenchmarksBy(BenchmarkLogicalGroupRule.ByCategory)]
 [CategoriesColumn]
 public class ProducerBenchmarks

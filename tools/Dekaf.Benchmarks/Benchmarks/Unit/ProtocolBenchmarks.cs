@@ -10,7 +10,7 @@ namespace Dekaf.Benchmarks.Benchmarks.Unit;
 /// These benchmarks verify Dekaf's allocation-free design.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(warmupCount: 3, iterationCount: 10)]
+[ShortRunJob]
 public class ProtocolBenchmarks
 {
     private ArrayBufferWriter<byte> _buffer = null!;

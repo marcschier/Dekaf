@@ -22,7 +22,7 @@ namespace Dekaf.Benchmarks.Benchmarks.Unit;
 /// </summary>
 [MemoryDiagnoser]
 [Config(typeof(ThroughputConfig))]
-[SimpleJob(warmupCount: 3, iterationCount: 10)]
+[ShortRunJob]
 public class ReceiveLoopCopyBenchmark
 {
     private ReadOnlySequence<byte> _sequence;

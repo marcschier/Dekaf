@@ -10,7 +10,7 @@ namespace Dekaf.Benchmarks.Benchmarks.Unit;
 /// Tests the ISerializer/IDeserializer implementations.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(warmupCount: 3, iterationCount: 10)]
+[ShortRunJob]
 public class SerializerBenchmarks
 {
     private ArrayBufferWriter<byte> _buffer = null!;

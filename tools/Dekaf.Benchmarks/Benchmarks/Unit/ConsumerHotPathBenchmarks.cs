@@ -13,7 +13,7 @@ namespace Dekaf.Benchmarks.Benchmarks.Unit;
 /// allocation is measured separately from batch/record traversal overhead.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(warmupCount: 3, iterationCount: 10)]
+[ShortRunJob]
 public class ConsumerHotPathBenchmarks
 {
     private const int MessageCount = 1_000;

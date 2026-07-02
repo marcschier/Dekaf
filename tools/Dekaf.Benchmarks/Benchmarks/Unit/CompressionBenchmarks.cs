@@ -9,7 +9,7 @@ namespace Dekaf.Benchmarks.Benchmarks.Unit;
 /// Tests Snappy compression/decompression performance.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(warmupCount: 3, iterationCount: 10)]
+[ShortRunJob]
 public class CompressionBenchmarks
 {
     private readonly SnappyCompressionCodec _codec = new(blockSize: 65536);

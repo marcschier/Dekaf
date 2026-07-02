@@ -13,7 +13,7 @@ namespace Dekaf.Benchmarks.Benchmarks.Unit;
 /// If any are non-zero, they could seed a GC feedback loop on low-core machines.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RunStrategy.Throughput, warmupCount: 5, iterationCount: 15)]
+[SimpleJob(RunStrategy.Throughput, launchCount: 1, warmupCount: 3, iterationCount: 3)]
 public class InflightTrackingBenchmarks
 {
     private PartitionInflightTracker _tracker = null!;

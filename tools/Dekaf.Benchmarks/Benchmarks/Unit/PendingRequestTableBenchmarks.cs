@@ -8,7 +8,7 @@ namespace Dekaf.Benchmarks.Benchmarks.Unit;
 /// Isolates pending-request tracking used by KafkaConnection for one request/response round trip.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RunStrategy.Throughput, warmupCount: 5, iterationCount: 15)]
+[SimpleJob(RunStrategy.Throughput, launchCount: 1, warmupCount: 3, iterationCount: 3)]
 public class PendingRequestTableBenchmarks
 {
     private const int Operations = 1_000;
