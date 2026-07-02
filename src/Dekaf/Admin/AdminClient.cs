@@ -318,7 +318,7 @@ public sealed class AdminClient : IAdminClient
 
         return await WithRetryAsync<IReadOnlyDictionary<string, GroupDescription>>(async () =>
         {
-            // Find coordinator for each group and batch groups by coordinator
+            // Find coordinator for each group and batch groups by coordinator.
             var groupsByCoordinator = new Dictionary<int, List<string>>();
             foreach (var groupId in groupIdList)
             {
@@ -331,60 +331,139 @@ public sealed class AdminClient : IAdminClient
                 groups.Add(groupId);
             }
 
-            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
-                Protocol.ApiKey.DescribeGroups,
-                DescribeGroupsRequest.LowestSupportedVersion,
-                DescribeGroupsRequest.HighestSupportedVersion);
+            return _metadataManager.HasApiKey(Protocol.ApiKey.ConsumerGroupDescribe)
+                ? await DescribeConsumerGroupsWithKip848Async(groupsByCoordinator, cancellationToken).ConfigureAwait(false)
+                : await DescribeConsumerGroupsWithClassicApiAsync(groupsByCoordinator, cancellationToken).ConfigureAwait(false);
+        }, cancellationToken).ConfigureAwait(false);
+    }
 
-            var result = new Dictionary<string, GroupDescription>();
+    private async ValueTask<IReadOnlyDictionary<string, GroupDescription>> DescribeConsumerGroupsWithKip848Async(
+        IReadOnlyDictionary<int, List<string>> groupsByCoordinator,
+        CancellationToken cancellationToken)
+    {
+        var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+            Protocol.ApiKey.ConsumerGroupDescribe,
+            ConsumerGroupDescribeRequest.LowestSupportedVersion,
+            ConsumerGroupDescribeRequest.HighestSupportedVersion);
 
-            // Send requests per coordinator
-            foreach (var (coordinatorId, groups) in groupsByCoordinator)
+        var result = new Dictionary<string, GroupDescription>();
+
+        foreach (var (coordinatorId, groups) in groupsByCoordinator)
+        {
+            var connection = await _connectionPool.GetConnectionAsync(coordinatorId, cancellationToken).ConfigureAwait(false);
+
+            var request = new ConsumerGroupDescribeRequest
             {
-                var connection = await _connectionPool.GetConnectionAsync(coordinatorId, cancellationToken).ConfigureAwait(false);
+                GroupIds = groups,
+                IncludeAuthorizedOperations = true
+            };
 
-                var request = new DescribeGroupsRequest
+            var response = await connection.SendAsync<ConsumerGroupDescribeRequest, ConsumerGroupDescribeResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            foreach (var group in response.Groups)
+            {
+                if (group.ErrorCode != Protocol.ErrorCode.None)
                 {
-                    Groups = groups
-                };
-
-                var response = await connection.SendAsync<DescribeGroupsRequest, DescribeGroupsResponse>(
-                    request,
-                    apiVersion,
-                    cancellationToken).ConfigureAwait(false);
-
-                foreach (var group in response.Groups)
-                {
-                    if (group.ErrorCode != Protocol.ErrorCode.None)
+                    throw new Errors.GroupException(group.ErrorCode,
+                        $"DescribeConsumerGroups failed for group '{group.GroupId}': {group.ErrorCode}")
                     {
-                        throw new Errors.GroupException(group.ErrorCode,
-                            $"DescribeConsumerGroups failed for group '{group.GroupId}': {group.ErrorCode}")
-                        {
-                            GroupId = group.GroupId
-                        };
-                    }
-
-                    result[group.GroupId] = new GroupDescription
-                    {
-                        GroupId = group.GroupId,
-                        ProtocolType = group.ProtocolType,
-                        ProtocolData = group.ProtocolData,
-                        State = group.GroupState,
-                        CoordinatorId = coordinatorId,
-                        Members = group.Members.Select(m => new MemberDescription
-                        {
-                            MemberId = m.MemberId,
-                            GroupInstanceId = m.GroupInstanceId,
-                            ClientId = m.ClientId,
-                            ClientHost = m.ClientHost,
-                            Assignment = ParseMemberAssignment(m.MemberAssignment)
-                        }).ToList()
+                        GroupId = group.GroupId
                     };
                 }
-            }
 
-            return result;
-        }, cancellationToken).ConfigureAwait(false);
+                result[group.GroupId] = new GroupDescription
+                {
+                    GroupId = group.GroupId,
+                    ProtocolType = "consumer",
+                    ProtocolData = group.AssignorName,
+                    State = group.GroupState,
+                    CoordinatorId = coordinatorId,
+                    GroupEpoch = group.GroupEpoch,
+                    AssignmentEpoch = group.AssignmentEpoch,
+                    AssignorName = group.AssignorName,
+                    AuthorizedOperations = group.AuthorizedOperations,
+                    Members = group.Members.Select(m => new MemberDescription
+                    {
+                        MemberId = m.MemberId,
+                        GroupInstanceId = m.InstanceId,
+                        RackId = m.RackId,
+                        MemberEpoch = m.MemberEpoch,
+                        ClientId = m.ClientId,
+                        ClientHost = m.ClientHost,
+                        SubscribedTopicNames = m.SubscribedTopicNames,
+                        SubscribedTopicRegex = m.SubscribedTopicRegex,
+                        Assignment = FlattenAssignment(m.Assignment),
+                        TargetAssignment = FlattenAssignment(m.TargetAssignment),
+                        MemberType = m.MemberType
+                    }).ToList()
+                };
+            }
+        }
+
+        return result;
+    }
+
+    private async ValueTask<IReadOnlyDictionary<string, GroupDescription>> DescribeConsumerGroupsWithClassicApiAsync(
+        IReadOnlyDictionary<int, List<string>> groupsByCoordinator,
+        CancellationToken cancellationToken)
+    {
+        var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+            Protocol.ApiKey.DescribeGroups,
+            DescribeGroupsRequest.LowestSupportedVersion,
+            DescribeGroupsRequest.HighestSupportedVersion);
+
+        var result = new Dictionary<string, GroupDescription>();
+
+        foreach (var (coordinatorId, groups) in groupsByCoordinator)
+        {
+            var connection = await _connectionPool.GetConnectionAsync(coordinatorId, cancellationToken).ConfigureAwait(false);
+
+            var request = new DescribeGroupsRequest
+            {
+                Groups = groups,
+                IncludeAuthorizedOperations = true
+            };
+
+            var response = await connection.SendAsync<DescribeGroupsRequest, DescribeGroupsResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            foreach (var group in response.Groups)
+            {
+                if (group.ErrorCode != Protocol.ErrorCode.None)
+                {
+                    throw new Errors.GroupException(group.ErrorCode,
+                        $"DescribeConsumerGroups failed for group '{group.GroupId}': {group.ErrorCode}")
+                    {
+                        GroupId = group.GroupId
+                    };
+                }
+
+                result[group.GroupId] = new GroupDescription
+                {
+                    GroupId = group.GroupId,
+                    ProtocolType = group.ProtocolType,
+                    ProtocolData = group.ProtocolData,
+                    State = group.GroupState,
+                    CoordinatorId = coordinatorId,
+                    AuthorizedOperations = group.AuthorizedOperations,
+                    Members = group.Members.Select(m => new MemberDescription
+                    {
+                        MemberId = m.MemberId,
+                        GroupInstanceId = m.GroupInstanceId,
+                        ClientId = m.ClientId,
+                        ClientHost = m.ClientHost,
+                        Assignment = ParseMemberAssignment(m.MemberAssignment)
+                    }).ToList()
+                };
+            }
+        }
+
+        return result;
     }
 
     public async ValueTask<IReadOnlyList<GroupListing>> ListConsumerGroupsAsync(
@@ -2086,6 +2165,16 @@ public sealed class AdminClient : IAdminClient
             // If we can't parse the assignment bytes, return null rather than failing
             return null;
         }
+    }
+
+    private static IReadOnlyList<TopicPartition>? FlattenAssignment(ConsumerGroupDescribeAssignment assignment)
+    {
+        if (assignment.TopicPartitions.Count == 0)
+            return null;
+
+        return assignment.TopicPartitions
+            .SelectMany(topic => topic.Partitions.Select(partition => new TopicPartition(topic.TopicName, partition)))
+            .ToList();
     }
 
     public async ValueTask DisposeAsync()

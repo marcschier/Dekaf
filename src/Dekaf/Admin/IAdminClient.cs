@@ -362,6 +362,10 @@ public sealed class GroupDescription
     public string State { get; init; } = "Unknown";
     public required IReadOnlyList<MemberDescription> Members { get; init; }
     public int? CoordinatorId { get; init; }
+    public int? GroupEpoch { get; init; }
+    public int? AssignmentEpoch { get; init; }
+    public string? AssignorName { get; init; }
+    public int AuthorizedOperations { get; init; } = int.MinValue;
 }
 
 /// <summary>
@@ -371,9 +375,15 @@ public sealed class MemberDescription
 {
     public required string MemberId { get; init; }
     public string? GroupInstanceId { get; init; }
+    public string? RackId { get; init; }
+    public int? MemberEpoch { get; init; }
     public string? ClientId { get; init; }
     public string? ClientHost { get; init; }
+    public IReadOnlyList<string>? SubscribedTopicNames { get; init; }
+    public string? SubscribedTopicRegex { get; init; }
     public IReadOnlyList<TopicPartition>? Assignment { get; init; }
+    public IReadOnlyList<TopicPartition>? TargetAssignment { get; init; }
+    public sbyte? MemberType { get; init; }
 }
 
 /// <summary>
