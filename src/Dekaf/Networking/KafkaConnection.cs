@@ -162,6 +162,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
     // Cap on _cancelledCorrelationIds to prevent unbounded growth when brokers
     // silently drop responses for timed-out requests.
     private const int MaxCancelledCorrelationIds = 10_000;
+    private const int MinimumResponseFrameSize = 4; // Correlation ID is always first in the response header.
     private static int s_globalCorrelationId;
     private readonly ConcurrentDictionary<int, PendingRequestEntry> _pendingRequests = new();
     private readonly ConcurrentDictionary<int, byte> _cancelledCorrelationIds = new();
@@ -1131,8 +1132,10 @@ public sealed partial class KafkaConnection : IKafkaConnection
         Span<byte> sizeBuffer = stackalloc byte[4];
         buffer.Slice(0, 4).CopyTo(sizeBuffer);
         var size = BinaryPrimitives.ReadInt32BigEndian(sizeBuffer);
+        ValidateResponseFrameSize(size, _responseBufferPool.MaxArrayLength);
 
-        if (buffer.Length < 4 + size)
+        var frameLength = 4L + size;
+        if (buffer.Length < frameLength)
             return false;
 
         // Extract response data (including header)
@@ -1148,7 +1151,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
         responseBuffer.CopyTo(responseArray);
         responseData = new PooledResponseBuffer(responseArray, size, isPooled, pool: _responseBufferPool);
 
-        buffer = buffer.Slice(4 + size);
+        buffer = buffer.Slice(frameLength);
         return true;
     }
 
@@ -1168,8 +1171,10 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
         // Read size prefix directly from span
         var size = BinaryPrimitives.ReadInt32BigEndian(span);
+        ValidateResponseFrameSize(size, _responseBufferPool.MaxArrayLength);
 
-        if (span.Length < 4 + size)
+        var frameLength = 4L + size;
+        if (span.Length < frameLength)
             return false;
 
         // Read correlation ID directly from span (offset 4 = past size prefix)
@@ -1181,8 +1186,18 @@ public sealed partial class KafkaConnection : IKafkaConnection
         span.Slice(4, size).CopyTo(responseArray);
         responseData = new PooledResponseBuffer(responseArray, size, isPooled, pool: _responseBufferPool);
 
-        buffer = buffer.Slice(4 + size);
+        buffer = buffer.Slice(frameLength);
         return true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void ValidateResponseFrameSize(int frameSize, int maxFrameSize)
+    {
+        if (frameSize < MinimumResponseFrameSize || frameSize > maxFrameSize)
+        {
+            throw new KafkaException(
+                $"Invalid response frame size {frameSize}. Expected between {MinimumResponseFrameSize} and {maxFrameSize} bytes.");
+        }
     }
 
     /// <summary>
@@ -1193,6 +1208,8 @@ public sealed partial class KafkaConnection : IKafkaConnection
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private (byte[] Array, bool IsPooled) RentResponseArray(int size)
     {
+        ValidateResponseFrameSize(size, _responseBufferPool.MaxArrayLength);
+
         if (size <= _responseBufferPool.MaxArrayLength)
         {
             return (_responseBufferPool.Pool.Rent(size), true);
@@ -2176,9 +2193,11 @@ public sealed partial class KafkaConnection : IKafkaConnection
         Span<byte> sizeSpan = stackalloc byte[4];
         buffer.Slice(0, 4).CopyTo(sizeSpan);
         var frameSize = BinaryPrimitives.ReadInt32BigEndian(sizeSpan);
+        ValidateResponseFrameSize(frameSize, responseBufferPool.MaxArrayLength);
 
         // If the full frame is available, don't start partial — let TryReadResponse handle it
-        if (buffer.Length >= 4 + frameSize)
+        var frameLength = 4L + frameSize;
+        if (buffer.Length >= frameLength)
             return false;
 
         // Read correlation ID (first 4 bytes of payload, at offset 4)
