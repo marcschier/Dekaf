@@ -105,7 +105,7 @@ public class OrderService
 
 ## Multiple Producers/Consumers
 
-Register multiple producers or consumers with different type parameters:
+Register multiple producers or consumers with different type parameters normally:
 
 ```csharp
 builder.Services.AddDekaf(dekaf =>
@@ -119,6 +119,84 @@ builder.Services.AddDekaf(dekaf =>
         .WithBootstrapServers(config["Kafka:BootstrapServers"]!)
         .WithBatchSize(128 * 1024)
         .ForHighThroughput());
+});
+```
+
+If two clients use the same `<TKey, TValue>` pair, register them with service keys.
+
+Before:
+
+```csharp
+builder.Services.AddDekaf(dekaf =>
+{
+    dekaf.AddProducer<string, string>(producer => producer
+        .WithBootstrapServers(config["Kafka:Orders:BootstrapServers"]!)
+        .WithClientId("orders-producer"));
+
+    dekaf.AddProducer<string, string>(producer => producer
+        .WithBootstrapServers(config["Kafka:Payments:BootstrapServers"]!)
+        .WithClientId("payments-producer"));
+});
+
+public class OrderHandler(IKafkaProducer<string, string> producer)
+{
+    // Ambiguous: both registrations use the same service type.
+}
+```
+
+After:
+
+```csharp
+using Microsoft.Extensions.DependencyInjection;
+
+builder.Services.AddDekaf(dekaf =>
+{
+    dekaf.AddProducer<string, string>("orders", producer => producer
+        .WithBootstrapServers(config["Kafka:Orders:BootstrapServers"]!)
+        .WithClientId("orders-producer"));
+
+    dekaf.AddProducer<string, string>("payments", producer => producer
+        .WithBootstrapServers(config["Kafka:Payments:BootstrapServers"]!)
+        .WithClientId("payments-producer"));
+
+    dekaf.AddConsumer<string, string>("orders", consumer => consumer
+        .WithBootstrapServers(config["Kafka:Orders:BootstrapServers"]!)
+        .WithGroupId("orders-service"));
+});
+
+public class OrderHandler(
+    [FromKeyedServices("orders")] IKafkaProducer<string, string> producer)
+{
+    // Receives the orders producer.
+}
+
+public class PaymentHandler(
+    [FromKeyedServices("payments")] IKafkaProducer<string, string> producer)
+{
+    // Receives the payments producer.
+}
+```
+
+The existing unkeyed overload remains the default-client registration. You can use one
+unkeyed producer or consumer for the common case, then add keyed clients for additional
+clusters, tenants, or workloads that share the same generic type.
+
+Keyed clients also support configuration sections:
+
+```csharp
+builder.Services.AddDekaf(dekaf =>
+{
+    dekaf.AddProducer<string, Order>(
+        "orders",
+        builder.Configuration.GetSection("Kafka:Producers:Orders"),
+        producer => producer.WithValueSerializer(new JsonSerializer<Order>()));
+
+    dekaf.AddConsumer<string, Order>(
+        "orders",
+        builder.Configuration.GetSection("Kafka:Consumers:Orders"),
+        consumer => consumer
+            .WithValueDeserializer(new JsonDeserializer<Order>())
+            .SubscribeTo("orders"));
 });
 ```
 
