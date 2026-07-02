@@ -1,4 +1,5 @@
 using Dekaf.Internal;
+using System.Reflection;
 
 namespace Dekaf.Tests.Unit.Internal;
 
@@ -108,6 +109,46 @@ public class LockFreeStackTests
     }
 
     [Test]
+    public async Task SmallCapacity_UsesSingleStripe()
+    {
+        var stack = new LockFreeStack<Item>(16);
+
+        await Assert.That(GetStripeCount(stack)).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task LargeCapacity_UsesMultipleStripes()
+    {
+        var stack = new LockFreeStack<Item>(256);
+        var stripeCount = GetStripeCount(stack);
+
+        if (Environment.ProcessorCount > 1)
+            await Assert.That(stripeCount).IsGreaterThan(1);
+        else
+            await Assert.That(stripeCount).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task LargeCapacity_CanUseFullCapacityAcrossStripes()
+    {
+        const int capacity = 256;
+        var stack = new LockFreeStack<Item>(capacity);
+
+        for (var i = 0; i < capacity; i++)
+            await Assert.That(stack.TryPush(new Item { Value = i })).IsTrue();
+
+        await Assert.That(stack.TryPush(new Item { Value = capacity })).IsFalse();
+        await Assert.That(stack.Count).IsEqualTo(capacity);
+
+        var seen = new HashSet<int>();
+        while (stack.TryPop(out var item))
+            seen.Add(item.Value);
+
+        await Assert.That(seen.Count).IsEqualTo(capacity);
+        await Assert.That(stack.Count).IsEqualTo(0);
+    }
+
+    [Test]
     public async Task Constructor_ThrowsOnInvalidCapacity()
     {
         await Assert.That(() => new LockFreeStack<Item>(0)).Throws<ArgumentOutOfRangeException>();
@@ -163,5 +204,12 @@ public class LockFreeStackTests
         await Assert.That(popCount).IsGreaterThan(0);
         await Assert.That(popCount).IsLessThanOrEqualTo(pushCount);
         await Assert.That(stack.Count).IsEqualTo(0);
+    }
+
+    private static int GetStripeCount(LockFreeStack<Item> stack)
+    {
+        var field = typeof(LockFreeStack<Item>).GetField("_stripes", BindingFlags.Instance | BindingFlags.NonPublic);
+        var stripes = (Array)field!.GetValue(stack)!;
+        return stripes.Length;
     }
 }
