@@ -47,6 +47,7 @@ internal sealed class PendingFetchData : IDisposable
     private int _batchIndex = -1;
     private int _recordIndex = -1;
     private int _disposed;
+    private int _headerGeneration;
 
     public string Topic { get; private set; } = null!;
     public int PartitionIndex { get; private set; }
@@ -141,6 +142,11 @@ internal sealed class PendingFetchData : IDisposable
     }
 
     public RecordBatch CurrentBatch => _batches[_batchIndex];
+
+    internal int HeaderGeneration => Volatile.Read(ref _headerGeneration);
+
+    internal bool IsHeaderGenerationActive(int generation) =>
+        Volatile.Read(ref _disposed) == 0 && Volatile.Read(ref _headerGeneration) == generation;
 
     /// <summary>
     /// Gets the current record via direct array access, bypassing the LazyRecordList
@@ -362,6 +368,12 @@ internal sealed class PendingFetchData : IDisposable
         _currentRecordsArray = null;
         _currentRecords = null;
         _currentRecordsCount = 0;
+        unchecked
+        {
+            _headerGeneration++;
+            if (_headerGeneration == 0)
+                _headerGeneration = 1;
+        }
         CurrentBaseOffset = 0;
         CurrentBaseTimestamp = 0;
         CurrentTimestampType = default;
@@ -1081,21 +1093,6 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
                             var offset = pending.CurrentBaseOffset + record.OffsetDelta;
                             var timestampMs = pending.CurrentBaseTimestamp + record.TimestampDelta;
 
-                            // Create a standalone header array snapshot. Previous attempts used
-                            // pooled HeaderSlice instances to avoid per-message allocation, but
-                            // this created a use-after-free hazard: callers who store ConsumeResult
-                            // objects in a collection and access headers after the await foreach
-                            // loop exits would find zeroed-out headers because the pool reclaims
-                            // slices when the enumerator is disposed. A small per-message Header[]
-                            // copy (typically 1-3 headers = ~48-144 bytes) is the correct trade-off
-                            // for correctness. The Header struct itself is cheap to copy (string ref
-                            // + ReadOnlyMemory<byte> ref + bool).
-                            IReadOnlyList<Header>? headers = null;
-                            if (record.Headers is not null && record.HeaderCount > 0)
-                            {
-                                headers = record.Headers[..record.HeaderCount];
-                            }
-
                             // Use batch-level cached timestamp type (computed once per batch
                             // transition in CacheCurrentBatchState, not per message)
                             var timestampType = pending.CurrentTimestampType;
@@ -1109,6 +1106,11 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
                             System.Diagnostics.Activity? activity = null;
                             if (hasTraceListeners)
                             {
+                                var headers = LazyConsumeHeaders.Create(
+                                    record.Headers,
+                                    record.HeaderCount,
+                                    pending,
+                                    pending.HeaderGeneration);
                                 activity = StartConsumeActivity(pending, headers, offset, messageBytes);
                                 if (activity is not null)
                                     previousActivity = activity;
@@ -1123,7 +1125,9 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
                                 isKeyNull: record.IsKeyNull,
                                 valueData: record.Value,
                                 isValueNull: record.IsValueNull,
-                                headers: headers,
+                                pooledHeaders: record.Headers,
+                                pooledHeaderCount: record.HeaderCount,
+                                headerOwner: pending,
                                 timestampMs: timestampMs,
                                 timestampType: timestampType,
                                 leaderEpoch: null,

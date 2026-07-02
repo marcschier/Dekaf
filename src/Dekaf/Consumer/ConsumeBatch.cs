@@ -107,12 +107,6 @@ namespace Dekaf.Consumer
                 long offset = pending.CurrentBaseOffset + record.OffsetDelta;
                 long timestampMs = pending.CurrentBaseTimestamp + record.TimestampDelta;
 
-                IReadOnlyList<Header>? headers = null;
-                if (record.Headers is not null && record.HeaderCount > 0)
-                {
-                    headers = record.Headers[..record.HeaderCount];
-                }
-
                 TimestampType timestampType = pending.CurrentTimestampType;
 
                 int messageBytes = (record.IsKeyNull ? 0 : record.Key.Length) +
@@ -126,7 +120,9 @@ namespace Dekaf.Consumer
                     isKeyNull: record.IsKeyNull,
                     valueData: record.Value,
                     isValueNull: record.IsValueNull,
-                    headers: headers,
+                    pooledHeaders: record.Headers,
+                    pooledHeaderCount: record.HeaderCount,
+                    headerOwner: pending,
                     timestampMs: timestampMs,
                     timestampType: timestampType,
                     leaderEpoch: null,

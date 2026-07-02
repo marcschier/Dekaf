@@ -1,4 +1,5 @@
 using Dekaf.Consumer;
+using Dekaf.Protocol.Records;
 using Dekaf.Serialization;
 
 namespace Dekaf.Tests.Unit.Consumer;
@@ -129,6 +130,127 @@ public class ConsumeResultTests
             valueDeserializer: null);
 
         await Assert.That(result.TimestampMs).IsEqualTo(timestampMs);
+    }
+
+    [Test]
+    public async Task LazyConsumeHeaders_CountDoesNotMaterialize()
+    {
+        var pooledHeaders = new[]
+        {
+            new Header("trace-id", "abc"u8.ToArray())
+        };
+        var pending = CreatePendingFetchData(pooledHeaders);
+        pending.EagerParseAll();
+        pending.MoveNext();
+
+        var headers = LazyConsumeHeaders.Create(pooledHeaders, 1, pending, pending.HeaderGeneration);
+
+        await Assert.That(headers).IsNotNull();
+        await Assert.That(headers!.Count).IsEqualTo(1);
+
+        pending.Dispose();
+    }
+
+    [Test]
+    public async Task LazyConsumeHeaders_FirstAccessCopiesSnapshot()
+    {
+        var pooledHeaders = new[]
+        {
+            new Header("trace-id", "abc"u8.ToArray())
+        };
+        var pending = CreatePendingFetchData(pooledHeaders);
+        pending.EagerParseAll();
+        pending.MoveNext();
+
+        var headers = LazyConsumeHeaders.Create(pooledHeaders, 1, pending, pending.HeaderGeneration)!;
+        var header = headers[0];
+
+        pooledHeaders[0] = new Header("changed", "def"u8.ToArray());
+
+        await Assert.That(header.Key).IsEqualTo("trace-id");
+        await Assert.That(headers[0].Key).IsEqualTo("trace-id");
+
+        pending.Dispose();
+    }
+
+    [Test]
+    public async Task LazyConsumeHeaders_AccessAfterDisposeBeforeMaterialize_ThrowsObjectDisposedException()
+    {
+        var pooledHeaders = new[]
+        {
+            new Header("trace-id", "abc"u8.ToArray())
+        };
+        var pending = CreatePendingFetchData(pooledHeaders);
+        pending.EagerParseAll();
+        pending.MoveNext();
+
+        var headers = LazyConsumeHeaders.Create(pooledHeaders, 1, pending, pending.HeaderGeneration)!;
+        pending.Dispose();
+
+        _ = headers.Count;
+        await Assert.That(() => headers[0]).Throws<ObjectDisposedException>();
+    }
+
+    [Test]
+    public async Task ConsumeResult_PooledHeaders_MaterializesOnHeadersAccess()
+    {
+        var pooledHeaders = new[]
+        {
+            new Header("trace-id", "abc"u8.ToArray())
+        };
+        var pending = CreatePendingFetchData(pooledHeaders);
+        pending.EagerParseAll();
+        pending.MoveNext();
+
+        var result = new ConsumeResult<string, string>(
+            topic: "test-topic",
+            partition: 0,
+            offset: 0,
+            keyData: default,
+            isKeyNull: true,
+            valueData: default,
+            isValueNull: true,
+            pooledHeaders: pooledHeaders,
+            pooledHeaderCount: pooledHeaders.Length,
+            headerOwner: pending,
+            timestampMs: 0,
+            timestampType: TimestampType.CreateTime,
+            leaderEpoch: null,
+            keyDeserializer: null,
+            valueDeserializer: null);
+
+        var headers = result.Headers!;
+        var first = headers[0];
+        pooledHeaders[0] = new Header("changed", "def"u8.ToArray());
+
+        await Assert.That(first.Key).IsEqualTo("trace-id");
+        await Assert.That(headers[0].Key).IsEqualTo("trace-id");
+
+        pending.Dispose();
+    }
+
+    private static PendingFetchData CreatePendingFetchData(Header[] headers)
+    {
+        var batch = new RecordBatch
+        {
+            BaseOffset = 0,
+            BaseTimestamp = 0,
+            Attributes = RecordBatchAttributes.TimestampTypeCreateTime,
+            Records =
+            [
+                new Dekaf.Protocol.Records.Record
+                {
+                    Headers = headers,
+                    HeaderCount = headers.Length,
+                    Key = ReadOnlyMemory<byte>.Empty,
+                    Value = ReadOnlyMemory<byte>.Empty,
+                    IsKeyNull = true,
+                    IsValueNull = true
+                }
+            ]
+        };
+
+        return PendingFetchData.Create("test-topic", 0, [batch]);
     }
 
 }
