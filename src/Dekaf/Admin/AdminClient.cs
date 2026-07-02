@@ -23,6 +23,7 @@ public sealed class AdminClient : IAdminClient
     private readonly MetadataManager _metadataManager;
     private readonly ClientTelemetryManager _telemetryManager;
     private readonly ILogger<AdminClient>? _logger;
+    private readonly bool _ownsResources;
     private int _telemetryStartAttempted;
     private int _disposed;
 
@@ -30,6 +31,7 @@ public sealed class AdminClient : IAdminClient
     {
         _options = options;
         _logger = loggerFactory?.CreateLogger<AdminClient>();
+        _ownsResources = true;
 
         _connectionPool = new ConnectionPool(
             options.ClientId,
@@ -64,12 +66,18 @@ public sealed class AdminClient : IAdminClient
         AdminClientOptions options,
         IConnectionPool connectionPool,
         MetadataManager metadataManager,
-        ILoggerFactory? loggerFactory = null)
+        ILoggerFactory? loggerFactory = null,
+        bool ownsResources = false)
     {
         _options = options;
         _logger = loggerFactory?.CreateLogger<AdminClient>();
         _connectionPool = connectionPool;
         _metadataManager = metadataManager;
+        _telemetryManager = new ClientTelemetryManager(
+            _connectionPool,
+            _metadataManager,
+            loggerFactory?.CreateLogger<ClientTelemetryManager>());
+        _ownsResources = ownsResources;
     }
 
     public ClusterMetadata Metadata => _metadataManager.Metadata;
@@ -313,16 +321,18 @@ public sealed class AdminClient : IAdminClient
         DescribeTopicPartitionsOptions? options = null,
         CancellationToken cancellationToken = default)
     {
+        var opts = options ?? new DescribeTopicPartitionsOptions();
+        ArgumentOutOfRangeException.ThrowIfLessThan(opts.ResponsePartitionLimit, 1);
+
         var topicList = topicNames.ToList();
         if (topicList.Count == 0)
         {
             return new Dictionary<string, TopicDescription>();
         }
 
-        var opts = options ?? new DescribeTopicPartitionsOptions();
-        ArgumentOutOfRangeException.ThrowIfLessThan(opts.ResponsePartitionLimit, 1);
-
         var result = new Dictionary<string, TopicDescription>(StringComparer.Ordinal);
+        var partitionAccumulator = new Dictionary<string, List<PartitionInfo>>(StringComparer.Ordinal);
+        var seenCursors = new HashSet<(string TopicName, int PartitionIndex)>();
         DescribeTopicPartitionsCursor? cursor = null;
 
         do
@@ -336,8 +346,12 @@ public sealed class AdminClient : IAdminClient
                 },
                 cancellationToken).ConfigureAwait(false);
 
-            MergeTopicPartitionPage(result, page.Topics.Values);
+            MergeTopicPartitionPage(result, partitionAccumulator, page.Topics.Values);
             cursor = page.NextCursor;
+            if (cursor is not null && !seenCursors.Add((cursor.TopicName, cursor.PartitionIndex)))
+            {
+                throw new InvalidOperationException("Broker returned a repeated DescribeTopicPartitions cursor.");
+            }
         } while (cursor is not null);
 
         return result;
@@ -348,7 +362,8 @@ public sealed class AdminClient : IAdminClient
         DescribeTopicPartitionsPageOptions? options = null,
         CancellationToken cancellationToken = default)
     {
-        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+        var opts = options ?? new DescribeTopicPartitionsPageOptions();
+        ArgumentOutOfRangeException.ThrowIfLessThan(opts.ResponsePartitionLimit, 1);
 
         var topicList = topicNames.ToList();
         if (topicList.Count == 0)
@@ -359,8 +374,7 @@ public sealed class AdminClient : IAdminClient
             };
         }
 
-        var opts = options ?? new DescribeTopicPartitionsPageOptions();
-        ArgumentOutOfRangeException.ThrowIfLessThan(opts.ResponsePartitionLimit, 1);
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
 
         if (!_metadataManager.HasApiKey(Protocol.ApiKey.DescribeTopicPartitions))
         {
@@ -435,14 +449,19 @@ public sealed class AdminClient : IAdminClient
 
     private static void MergeTopicPartitionPage(
         Dictionary<string, TopicDescription> result,
+        Dictionary<string, List<PartitionInfo>> partitionAccumulator,
         IEnumerable<TopicDescription> pageTopics)
     {
         foreach (var topic in pageTopics)
         {
-            if (!result.TryGetValue(topic.Name, out var existing))
+            if (!partitionAccumulator.TryGetValue(topic.Name, out var partitions))
             {
-                result[topic.Name] = topic;
-                continue;
+                partitions = new List<PartitionInfo>(topic.Partitions);
+                partitionAccumulator[topic.Name] = partitions;
+            }
+            else
+            {
+                partitions.AddRange(topic.Partitions);
             }
 
             result[topic.Name] = new TopicDescription
@@ -452,7 +471,7 @@ public sealed class AdminClient : IAdminClient
                 IsInternal = topic.IsInternal,
                 ErrorCode = topic.ErrorCode,
                 TopicAuthorizedOperations = topic.TopicAuthorizedOperations,
-                Partitions = existing.Partitions.Concat(topic.Partitions).ToList()
+                Partitions = partitions
             };
         }
     }
@@ -2266,8 +2285,12 @@ public sealed class AdminClient : IAdminClient
         var telemetryStopMs = Math.Max(1, Math.Min(_options.RequestTimeoutMs, 5000));
         await _telemetryManager.StopAsync(TimeSpan.FromMilliseconds(telemetryStopMs)).ConfigureAwait(false);
         await _telemetryManager.DisposeAsync().ConfigureAwait(false);
-        await _metadataManager.DisposeAsync().ConfigureAwait(false);
-        await _connectionPool.DisposeAsync().ConfigureAwait(false);
+
+        if (_ownsResources)
+        {
+            await _metadataManager.DisposeAsync().ConfigureAwait(false);
+            await _connectionPool.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }
 

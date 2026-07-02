@@ -78,6 +78,65 @@ public sealed class AdminDescribeTopicPartitionsTests
     }
 
     [Test]
+    public async Task DescribeTopicPartitionsAsync_RepeatedCursor_ThrowsInvalidOperationException()
+    {
+        await using var context = new AdminTestContext();
+        var repeatedCursor = new DescribeTopicPartitionsResponseCursor
+        {
+            TopicName = "topic-a",
+            PartitionIndex = 1
+        };
+        context.Connection.Enqueue(PageResponse(
+            "topic-a",
+            partitionIndex: 0,
+            nextCursor: repeatedCursor));
+        context.Connection.Enqueue(PageResponse(
+            "topic-a",
+            partitionIndex: 1,
+            nextCursor: repeatedCursor));
+
+        async Task Act() => await context.Client.DescribeTopicPartitionsAsync(
+            ["topic-a"],
+            new DescribeTopicPartitionsOptions
+            {
+                ResponsePartitionLimit = 1
+            });
+
+        await Assert.That(Act).Throws<InvalidOperationException>();
+        await Assert.That(context.Connection.RequestsOfType<DescribeTopicPartitionsRequest>().Count).IsEqualTo(2);
+    }
+
+    [Test]
+    public async Task DescribeTopicPartitionsAsync_ValidatesResponsePartitionLimitWhenTopicsEmpty()
+    {
+        await using var context = new AdminTestContext();
+
+        async Task Act() => await context.Client.DescribeTopicPartitionsAsync(
+            [],
+            new DescribeTopicPartitionsOptions
+            {
+                ResponsePartitionLimit = 0
+            });
+
+        await Assert.That(Act).Throws<ArgumentOutOfRangeException>();
+    }
+
+    [Test]
+    public async Task DescribeTopicPartitionsPageAsync_ValidatesResponsePartitionLimitWhenTopicsEmpty()
+    {
+        await using var context = new AdminTestContext();
+
+        async Task Act() => await context.Client.DescribeTopicPartitionsPageAsync(
+            [],
+            new DescribeTopicPartitionsPageOptions
+            {
+                ResponsePartitionLimit = 0
+            });
+
+        await Assert.That(Act).Throws<ArgumentOutOfRangeException>();
+    }
+
+    [Test]
     public async Task DescribeTopicPartitionsPageAsync_MapsElrAndAuthorizedOperations()
     {
         await using var context = new AdminTestContext();
@@ -123,6 +182,16 @@ public sealed class AdminDescribeTopicPartitionsTests
         await Assert.That(partition.EligibleLeaderReplicas).IsEquivalentTo([2]);
         await Assert.That(partition.LastKnownElr).IsEquivalentTo([1]);
         await Assert.That(partition.OfflineReplicas).IsEquivalentTo([2]);
+    }
+
+    [Test]
+    public async Task DisposeAsync_WithInjectedResources_DoesNotDisposeExternalPool()
+    {
+        await using var context = new AdminTestContext();
+
+        await context.Client.DisposeAsync();
+
+        await Assert.That(context.PoolDisposeCount).IsEqualTo(0);
     }
 
     private static DescribeTopicPartitionsResponse PageResponse(
@@ -196,6 +265,7 @@ public sealed class AdminDescribeTopicPartitionsTests
 
         public AdminClient Client { get; }
         public TestKafkaConnection Connection => _pool.Connection;
+        public int PoolDisposeCount => _pool.DisposeCount;
 
         public async ValueTask DisposeAsync()
         {
@@ -208,6 +278,7 @@ public sealed class AdminDescribeTopicPartitionsTests
     private sealed class TestConnectionPool : IConnectionPool
     {
         public TestKafkaConnection Connection { get; } = new();
+        public int DisposeCount { get; private set; }
 
         public ValueTask<IKafkaConnection> GetConnectionAsync(int brokerId, CancellationToken cancellationToken = default) =>
             ValueTask.FromResult<IKafkaConnection>(Connection);
@@ -232,7 +303,11 @@ public sealed class AdminDescribeTopicPartitionsTests
 
         public ValueTask CloseAllAsync() => ValueTask.CompletedTask;
 
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class TestKafkaConnection : IKafkaConnection

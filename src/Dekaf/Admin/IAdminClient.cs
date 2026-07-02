@@ -348,7 +348,9 @@ public sealed class TopicDescription
     public Protocol.ErrorCode ErrorCode { get; init; }
 
     /// <summary>
-    /// 32-bit bitfield representing authorized operations for this topic.
+    /// 32-bit bitfield representing authorized operations for this topic. This is populated by
+    /// DescribeTopicPartitions APIs; APIs that do not return authorized operations leave the default
+    /// <see cref="int.MinValue"/> sentinel.
     /// </summary>
     public int TopicAuthorizedOperations { get; init; } = int.MinValue;
 }
