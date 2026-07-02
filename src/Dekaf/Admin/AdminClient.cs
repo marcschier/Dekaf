@@ -8,6 +8,7 @@ using Dekaf.Retry;
 using Dekaf.Protocol.Messages;
 using Dekaf.Security;
 using Dekaf.Security.Sasl;
+using Dekaf.Telemetry;
 using Microsoft.Extensions.Logging;
 
 namespace Dekaf.Admin;
@@ -20,6 +21,7 @@ public sealed class AdminClient : IAdminClient
     private readonly AdminClientOptions _options;
     private readonly IConnectionPool _connectionPool;
     private readonly MetadataManager _metadataManager;
+    private readonly ClientTelemetryManager _telemetryManager;
     private readonly ILogger<AdminClient>? _logger;
     private int _disposed;
 
@@ -50,6 +52,11 @@ public sealed class AdminClient : IAdminClient
             options.BootstrapServers,
             options: metadataOptions,
             logger: loggerFactory?.CreateLogger<MetadataManager>());
+
+        _telemetryManager = new ClientTelemetryManager(
+            _connectionPool,
+            _metadataManager,
+            loggerFactory?.CreateLogger<ClientTelemetryManager>());
     }
 
     public ClusterMetadata Metadata => _metadataManager.Metadata;
@@ -1958,6 +1965,8 @@ public sealed class AdminClient : IAdminClient
         {
             await _metadataManager.InitializeAsync(cancellationToken).ConfigureAwait(false);
         }
+
+        await _telemetryManager.StartAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private ValueTask WithRetryAsync(Func<ValueTask> operation, CancellationToken cancellationToken)
@@ -2062,6 +2071,9 @@ public sealed class AdminClient : IAdminClient
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
+        var telemetryStopMs = Math.Max(1, Math.Min(_options.RequestTimeoutMs, 5000));
+        await _telemetryManager.StopAsync(TimeSpan.FromMilliseconds(telemetryStopMs)).ConfigureAwait(false);
+        await _telemetryManager.DisposeAsync().ConfigureAwait(false);
         await _metadataManager.DisposeAsync().ConfigureAwait(false);
         await _connectionPool.DisposeAsync().ConfigureAwait(false);
     }
