@@ -220,23 +220,10 @@ public sealed class JsonSchemaRegistryDeserializer<T> : IDeserializer<T>, IAsync
         var schemaId = BinaryPrimitives.ReadInt32BigEndian(span.Slice(1, 4));
 
         // Verify the schema exists. Cache hits avoid Task allocation and sync-over-async.
-        _ = GetSchemaSync(schemaId);
+        _ = _schemaRegistry.GetSchemaSync(schemaId, SchemaRegistryTimeout);
 
         // Extract JSON payload and deserialize
         return JsonSerializer.Deserialize<T>(span.Slice(5), _jsonOptions)!;
-    }
-
-    private Schema GetSchemaSync(int schemaId)
-    {
-        if (_schemaRegistry is ISchemaRegistryCache cache
-            && cache.TryGetCachedSchema(schemaId, out var cached))
-            return cached;
-
-        return _schemaRegistry.GetSchemaAsync(schemaId)
-            .WaitAsync(SchemaRegistryTimeout)
-            .ConfigureAwait(false)
-            .GetAwaiter()
-            .GetResult();
     }
 
     public ValueTask DisposeAsync()

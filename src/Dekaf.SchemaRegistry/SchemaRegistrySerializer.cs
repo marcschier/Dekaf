@@ -241,23 +241,10 @@ public sealed class SchemaRegistryDeserializer<T> : IDeserializer<T>, IAsyncDisp
 
         var schemaId = BinaryPrimitives.ReadInt32BigEndian(span.Slice(1, 4));
 
-        var schema = GetSchemaSync(schemaId);
+        var schema = _schemaRegistry.GetSchemaSync(schemaId, SchemaRegistryTimeout);
         var payload = data.Slice(5);
 
         return _deserialize(payload, schema);
-    }
-
-    private Schema GetSchemaSync(int schemaId)
-    {
-        if (_schemaRegistry is ISchemaRegistryCache cache
-            && cache.TryGetCachedSchema(schemaId, out var cached))
-            return cached;
-
-        return _schemaRegistry.GetSchemaAsync(schemaId)
-            .WaitAsync(SchemaRegistryTimeout)
-            .ConfigureAwait(false)
-            .GetAwaiter()
-            .GetResult();
     }
 
     public ValueTask DisposeAsync()

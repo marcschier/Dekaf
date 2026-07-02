@@ -64,7 +64,7 @@ public sealed class ProtobufSchemaRegistryDeserializer<T> : IDeserializer<T>, IA
         // Optionally validate the schema exists (with timeout to prevent indefinite hang)
         if (!_config.SkipSchemaValidation)
         {
-            var schema = GetSchemaSync(schemaId);
+            var schema = _schemaRegistry.GetSchemaSync(schemaId, SchemaRegistryTimeout);
             if (schema.SchemaType != SchemaType.Protobuf)
                 throw new InvalidOperationException($"Schema {schemaId} is not a Protobuf schema (type: {schema.SchemaType})");
         }
@@ -108,20 +108,6 @@ public sealed class ProtobufSchemaRegistryDeserializer<T> : IDeserializer<T>, IA
 
         throw new InvalidOperationException("Varint is truncated");
     }
-
-    private Schema GetSchemaSync(int schemaId)
-    {
-        if (_schemaRegistry is ISchemaRegistryCache cache
-            && cache.TryGetCachedSchema(schemaId, out var cached))
-            return cached;
-
-        return _schemaRegistry.GetSchemaAsync(schemaId)
-            .WaitAsync(SchemaRegistryTimeout)
-            .ConfigureAwait(false)
-            .GetAwaiter()
-            .GetResult();
-    }
-
     /// <inheritdoc />
     public ValueTask DisposeAsync()
     {
