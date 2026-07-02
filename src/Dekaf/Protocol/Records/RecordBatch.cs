@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics.X86;
+using ArmCrc32 = System.Runtime.Intrinsics.Arm.Crc32;
 using Dekaf.Compression;
 using Dekaf.Internal;
 using Dekaf.Producer;
@@ -1186,28 +1187,40 @@ public enum CompressionType
 
 /// <summary>
 /// CRC32C implementation for Kafka record batch checksums.
-/// Uses the Castagnoli polynomial (0x1EDC6F41) with hardware acceleration (SSE4.2).
+/// Uses the Castagnoli polynomial (0x1EDC6F41) with hardware acceleration (SSE4.2 or Arm CRC32).
 /// </summary>
 internal static class Crc32C
 {
-    private static readonly bool IsHardwareAccelerated = Sse42.IsSupported;
+    private const int TableSize = 256;
+    private const int SliceCount = 8;
 
-    // Software fallback table
     private static readonly uint[] Table = GenerateTable();
 
     private static uint[] GenerateTable()
     {
-        var table = new uint[256];
+        var table = new uint[SliceCount * TableSize];
         const uint polynomial = 0x82F63B78; // Reversed Castagnoli polynomial
 
-        for (uint i = 0; i < 256; i++)
+        for (var i = 0; i < TableSize; i++)
         {
-            var crc = i;
+            var crc = (uint)i;
             for (var j = 0; j < 8; j++)
             {
                 crc = (crc & 1) != 0 ? (crc >> 1) ^ polynomial : crc >> 1;
             }
             table[i] = crc;
+        }
+
+        for (var slice = 1; slice < SliceCount; slice++)
+        {
+            var previousOffset = (slice - 1) * TableSize;
+            var currentOffset = slice * TableSize;
+
+            for (var i = 0; i < TableSize; i++)
+            {
+                var crc = table[previousOffset + i];
+                table[currentOffset + i] = table[(int)(crc & 0xFF)] ^ (crc >> 8);
+            }
         }
 
         return table;
@@ -1216,11 +1229,21 @@ internal static class Crc32C
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static uint Compute(ReadOnlySpan<byte> data)
     {
-        return IsHardwareAccelerated ? ComputeHardware(data) : ComputeSoftware(data);
+        if (Sse42.IsSupported)
+        {
+            return ComputeHardwareX86(data);
+        }
+
+        if (ArmCrc32.IsSupported)
+        {
+            return ComputeHardwareArm(data);
+        }
+
+        return ComputeSoftware(data);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static uint ComputeHardware(ReadOnlySpan<byte> data)
+    internal static uint ComputeHardwareX86(ReadOnlySpan<byte> data)
     {
         var crc = 0xFFFFFFFFu;
         var i = 0;
@@ -1255,14 +1278,69 @@ internal static class Crc32C
         return crc ^ 0xFFFFFFFFu;
     }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private static uint ComputeSoftware(ReadOnlySpan<byte> data)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static uint ComputeHardwareArm(ReadOnlySpan<byte> data)
     {
         var crc = 0xFFFFFFFFu;
+        var i = 0;
 
-        foreach (var b in data)
+        // Process 8 bytes at a time on Arm64 when available.
+        if (ArmCrc32.Arm64.IsSupported)
         {
-            crc = Table[(crc ^ b) & 0xFF] ^ (crc >> 8);
+            while (i + 8 <= data.Length)
+            {
+                var value = BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(i, 8));
+                crc = ArmCrc32.Arm64.ComputeCrc32C(crc, value);
+                i += 8;
+            }
+        }
+
+        // Process 4 bytes at a time.
+        while (i + 4 <= data.Length)
+        {
+            var value = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(i, 4));
+            crc = ArmCrc32.ComputeCrc32C(crc, value);
+            i += 4;
+        }
+
+        // Process remaining bytes.
+        while (i < data.Length)
+        {
+            crc = ArmCrc32.ComputeCrc32C(crc, data[i]);
+            i++;
+        }
+
+        return crc ^ 0xFFFFFFFFu;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static uint ComputeSoftware(ReadOnlySpan<byte> data)
+    {
+        var crc = 0xFFFFFFFFu;
+        var i = 0;
+
+        while (i + 8 <= data.Length)
+        {
+            crc ^= BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(i, 4));
+            var next = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(i + 4, 4));
+
+            crc =
+                Table[(7 * TableSize) + (int)(crc & 0xFF)] ^
+                Table[(6 * TableSize) + (int)((crc >> 8) & 0xFF)] ^
+                Table[(5 * TableSize) + (int)((crc >> 16) & 0xFF)] ^
+                Table[(4 * TableSize) + (int)(crc >> 24)] ^
+                Table[(3 * TableSize) + (int)(next & 0xFF)] ^
+                Table[(2 * TableSize) + (int)((next >> 8) & 0xFF)] ^
+                Table[TableSize + (int)((next >> 16) & 0xFF)] ^
+                Table[(int)(next >> 24)];
+
+            i += 8;
+        }
+
+        while (i < data.Length)
+        {
+            crc = Table[(int)((crc ^ data[i]) & 0xFF)] ^ (crc >> 8);
+            i++;
         }
 
         return crc ^ 0xFFFFFFFFu;
