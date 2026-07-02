@@ -246,6 +246,11 @@ public readonly struct ConsumeResult<TKey, TValue>
     // DateTimeOffset.FromUnixTimeMilliseconds() construction in the consume loop.
     // The DateTimeOffset is computed on demand via the Timestamp property.
     private readonly long _timestampMs;
+    private readonly IReadOnlyList<Header>? _headers;
+    private readonly Header[]? _pooledHeaders;
+    private readonly int _pooledHeaderCount;
+    private readonly PendingFetchData? _headerOwner;
+    private readonly int _headerGeneration;
 
     /// <summary>
     /// Creates a new ConsumeResult with eager deserialization.
@@ -266,11 +271,94 @@ public readonly struct ConsumeResult<TKey, TValue>
         IDeserializer<TKey>? keyDeserializer,
         IDeserializer<TValue>? valueDeserializer,
         bool isPartitionEof = false)
+        : this(
+            topic,
+            partition,
+            offset,
+            keyData,
+            isKeyNull,
+            valueData,
+            isValueNull,
+            headers,
+            pooledHeaders: null,
+            pooledHeaderCount: 0,
+            headerOwner: null,
+            headerGeneration: 0,
+            timestampMs,
+            timestampType,
+            leaderEpoch,
+            keyDeserializer,
+            valueDeserializer,
+            isPartitionEof)
+    {
+    }
+
+    internal ConsumeResult(
+        string topic,
+        int partition,
+        long offset,
+        ReadOnlyMemory<byte> keyData,
+        bool isKeyNull,
+        ReadOnlyMemory<byte> valueData,
+        bool isValueNull,
+        Header[]? pooledHeaders,
+        int pooledHeaderCount,
+        PendingFetchData headerOwner,
+        long timestampMs,
+        TimestampType timestampType,
+        int? leaderEpoch,
+        IDeserializer<TKey>? keyDeserializer,
+        IDeserializer<TValue>? valueDeserializer)
+        : this(
+            topic,
+            partition,
+            offset,
+            keyData,
+            isKeyNull,
+            valueData,
+            isValueNull,
+            headers: null,
+            pooledHeaders,
+            pooledHeaderCount,
+            headerOwner,
+            headerOwner.HeaderGeneration,
+            timestampMs,
+            timestampType,
+            leaderEpoch,
+            keyDeserializer,
+            valueDeserializer,
+            isPartitionEof: false)
+    {
+    }
+
+    private ConsumeResult(
+        string topic,
+        int partition,
+        long offset,
+        ReadOnlyMemory<byte> keyData,
+        bool isKeyNull,
+        ReadOnlyMemory<byte> valueData,
+        bool isValueNull,
+        IReadOnlyList<Header>? headers,
+        Header[]? pooledHeaders,
+        int pooledHeaderCount,
+        PendingFetchData? headerOwner,
+        int headerGeneration,
+        long timestampMs,
+        TimestampType timestampType,
+        int? leaderEpoch,
+        IDeserializer<TKey>? keyDeserializer,
+        IDeserializer<TValue>? valueDeserializer,
+        bool isPartitionEof)
     {
         Topic = topic;
         Partition = partition;
         Offset = offset;
-        Headers = headers;
+        _headers = headers;
+        _pooledHeaders = pooledHeaders;
+        _pooledHeaderCount = pooledHeaderCount;
+        _headerOwner = headerOwner;
+        _headerGeneration = headerGeneration;
         _timestampMs = timestampMs;
         TimestampType = timestampType;
         LeaderEpoch = leaderEpoch;
@@ -369,8 +457,15 @@ public readonly struct ConsumeResult<TKey, TValue>
 
     /// <summary>
     /// The message headers. Returns null if no headers.
+    /// Header arrays from consumed record batches are copied lazily on first access; if a
+    /// result is retained beyond the consume loop, access this property before the owning
+    /// fetch batch is disposed to keep a safe snapshot.
     /// </summary>
-    public IReadOnlyList<Header>? Headers { get; }
+    public IReadOnlyList<Header>? Headers => _headers ?? LazyConsumeHeaders.Create(
+        _pooledHeaders,
+        _pooledHeaderCount,
+        _headerOwner,
+        _headerGeneration);
 
     /// <summary>
     /// The message timestamp as a DateTimeOffset.
