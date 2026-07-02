@@ -1,4 +1,6 @@
 using System.Buffers;
+using System.Runtime.InteropServices;
+using Dekaf.Compression;
 using Dekaf.Protocol;
 using Dekaf.Protocol.Records;
 using Dekaf.Serialization;
@@ -569,6 +571,39 @@ public class RecordBatchTests
     }
 
     [Test]
+    public async Task PreCompress_StoresCodecOutputBufferWithoutCopy()
+    {
+        var codec = new CapturingCompressionCodec(CompressionType.Gzip);
+        var registry = new CompressionCodecRegistry();
+        registry.Register(codec);
+
+        using var batch = new RecordBatch
+        {
+            BaseOffset = 0,
+            BaseTimestamp = 0,
+            MaxTimestamp = 0,
+            Records =
+            [
+                new Record
+                {
+                    OffsetDelta = 0,
+                    TimestampDelta = 0,
+                    Key = "key"u8.ToArray(),
+                    Value = new byte[512]
+                }
+            ]
+        };
+
+        batch.PreCompress(CompressionType.Gzip, registry);
+
+        await Assert.That(codec.OutputArray).IsNotNull();
+        await Assert.That(batch.PreCompressedRecords).IsSameReferenceAs(codec.OutputArray!);
+        await Assert.That(batch.PreCompressedLength).IsEqualTo(codec.BytesWritten);
+        await Assert.That(batch.PreCompressedRecords.AsSpan(0, batch.PreCompressedLength).ToArray())
+            .IsEquivalentTo(CapturingCompressionCodec.Payload);
+    }
+
+    [Test]
     public async Task Write_WithPreCompressedData_ProducesSameOutputAsInlineCompression()
     {
         var records = new Record[]
@@ -631,6 +666,33 @@ public class RecordBatchTests
     }
 
     #endregion
+
+    private sealed class CapturingCompressionCodec(CompressionType type) : ICompressionCodec
+    {
+        public static readonly byte[] Payload = [0x44, 0x45, 0x4b, 0x41, 0x46];
+
+        public CompressionType Type { get; } = type;
+        public byte[]? OutputArray { get; private set; }
+        public int BytesWritten { get; private set; }
+
+        public void Compress(ReadOnlySequence<byte> source, IBufferWriter<byte> destination)
+        {
+            var memory = destination.GetMemory(Payload.Length);
+            if (!MemoryMarshal.TryGetArray<byte>(memory, out var segment) || segment.Array is null)
+                throw new InvalidOperationException("Expected array-backed compression destination.");
+
+            OutputArray = segment.Array;
+            Payload.CopyTo(memory.Span);
+            BytesWritten = Payload.Length;
+            destination.Advance(Payload.Length);
+        }
+
+        public void Decompress(ReadOnlySequence<byte> source, IBufferWriter<byte> destination)
+        {
+            foreach (var segment in source)
+                destination.Write(segment.Span);
+        }
+    }
 
     #region Pool Reuse on Consumer Read Path Tests
 

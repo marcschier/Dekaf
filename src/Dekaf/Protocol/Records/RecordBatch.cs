@@ -276,6 +276,92 @@ internal sealed class DecompressDirectBufferWriter : IBufferWriter<byte>, IDispo
 }
 
 /// <summary>
+/// Lightweight <see cref="IBufferWriter{T}"/> backed by <see cref="ProducerDataPool"/>.
+/// <see cref="DetachBuffer"/> transfers the compressed payload buffer to the caller,
+/// avoiding an extra copy from a reusable scratch buffer into producer-owned storage.
+/// </summary>
+internal sealed class ProducerDataBufferWriter : IBufferWriter<byte>, IDisposable
+{
+    private const int InitialCapacityLimit = 4096;
+
+    private byte[] _buffer;
+    private int _written;
+
+    public ProducerDataBufferWriter(int initialCapacity)
+    {
+        _buffer = ProducerDataPool.BytePool.Rent(Math.Clamp(initialCapacity, 256, InitialCapacityLimit));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Advance(int count)
+    {
+        if ((uint)count > (uint)(_buffer.Length - _written))
+            throw new InvalidOperationException("Advance called with count exceeding available space.");
+        _written += count;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Memory<byte> GetMemory(int sizeHint = 0)
+    {
+        EnsureCapacity(sizeHint);
+        return _buffer.AsMemory(_written);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Span<byte> GetSpan(int sizeHint = 0)
+    {
+        EnsureCapacity(sizeHint);
+        return _buffer.AsSpan(_written);
+    }
+
+    public byte[] DetachBuffer(out int length)
+    {
+        length = _written;
+        var buf = _buffer;
+        _buffer = [];
+        _written = 0;
+        return buf;
+    }
+
+    public void Dispose()
+    {
+        var buf = _buffer;
+        _buffer = [];
+        _written = 0;
+        if (buf.Length > 0)
+            ProducerDataPool.BytePool.Return(buf, clearArray: false);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureCapacity(int sizeHint)
+    {
+        if (sizeHint < 1)
+            sizeHint = 1;
+
+        if (_buffer.Length - _written < sizeHint)
+        {
+            Grow(sizeHint);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void Grow(int sizeHint)
+    {
+        var doubled = Math.Min((long)_buffer.Length * 2, Array.MaxLength);
+        var required = Math.Min((long)_written + sizeHint, Array.MaxLength);
+        var newSize = (int)Math.Max(doubled, required);
+
+        if (newSize <= _buffer.Length)
+            throw new InvalidOperationException("Cannot grow buffer: maximum size reached.");
+
+        var newBuffer = ProducerDataPool.BytePool.Rent(newSize);
+        _buffer.AsSpan(0, _written).CopyTo(newBuffer);
+        ProducerDataPool.BytePool.Return(_buffer, clearArray: false);
+        _buffer = newBuffer;
+    }
+}
+
+/// <summary>
 /// Kafka RecordBatch v2 format (magic byte 2).
 /// This is the modern record format used since Kafka 0.11.
 /// Supports lazy record parsing - records are only parsed when enumerated.
@@ -436,7 +522,7 @@ public sealed class RecordBatch : IDisposable
 
     /// <summary>
     /// Pre-compressed records data. When set, <see cref="Write"/> skips compression
-    /// and uses this data directly. The array is rented from <see cref="ArrayPool{T}"/>
+    /// and uses this data directly. The array is rented from <see cref="ProducerDataPool"/>
     /// and must be returned by the caller after Write() completes.
     /// Set by <see cref="PreCompress"/> before send so <see cref="Write"/> can emit
     /// the compressed payload directly.
@@ -478,21 +564,13 @@ public sealed class RecordBatch : IDisposable
 
             WriteRecords(records, ref recordsWriter);
 
-            // Compress to pooled scratch buffer
+            // Compress directly into a detachable producer-pool buffer.
             var registry = codecs ?? CompressionCodecRegistry.Default;
             var codec = registry.GetCodec(compression);
-            var compressedBuffer = GetCompressedBuffer(cache);
+            using var compressedBuffer = new ProducerDataBufferWriter(recordsBuffer.WrittenCount);
             codec.Compress(new ReadOnlySequence<byte>(recordsBuffer.WrittenMemory), compressedBuffer);
 
-            // Copy to a pooled array for storage (scratch buffer will be reused).
-            // Uses ProducerDataPool (not ArrayPool<byte>.Shared) because PreCompress and
-            // ReturnPreCompressedBuffer may run on different producer threads; cross-thread
-            // ArrayPool<byte>.Shared use causes TLS accumulation.
-            var compressedLength = compressedBuffer.WrittenCount;
-            var pooledArray = Producer.ProducerDataPool.BytePool.Rent(compressedLength);
-            compressedBuffer.WrittenSpan.CopyTo(pooledArray);
-
-            PreCompressedRecords = pooledArray;
+            PreCompressedRecords = compressedBuffer.DetachBuffer(out var compressedLength);
             PreCompressedLength = compressedLength;
             PreCompressedType = compression;
         }

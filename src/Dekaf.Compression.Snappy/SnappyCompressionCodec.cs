@@ -26,7 +26,7 @@ public sealed class SnappyCompressionCodec : ICompressionCodec
 
     private readonly int _blockSize;
 
-    // Thread-local reusable buffer for compression output (avoids ~77KB allocation per Compress call)
+    // Thread-local fallback for multi-segment block compression.
     [ThreadStatic]
     private static ArrayBufferWriter<byte>? t_compressedBuffer;
 
@@ -59,28 +59,32 @@ public sealed class SnappyCompressionCodec : ICompressionCodec
         var position = source.Start;
         var remaining = source.Length;
 
-        // Reuse thread-local buffer to capture compressed output (needed to get size for header)
-        var compressedBuffer = t_compressedBuffer ??= new ArrayBufferWriter<byte>();
-
         while (remaining > 0)
         {
             var blockLength = (int)Math.Min(remaining, _blockSize);
             var blockSequence = source.Slice(position, blockLength);
 
-            // Compress the block using ReadOnlySequence/IBufferWriter overload
-            compressedBuffer.ResetWrittenCount();
-            Snappier.Snappy.Compress(blockSequence, compressedBuffer);
-            var compressedLength = compressedBuffer.WrittenCount;
+            if (blockSequence.IsSingleSegment)
+            {
+                var maxCompressedLength = Snappier.Snappy.GetMaxCompressedLength(blockLength);
+                var blockSpan = destination.GetSpan(4 + maxCompressedLength);
+                var compressedLength = Snappier.Snappy.Compress(blockSequence.FirstSpan, blockSpan[4..]);
 
-            // Write block header: [compressed size (4 bytes BE)]
-            var blockHeaderSpan = destination.GetSpan(4);
-            BinaryPrimitives.WriteInt32BigEndian(blockHeaderSpan, compressedLength);
-            destination.Advance(4);
+                BinaryPrimitives.WriteInt32BigEndian(blockSpan, compressedLength);
+                destination.Advance(4 + compressedLength);
+            }
+            else
+            {
+                var compressedBuffer = t_compressedBuffer ??= new ArrayBufferWriter<byte>();
+                compressedBuffer.ResetWrittenCount();
+                Snappier.Snappy.Compress(blockSequence, compressedBuffer);
+                var compressedLength = compressedBuffer.WrittenCount;
 
-            // Write compressed data
-            var compressedSpan = destination.GetSpan(compressedLength);
-            compressedBuffer.WrittenSpan.CopyTo(compressedSpan);
-            destination.Advance(compressedLength);
+                var blockSpan = destination.GetSpan(4 + compressedLength);
+                BinaryPrimitives.WriteInt32BigEndian(blockSpan, compressedLength);
+                compressedBuffer.WrittenSpan.CopyTo(blockSpan[4..]);
+                destination.Advance(4 + compressedLength);
+            }
 
             position = source.GetPosition(blockLength, position);
             remaining -= blockLength;
