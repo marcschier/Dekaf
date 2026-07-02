@@ -1309,6 +1309,23 @@ public class RecordAccumulatorTests
     }
 
     [Test]
+    public async Task RecordListWrapper_AsSpan_ExposesValidRecordsOnly()
+    {
+        var records = new Record[4];
+        records[0] = new Record { OffsetDelta = 10 };
+        records[1] = new Record { OffsetDelta = 20 };
+        records[2] = new Record { OffsetDelta = 30 };
+        records[3] = new Record { OffsetDelta = 40 };
+
+        var wrapper = new RecordListWrapper(records, 2);
+        var snapshot = ReadWrapperSpan(wrapper);
+
+        await Assert.That(snapshot.Length).IsEqualTo(2);
+        await Assert.That(snapshot.FirstOffset).IsEqualTo(10);
+        await Assert.That(snapshot.SecondOffset).IsEqualTo(20);
+    }
+
+    [Test]
     public async Task RecordListWrapper_IndexBasedIteration_MatchesEnumerator()
     {
         var records = new Record[10];
@@ -1335,6 +1352,12 @@ public class RecordAccumulatorTests
     }
 
     #endregion
+
+    private static (int Length, int FirstOffset, int SecondOffset) ReadWrapperSpan(RecordListWrapper wrapper)
+    {
+        var span = wrapper.AsSpan();
+        return (span.Length, span[0].OffsetDelta, span[1].OffsetDelta);
+    }
 
     #region ReadyBatch.Reset Safety Net
 

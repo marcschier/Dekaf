@@ -5079,7 +5079,7 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
 }
 
 /// <summary>
-/// Zero-allocation wrapper around a pooled Record array that implements IReadOnlyList.
+/// Wrapper around a pooled Record array that implements IReadOnlyList.
 /// Used to present only the valid portion of a pooled array without copying.
 /// </summary>
 internal readonly struct RecordListWrapper : IReadOnlyList<Record>
@@ -5104,6 +5104,9 @@ internal readonly struct RecordListWrapper : IReadOnlyList<Record>
     }
 
     public int Count => _count;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ReadOnlySpan<Record> AsSpan() => _array.AsSpan(0, _count);
 
     public Enumerator GetEnumerator() => new(_array, _count);
 

@@ -474,11 +474,9 @@ public sealed class RecordBatch : IDisposable
             // Serialize records to pooled scratch buffer
             var recordsBuffer = GetRecordsBuffer(cache);
             var recordsWriter = new KafkaProtocolWriter(recordsBuffer);
+            var records = Records;
 
-            for (var i = 0; i < Records.Count; i++)
-            {
-                Records[i].Write(ref recordsWriter);
-            }
+            WriteRecords(records, ref recordsWriter);
 
             // Compress to pooled scratch buffer
             var registry = codecs ?? CompressionCodecRegistry.Default;
@@ -652,6 +650,7 @@ public sealed class RecordBatch : IDisposable
     public void Write(IBufferWriter<byte> output, CompressionType compression = CompressionType.None, CompressionCodecRegistry? codecs = null)
     {
         var writer = new KafkaProtocolWriter(output);
+        var records = Records;
 
         // Determine the effective compression and records data to write.
         // If pre-compressed at seal time, use that data directly (skip CPU-bound compression
@@ -678,10 +677,7 @@ public sealed class RecordBatch : IDisposable
                 var recordsBuffer = GetRecordsBuffer(cache);
                 var recordsWriter = new KafkaProtocolWriter(recordsBuffer);
 
-                for (var i = 0; i < Records.Count; i++)
-                {
-                    Records[i].Write(ref recordsWriter);
-                }
+                WriteRecords(records, ref recordsWriter);
 
                 // Apply compression if needed
                 if (compression != CompressionType.None)
@@ -743,7 +739,7 @@ public sealed class RecordBatch : IDisposable
             offset += 2;
             BinaryPrimitives.WriteInt32BigEndian(contentSpan[offset..], BaseSequence);
             offset += 4;
-            BinaryPrimitives.WriteInt32BigEndian(contentSpan[offset..], Records.Count);
+            BinaryPrimitives.WriteInt32BigEndian(contentSpan[offset..], records.Count);
             offset += 4;
             compressedRecords.CopyTo(contentSpan[offset..]);
 
@@ -778,29 +774,113 @@ public sealed class RecordBatch : IDisposable
         if (compression != CompressionType.None)
             throw new InvalidOperationException("Compressed RecordBatch size requires pre-compressed records.");
 
-        var recordsLength = 0;
-        for (var i = 0; i < Records.Count; i++)
-        {
-            var record = Records[i];
-            var bodySize = record.CachedBodySize > 0
-                ? record.CachedBodySize
-                : Record.ComputeBodySize(
-                    record.TimestampDelta,
-                    record.OffsetDelta,
-                    record.IsKeyNull,
-                    record.Key.Length,
-                    record.IsValueNull,
-                    record.Value.Length,
-                    record.Headers,
-                    record.EffectiveHeaderCount);
+        return GetEncodedRecordsLength(Records);
+    }
 
+    private static void WriteRecords(IReadOnlyList<Record> records, ref KafkaProtocolWriter writer)
+    {
+        switch (records)
+        {
+            case Record[] array:
+                WriteRecordSpan(array, ref writer);
+                return;
+            case RecordListWrapper wrapper:
+                WriteRecordSpan(wrapper.AsSpan(), ref writer);
+                return;
+            case LazyRecordList lazyRecords:
+                lazyRecords.EnsureAllParsed();
+                var parsedRecords = lazyRecords.GetParsedArray();
+                if (parsedRecords is not null)
+                    WriteRecordSpan(parsedRecords.AsSpan(0, lazyRecords.Count), ref writer);
+                return;
+            default:
+                WriteRecordList(records, ref writer);
+                return;
+        }
+    }
+
+    private static void WriteRecordSpan(ReadOnlySpan<Record> records, ref KafkaProtocolWriter writer)
+    {
+        foreach (ref readonly var record in records)
+        {
+            record.Write(ref writer);
+        }
+    }
+
+    private static void WriteRecordList(IReadOnlyList<Record> records, ref KafkaProtocolWriter writer)
+    {
+        var count = records.Count;
+        for (var i = 0; i < count; i++)
+        {
+            var record = records[i];
+            record.Write(ref writer);
+        }
+    }
+
+    private static int GetEncodedRecordsLength(IReadOnlyList<Record> records)
+    {
+        return records switch
+        {
+            Record[] array => GetEncodedRecordSpanLength(array),
+            RecordListWrapper wrapper => GetEncodedRecordSpanLength(wrapper.AsSpan()),
+            LazyRecordList lazyRecords => GetEncodedLazyRecordListLength(lazyRecords),
+            _ => GetEncodedRecordListLength(records)
+        };
+    }
+
+    private static int GetEncodedLazyRecordListLength(LazyRecordList lazyRecords)
+    {
+        lazyRecords.EnsureAllParsed();
+        var parsedRecords = lazyRecords.GetParsedArray();
+        return parsedRecords is null ? 0 : GetEncodedRecordSpanLength(parsedRecords.AsSpan(0, lazyRecords.Count));
+    }
+
+    private static int GetEncodedRecordSpanLength(ReadOnlySpan<Record> records)
+    {
+        var recordsLength = 0;
+        foreach (ref readonly var record in records)
+        {
             checked
             {
-                recordsLength += Record.VarIntSize(bodySize) + bodySize;
+                recordsLength += GetEncodedRecordLength(in record);
             }
         }
 
         return recordsLength;
+    }
+
+    private static int GetEncodedRecordListLength(IReadOnlyList<Record> records)
+    {
+        var recordsLength = 0;
+        var count = records.Count;
+        for (var i = 0; i < count; i++)
+        {
+            var record = records[i];
+            checked
+            {
+                recordsLength += GetEncodedRecordLength(in record);
+            }
+        }
+
+        return recordsLength;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int GetEncodedRecordLength(in Record record)
+    {
+        var bodySize = record.CachedBodySize > 0
+            ? record.CachedBodySize
+            : Record.ComputeBodySize(
+                record.TimestampDelta,
+                record.OffsetDelta,
+                record.IsKeyNull,
+                record.Key.Length,
+                record.IsValueNull,
+                record.Value.Length,
+                record.Headers,
+                record.EffectiveHeaderCount);
+
+        return checked(Record.VarIntSize(bodySize) + bodySize);
     }
 
     /// <summary>
