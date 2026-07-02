@@ -15,6 +15,11 @@ namespace Dekaf.Tests.Unit.SchemaRegistry;
 
 public sealed class SchemaRegistryCacheTests
 {
+    private static readonly JsonSerializerOptions CamelCaseJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
     /// <summary>
     /// A mock registry client that counts how many times GetOrRegisterSchemaAsync is called per subject.
     /// </summary>
@@ -140,6 +145,8 @@ public sealed class SchemaRegistryCacheTests
 
         await Assert.That(cache.CachedEntryCount).IsEqualTo(SubjectSchemaIdCache.MaxCachedEntries);
     }
+
+    private sealed record JsonPayload(int Id, string Name);
 
     [Test]
     public async Task Serializer_CachesSchemaId_AcrossMultipleSubjects()
@@ -308,6 +315,41 @@ public sealed class SchemaRegistryCacheTests
         serializer.Serialize(message, ref buffer2, context);
 
         await Assert.That(strategy.CallCount).IsEqualTo(1);
+        await Assert.That(registry.GetCallCount("topic-value")).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task JsonSerializer_WritesCorrectWireFormat()
+    {
+        var registry = new CountingSchemaRegistryClient();
+        await using var serializer = new JsonSchemaRegistrySerializer<JsonPayload>(
+            registry,
+            """
+            {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer" },
+                    "name": { "type": "string" }
+                }
+            }
+            """);
+        var payload = new JsonPayload(7, "Test");
+        var buffer = new ArrayBufferWriter<byte>();
+
+        serializer.Serialize(
+            payload,
+            ref buffer,
+            new SerializationContext { Topic = "topic", Component = SerializationComponent.Value });
+
+        var written = buffer.WrittenMemory.ToArray();
+        var schemaId = BinaryPrimitives.ReadInt32BigEndian(written.AsSpan(1, 4));
+        var actualPayload = written.AsSpan(5).ToArray();
+
+        await Assert.That(written[0]).IsEqualTo((byte)0);
+        await Assert.That(schemaId).IsEqualTo(registry.GetSchemaId("topic-value"));
+
+        var expectedPayload = JsonSerializer.SerializeToUtf8Bytes(payload, CamelCaseJsonOptions);
+        await Assert.That(actualPayload).IsEquivalentTo(expectedPayload);
         await Assert.That(registry.GetCallCount("topic-value")).IsEqualTo(1);
     }
 

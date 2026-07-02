@@ -26,6 +26,9 @@ public sealed class JsonSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
     private const byte MagicByte = 0x00;
     private static readonly TimeSpan SchemaRegistryTimeout = TimeSpan.FromSeconds(30);
 
+    [ThreadStatic]
+    private static Utf8JsonWriter? t_jsonWriter;
+
     private readonly ISchemaRegistryClient _schemaRegistry;
     private readonly JsonSerializerOptions _jsonOptions;
     private readonly SubjectNameStrategy _subjectNameStrategy;
@@ -106,18 +109,46 @@ public sealed class JsonSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
     {
         var schemaId = GetSchemaIdForContext(context.Topic, context.Component == SerializationComponent.Key);
 
-        // Serialize to JSON
-        var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(value, _jsonOptions);
+        var payloadBuffer = SchemaRegistryBuffers.PayloadBuffer ??= new ArrayBufferWriter<byte>(initialCapacity: 4096);
+        payloadBuffer.ResetWrittenCount();
+
+        var jsonWriter = t_jsonWriter;
+        if (jsonWriter is null)
+        {
+            jsonWriter = new Utf8JsonWriter(payloadBuffer);
+            t_jsonWriter = jsonWriter;
+        }
+        else
+        {
+            jsonWriter.Reset(payloadBuffer);
+        }
+
+        try
+        {
+            JsonSerializer.Serialize(jsonWriter, value, _jsonOptions);
+            jsonWriter.Flush();
+        }
+        catch
+        {
+            t_jsonWriter = null;
+            throw;
+        }
 
         // Write wire format: [0x00] [schema ID] [JSON payload]
-        var totalSize = 1 + 4 + jsonBytes.Length;
+        var totalSize = 1 + 4 + payloadBuffer.WrittenCount;
         var span = destination.GetSpan(totalSize);
 
         span[0] = MagicByte;
         BinaryPrimitives.WriteInt32BigEndian(span.Slice(1, 4), schemaId);
-        jsonBytes.AsSpan().CopyTo(span.Slice(5));
+        payloadBuffer.WrittenSpan.CopyTo(span.Slice(5));
 
         destination.Advance(totalSize);
+
+        if (payloadBuffer.Capacity > 1024 * 1024)
+        {
+            SchemaRegistryBuffers.PayloadBuffer = null;
+            t_jsonWriter = null;
+        }
     }
 
     private int GetSchemaIdForContext(string topic, bool isKey)

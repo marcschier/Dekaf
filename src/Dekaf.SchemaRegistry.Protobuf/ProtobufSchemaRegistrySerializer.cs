@@ -77,12 +77,10 @@ public sealed class ProtobufSchemaRegistrySerializer<T> : ISerializer<T>, IAsync
 
         var schemaId = GetSchemaIdForContext(context.Topic, context.Component == SerializationComponent.Key);
 
-        // Serialize the protobuf message to bytes using ToByteArray() for compatibility
-        // with both generated and hand-coded messages
-        var protoBytes = value.ToByteArray();
+        var protoSize = value.CalculateSize();
 
         // Total size: magic byte + schema ID + indexes + message
-        var totalSize = 1 + 4 + _encodedMessageIndexes.Length + protoBytes.Length;
+        var totalSize = 1 + 4 + _encodedMessageIndexes.Length + protoSize;
         var span = destination.GetSpan(totalSize);
 
         // Write magic byte
@@ -96,7 +94,7 @@ public sealed class ProtobufSchemaRegistrySerializer<T> : ISerializer<T>, IAsync
         offset += _encodedMessageIndexes.Length;
 
         // Write the protobuf message
-        protoBytes.AsSpan().CopyTo(span.Slice(offset));
+        value.WriteTo(span.Slice(offset, protoSize));
 
         destination.Advance(totalSize);
     }
