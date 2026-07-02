@@ -158,7 +158,68 @@ public sealed class KafkaConnectionTests
         }
     }
 
-    private static async Task ReadRequestFrameAsync(NetworkStream stream, CancellationToken cancellationToken)
+    [Test]
+    [Timeout(10_000)]
+    public async Task ConnectAsync_DoesNotAllocateRetainedRequestWriter(CancellationToken cancellationToken)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+
+        try
+        {
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            var acceptTask = listener.AcceptTcpClientAsync(cancellationToken);
+            await using var connection = new KafkaConnection(IPAddress.Loopback.ToString(), port);
+
+            await connection.ConnectAsync(cancellationToken);
+            using var serverClient = await acceptTask.ConfigureAwait(false);
+
+            var writerField = typeof(KafkaConnection).GetField(
+                "_writer",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            await Assert.That(writerField?.GetValue(connection)).IsNull();
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    [Test]
+    [Timeout(10_000)]
+    public async Task SendFireAndForgetAsync_WritesFrameToStream(CancellationToken cancellationToken)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+
+        try
+        {
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            var acceptTask = listener.AcceptTcpClientAsync(cancellationToken);
+            await using var connection = new KafkaConnection(IPAddress.Loopback.ToString(), port);
+
+            await connection.ConnectAsync(cancellationToken);
+            using var serverClient = await acceptTask.ConfigureAwait(false);
+
+            await connection.SendFireAndForgetAsync<ApiVersionsRequest, ApiVersionsResponse>(
+                new ApiVersionsRequest { ClientSoftwareName = "test", ClientSoftwareVersion = "1.0" },
+                apiVersion: 3,
+                cancellationToken);
+
+            var frame = await ReadRequestFrameAsync(serverClient.GetStream(), cancellationToken);
+            var correlationId = BinaryPrimitives.ReadInt32BigEndian(frame.AsSpan(4, 4));
+
+            await Assert.That(frame.Length).IsGreaterThan(8);
+            await Assert.That(correlationId).IsGreaterThan(0);
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    private static async Task<byte[]> ReadRequestFrameAsync(NetworkStream stream, CancellationToken cancellationToken)
     {
         var lengthBuffer = new byte[4];
         await stream.ReadExactlyAsync(lengthBuffer, cancellationToken).ConfigureAwait(false);
@@ -166,6 +227,7 @@ public sealed class KafkaConnectionTests
         var frameLength = BinaryPrimitives.ReadInt32BigEndian(lengthBuffer);
         var frameBuffer = new byte[frameLength];
         await stream.ReadExactlyAsync(frameBuffer, cancellationToken).ConfigureAwait(false);
+        return frameBuffer;
     }
 
     [Test]
