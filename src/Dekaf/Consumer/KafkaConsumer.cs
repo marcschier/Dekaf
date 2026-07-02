@@ -14,6 +14,7 @@ using Dekaf.Protocol.Messages;
 using Dekaf.Protocol.Records;
 using Dekaf.Retry;
 using Dekaf.Serialization;
+using Dekaf.Telemetry;
 using Microsoft.Extensions.Logging;
 
 namespace Dekaf.Consumer;
@@ -475,6 +476,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
     private readonly IDeserializer<TValue> _valueDeserializer;
     private readonly IConnectionPool _connectionPool;
     private readonly MetadataManager _metadataManager;
+    private readonly ClientTelemetryManager _telemetryManager;
     private readonly ConsumerCoordinator? _coordinator;
     private readonly CompressionCodecRegistry _compressionCodecs;
     private readonly ILogger _logger;
@@ -691,6 +693,10 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
 
         _connectionPool = infrastructure.Pool;
         _metadataManager = infrastructure.Metadata;
+        _telemetryManager = new ClientTelemetryManager(
+            _connectionPool,
+            _metadataManager,
+            loggerFactory?.CreateLogger<ClientTelemetryManager>());
 
         _compressionCodecs = CompressionCodecRegistry.Default;
 
@@ -2670,6 +2676,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
                 return;
 
             await _metadataManager.InitializeAsync(cancellationToken).ConfigureAwait(false);
+            await _telemetryManager.StartAsync(cancellationToken).ConfigureAwait(false);
             _initialized = true;
         }
         finally
@@ -4144,6 +4151,8 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
             prefetched.Dispose();
         }
 
+        await _telemetryManager.StopAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+
         LogConsumerClosed();
     }
 
@@ -4375,6 +4384,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> : IKafkaConsumer<TKey, T
         if (_coordinator is not null)
             await _coordinator.DisposeAsync().ConfigureAwait(false);
 
+        await _telemetryManager.DisposeAsync().ConfigureAwait(false);
         await _metadataManager.DisposeAsync().ConfigureAwait(false);
         await _connectionPool.DisposeAsync().ConfigureAwait(false);
 

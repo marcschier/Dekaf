@@ -13,6 +13,7 @@ using Dekaf.Protocol.Messages;
 using Dekaf.Protocol.Records;
 using Dekaf.Retry;
 using Dekaf.Serialization;
+using Dekaf.Telemetry;
 using Microsoft.Extensions.Logging;
 
 namespace Dekaf.Producer;
@@ -43,6 +44,7 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
     private readonly bool _usesCustomPartitioner;
     private readonly ConnectionPool _connectionPool;
     private readonly MetadataManager _metadataManager;
+    private readonly ClientTelemetryManager _telemetryManager;
     private readonly RecordAccumulator _accumulator;
     internal RecordAccumulator RecordAccumulator => _accumulator;
     private readonly CompressionCodecRegistry _compressionCodecs;
@@ -249,6 +251,11 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
             options.BootstrapServers,
             options: metadataOptions,
             logger: loggerFactory?.CreateLogger<MetadataManager>());
+
+        _telemetryManager = new ClientTelemetryManager(
+            _connectionPool,
+            _metadataManager,
+            loggerFactory?.CreateLogger<ClientTelemetryManager>());
 
         // Re-ratchet shared pool sizes after metadata refresh discovers the real broker count.
         // Bootstrap servers are seed nodes — the actual cluster may have more brokers.
@@ -2378,6 +2385,8 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
                 await InitIdempotentProducerAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            await _telemetryManager.StartAsync(cancellationToken).ConfigureAwait(false);
+
             _initialized = true;
         }
         finally
@@ -3201,6 +3210,15 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         // Dispose ValueTaskSource pool — prevents resource leaks (usually fast).
         await DisposeWithBudgetAsync(
             _valueTaskSourcePool.DisposeAsync(), Math.Max(200, RemainingMs() / 10), "valueTaskSourcePool");
+
+        var telemetryStopMs = Math.Max(200, Math.Min(5000, RemainingMs()));
+        await DisposeWithBudgetAsync(
+            _telemetryManager.StopAsync(TimeSpan.FromMilliseconds(telemetryStopMs)),
+            telemetryStopMs,
+            "telemetry");
+
+        await DisposeWithBudgetAsync(
+            _telemetryManager.DisposeAsync(), Math.Max(100, RemainingMs() / 10), "telemetryManager");
 
         // Dispose metadata manager and connection pool in parallel.
         // Connection pool disposal waits up to ConnectionTimeout (30s default) per connection,
