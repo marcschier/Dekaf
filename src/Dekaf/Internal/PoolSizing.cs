@@ -232,7 +232,7 @@ internal static class PoolSizing
         // ArrayPool<T>.Create eagerly allocates per-bucket metadata based on depth,
         // so keep even producer-driven sizing bounded for pathological options.
         var pipeMemoryArrays = ClampPoolDepth(
-            totalMaxConnections * 32L,
+            SaturatingMultiply(totalMaxConnections, 32L),
             floor: 32,
             ceiling: SharedArrayPoolDepthCeiling);
 
@@ -240,7 +240,7 @@ internal static class PoolSizing
         // Each RentedBufferWriter growth step rents/returns arrays; with multiple connections
         // serializing concurrently, the pool needs depth proportional to peak connections.
         var serializationArrays = ClampPoolDepth(
-            totalMaxConnections * SerializationArraysPerConnection,
+            SaturatingMultiply(totalMaxConnections, SerializationArraysPerConnection),
             floor: 16,
             ceiling: SharedArrayPoolDepthCeiling);
 
