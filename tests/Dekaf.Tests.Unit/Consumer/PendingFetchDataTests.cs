@@ -1,5 +1,6 @@
 using System.Reflection;
 using Dekaf.Consumer;
+using Dekaf.Internal;
 using Dekaf.Protocol.Records;
 
 namespace Dekaf.Tests.Unit.Consumer;
@@ -8,6 +9,10 @@ public class PendingFetchDataTests
 {
     private static readonly FieldInfo ActivityNameField = typeof(PendingFetchData)
         .GetField("_activityName", BindingFlags.Instance | BindingFlags.NonPublic)!;
+    private static readonly FieldInfo MaxPoolSizeField = typeof(PendingFetchData)
+        .GetField("s_maxPoolSize", BindingFlags.Static | BindingFlags.NonPublic)!;
+    private static readonly FieldInfo PoolField = typeof(PendingFetchData)
+        .GetField("s_pool", BindingFlags.Static | BindingFlags.NonPublic)!;
 
     [Test]
     public async Task Constructor_WithActivityName_UsesCachedValue()
@@ -111,6 +116,42 @@ public class PendingFetchDataTests
 
         PendingFetchData.RatchetPoolSize(before + 100);
         await Assert.That(PendingFetchData.MaxPoolSizeValue).IsGreaterThanOrEqualTo(before + 100);
+    }
+
+    [Test]
+    [NotInParallel]
+    public async Task RatchetPoolSize_PreservesPooledInstances()
+    {
+        var originalMaxPoolSize = MaxPoolSizeField.GetValue(null);
+        var originalPool = PoolField.GetValue(null);
+        PendingFetchData? second = null;
+
+        try
+        {
+            MaxPoolSizeField.SetValue(null, 1);
+            PoolField.SetValue(null, new LockFreeStack<PendingFetchData>(1));
+
+            var first = PendingFetchData.Create(
+                "topic-1",
+                partitionIndex: 0,
+                batches: Array.Empty<RecordBatch>());
+            first.Dispose();
+
+            PendingFetchData.RatchetPoolSize(2);
+
+            second = PendingFetchData.Create(
+                "topic-2",
+                partitionIndex: 1,
+                batches: Array.Empty<RecordBatch>());
+
+            await Assert.That(second).IsSameReferenceAs(first);
+        }
+        finally
+        {
+            second?.Dispose();
+            MaxPoolSizeField.SetValue(null, originalMaxPoolSize);
+            PoolField.SetValue(null, originalPool);
+        }
     }
 
     [Test]
