@@ -82,6 +82,80 @@ public class DependencyInjectionTests
         await Assert.That(intDescriptor).IsNotNull();
     }
 
+    [Test]
+    public async Task AddProducer_WithServiceKeys_RegistersDistinctKeyedProducers()
+    {
+        var services = new ServiceCollection();
+
+        services.AddDekaf(builder =>
+        {
+            builder.AddProducer<string, string>("orders", p => p
+                .WithBootstrapServers("localhost:9092")
+                .WithClientId("orders-producer"));
+            builder.AddProducer<string, string>("payments", p => p
+                .WithBootstrapServers("localhost:9092")
+                .WithClientId("payments-producer"));
+        });
+
+        var provider = services.BuildServiceProvider();
+        var orders = provider.GetRequiredKeyedService<IKafkaProducer<string, string>>("orders");
+        var payments = provider.GetRequiredKeyedService<IKafkaProducer<string, string>>("payments");
+
+        await Assert.That(orders).IsNotSameReferenceAs(payments);
+        await Assert.That(GetProducerOptions(orders).ClientId).IsEqualTo("orders-producer");
+        await Assert.That(GetProducerOptions(payments).ClientId).IsEqualTo("payments-producer");
+        await Assert.That(provider.GetServices<IKafkaProducer<string, string>>().Count()).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task AddProducer_DefaultAndKeyed_CanCoexistForSameGenericType()
+    {
+        var services = new ServiceCollection();
+
+        services.AddDekaf(builder =>
+        {
+            builder.AddProducer<string, string>(p => p
+                .WithBootstrapServers("localhost:9092")
+                .WithClientId("default-producer"));
+            builder.AddProducer<string, string>("orders", p => p
+                .WithBootstrapServers("localhost:9092")
+                .WithClientId("orders-producer"));
+        });
+
+        var provider = services.BuildServiceProvider();
+        var defaultProducer = provider.GetRequiredService<IKafkaProducer<string, string>>();
+        var ordersProducer = provider.GetRequiredKeyedService<IKafkaProducer<string, string>>("orders");
+
+        await Assert.That(defaultProducer).IsNotSameReferenceAs(ordersProducer);
+        await Assert.That(GetProducerOptions(defaultProducer).ClientId).IsEqualTo("default-producer");
+        await Assert.That(GetProducerOptions(ordersProducer).ClientId).IsEqualTo("orders-producer");
+    }
+
+    [Test]
+    public async Task AddProducer_WithServiceKeyAndConfigurationSection_BindsOptions()
+    {
+        var services = new ServiceCollection();
+        var configuration = BuildConfiguration(new Dictionary<string, string?>
+        {
+            ["Kafka:Producers:Orders:BootstrapServers"] = "broker1:9092",
+            ["Kafka:Producers:Orders:ClientId"] = "orders-producer"
+        });
+
+        services.AddDekaf(builder =>
+        {
+            builder.AddProducer<string, string>(
+                "orders",
+                configuration.GetSection("Kafka:Producers:Orders"));
+        });
+
+        var provider = services.BuildServiceProvider();
+        var producer = provider.GetRequiredKeyedService<IKafkaProducer<string, string>>("orders");
+        var options = GetProducerOptions(producer);
+
+        await Assert.That(options.BootstrapServers[0]).IsEqualTo("broker1:9092");
+        await Assert.That(options.ClientId).IsEqualTo("orders-producer");
+    }
+
     #endregion
 
     #region AddConsumer Tests
@@ -101,6 +175,56 @@ public class DependencyInjectionTests
         var descriptor = services.FirstOrDefault(d => d.ServiceType == typeof(IKafkaConsumer<string, string>));
         await Assert.That(descriptor).IsNotNull();
         await Assert.That(descriptor!.Lifetime).IsEqualTo(ServiceLifetime.Singleton);
+    }
+
+    [Test]
+    public async Task AddConsumer_WithServiceKeys_RegistersDistinctKeyedConsumers()
+    {
+        var services = new ServiceCollection();
+
+        services.AddDekaf(builder =>
+        {
+            builder.AddConsumer<string, string>("orders", c => c
+                .WithBootstrapServers("localhost:9092")
+                .WithGroupId("orders-group"));
+            builder.AddConsumer<string, string>("payments", c => c
+                .WithBootstrapServers("localhost:9092")
+                .WithGroupId("payments-group"));
+        });
+
+        var provider = services.BuildServiceProvider();
+        var orders = provider.GetRequiredKeyedService<IKafkaConsumer<string, string>>("orders");
+        var payments = provider.GetRequiredKeyedService<IKafkaConsumer<string, string>>("payments");
+
+        await Assert.That(orders).IsNotSameReferenceAs(payments);
+        await Assert.That(GetConsumerOptions(orders).GroupId).IsEqualTo("orders-group");
+        await Assert.That(GetConsumerOptions(payments).GroupId).IsEqualTo("payments-group");
+        await Assert.That(provider.GetServices<IKafkaConsumer<string, string>>().Count()).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task AddConsumer_WithServiceKeyAndConfigurationSection_BindsOptions()
+    {
+        var services = new ServiceCollection();
+        var configuration = BuildConfiguration(new Dictionary<string, string?>
+        {
+            ["Kafka:Consumers:Orders:BootstrapServers"] = "broker1:9092",
+            ["Kafka:Consumers:Orders:GroupId"] = "orders-group"
+        });
+
+        services.AddDekaf(builder =>
+        {
+            builder.AddConsumer<string, string>(
+                "orders",
+                configuration.GetSection("Kafka:Consumers:Orders"));
+        });
+
+        var provider = services.BuildServiceProvider();
+        var consumer = provider.GetRequiredKeyedService<IKafkaConsumer<string, string>>("orders");
+        var options = GetConsumerOptions(consumer);
+
+        await Assert.That(options.BootstrapServers[0]).IsEqualTo("broker1:9092");
+        await Assert.That(options.GroupId).IsEqualTo("orders-group");
     }
 
     #endregion
@@ -532,6 +656,29 @@ public class DependencyInjectionTests
 
         var descriptors = services.Where(d => d.ServiceType == typeof(IInitializableKafkaClient)).ToList();
         await Assert.That(descriptors.Count).IsEqualTo(2);
+    }
+
+    [Test]
+    public async Task AddKeyedProducerAndConsumer_RegisterAsInitializableKafkaClients()
+    {
+        var services = new ServiceCollection();
+
+        services.AddDekaf(builder =>
+        {
+            builder.AddProducer<string, string>("orders", p => p.WithBootstrapServers("localhost:9092"));
+            builder.AddConsumer<string, string>("orders", c => c
+                .WithBootstrapServers("localhost:9092")
+                .WithGroupId("orders"));
+        });
+
+        var provider = services.BuildServiceProvider();
+        var producer = provider.GetRequiredKeyedService<IKafkaProducer<string, string>>("orders");
+        var consumer = provider.GetRequiredKeyedService<IKafkaConsumer<string, string>>("orders");
+        var initializables = provider.GetServices<IInitializableKafkaClient>().ToList();
+
+        await Assert.That(initializables.Count).IsEqualTo(2);
+        await Assert.That(initializables).Contains(producer);
+        await Assert.That(initializables).Contains(consumer);
     }
 
     #endregion

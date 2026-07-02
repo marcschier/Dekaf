@@ -112,42 +112,53 @@ public sealed class DekafBuilder
     /// <param name="configure">Configures the full producer builder surface.</param>
     public DekafBuilder AddProducer<TKey, TValue>(Action<ProducerBuilder<TKey, TValue>> configure)
     {
+        ArgumentNullException.ThrowIfNull(configure);
+        return AddProducerCore(serviceKey: null, isKeyed: false, configure);
+    }
+
+    /// <summary>
+    /// Adds a keyed producer to the service collection.
+    /// </summary>
+    /// <param name="serviceKey">Key used to resolve the producer through keyed DI.</param>
+    /// <param name="configure">Configures the full producer builder surface.</param>
+    public DekafBuilder AddProducer<TKey, TValue>(
+        object serviceKey,
+        Action<ProducerBuilder<TKey, TValue>> configure)
+    {
+        ArgumentNullException.ThrowIfNull(serviceKey);
+        ArgumentNullException.ThrowIfNull(configure);
+        return AddProducerCore(serviceKey, isKeyed: true, configure);
+    }
+
+    private DekafBuilder AddProducerCore<TKey, TValue>(
+        object? serviceKey,
+        bool isKeyed,
+        Action<ProducerBuilder<TKey, TValue>> configure)
+    {
         var builder = new ProducerBuilder<TKey, TValue>();
         configure(builder);
 
         var globalTypes = _globalProducerInterceptorTypes;
 
-        _services.AddSingleton<IKafkaProducer<TKey, TValue>>(sp =>
+        if (isKeyed)
         {
-            var loggerFactory = sp.GetService<ILoggerFactory>();
+            _services.AddKeyedSingleton<IKafkaProducer<TKey, TValue>>(
+                serviceKey!,
+                (sp, _) => BuildProducer(sp, builder, globalTypes));
 
-            if (globalTypes.Count > 0)
-            {
-                var globalInterceptors = new List<IProducerInterceptor<TKey, TValue>>(globalTypes.Count);
-                foreach (var type in globalTypes)
-                {
-                    var closedType = type.IsGenericTypeDefinition
-                        ? type.MakeGenericType(typeof(TKey), typeof(TValue))
-                        : type;
-                    var interceptor = (IProducerInterceptor<TKey, TValue>)
-                        ActivatorUtilities.CreateInstance(sp, closedType);
-                    globalInterceptors.Add(interceptor);
-                }
+            // Register as IInitializableKafkaClient (resolves the same keyed singleton instance).
+            _services.AddSingleton<IInitializableKafkaClient>(sp =>
+                sp.GetRequiredKeyedService<IKafkaProducer<TKey, TValue>>(serviceKey!));
+        }
+        else
+        {
+            _services.AddSingleton<IKafkaProducer<TKey, TValue>>(sp =>
+                BuildProducer(sp, builder, globalTypes));
 
-                builder.AddInterceptorsFirst(globalInterceptors);
-            }
-
-            if (loggerFactory is not null)
-            {
-                builder.WithLoggerFactory(loggerFactory);
-            }
-
-            return builder.Build();
-        });
-
-        // Register as IInitializableKafkaClient (resolves the same singleton instance)
-        _services.AddSingleton<IInitializableKafkaClient>(sp =>
-            sp.GetRequiredService<IKafkaProducer<TKey, TValue>>());
+            // Register as IInitializableKafkaClient (resolves the same singleton instance).
+            _services.AddSingleton<IInitializableKafkaClient>(sp =>
+                sp.GetRequiredService<IKafkaProducer<TKey, TValue>>());
+        }
 
         return this;
     }
@@ -172,6 +183,28 @@ public sealed class DekafBuilder
     }
 
     /// <summary>
+    /// Adds a keyed producer configured from an <see cref="IConfiguration"/> section.
+    /// Fluent configuration runs after binding, so it can override config values and add services such as serializers.
+    /// </summary>
+    /// <param name="serviceKey">Key used to resolve the producer through keyed DI.</param>
+    /// <param name="configuration">Configuration section using <see cref="ProducerOptions"/> property names.</param>
+    /// <param name="configure">Optional additional producer configuration.</param>
+    public DekafBuilder AddProducer<TKey, TValue>(
+        object serviceKey,
+        IConfiguration configuration,
+        Action<ProducerBuilder<TKey, TValue>>? configure = null)
+    {
+        ArgumentNullException.ThrowIfNull(serviceKey);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        return AddProducer<TKey, TValue>(serviceKey, producer =>
+        {
+            DekafConfigurationBinding.ApplyProducer(configuration, producer);
+            configure?.Invoke(producer);
+        });
+    }
+
+    /// <summary>
     /// Adds a consumer to the service collection.
     /// </summary>
     /// <param name="configure">Configures the full consumer builder surface.</param>
@@ -180,42 +213,56 @@ public sealed class DekafBuilder
         Action<ConsumerBuilder<TKey, TValue>> configure,
         Action<DeadLetterQueueBuilder>? configureDeadLetterQueue = null)
     {
+        ArgumentNullException.ThrowIfNull(configure);
+        return AddConsumerCore(serviceKey: null, isKeyed: false, configure, configureDeadLetterQueue);
+    }
+
+    /// <summary>
+    /// Adds a keyed consumer to the service collection.
+    /// </summary>
+    /// <param name="serviceKey">Key used to resolve the consumer through keyed DI.</param>
+    /// <param name="configure">Configures the full consumer builder surface.</param>
+    /// <param name="configureDeadLetterQueue">Optional dead letter queue configuration for hosted consumer services.</param>
+    public DekafBuilder AddConsumer<TKey, TValue>(
+        object serviceKey,
+        Action<ConsumerBuilder<TKey, TValue>> configure,
+        Action<DeadLetterQueueBuilder>? configureDeadLetterQueue = null)
+    {
+        ArgumentNullException.ThrowIfNull(serviceKey);
+        ArgumentNullException.ThrowIfNull(configure);
+        return AddConsumerCore(serviceKey, isKeyed: true, configure, configureDeadLetterQueue);
+    }
+
+    private DekafBuilder AddConsumerCore<TKey, TValue>(
+        object? serviceKey,
+        bool isKeyed,
+        Action<ConsumerBuilder<TKey, TValue>> configure,
+        Action<DeadLetterQueueBuilder>? configureDeadLetterQueue)
+    {
         var builder = new ConsumerBuilder<TKey, TValue>();
         configure(builder);
 
         var globalTypes = _globalConsumerInterceptorTypes;
 
-        _services.AddSingleton<IKafkaConsumer<TKey, TValue>>(sp =>
+        if (isKeyed)
         {
-            var loggerFactory = sp.GetService<ILoggerFactory>();
+            _services.AddKeyedSingleton<IKafkaConsumer<TKey, TValue>>(
+                serviceKey!,
+                (sp, _) => BuildConsumer(sp, builder, globalTypes));
 
-            if (globalTypes.Count > 0)
-            {
-                var globalInterceptors = new List<IConsumerInterceptor<TKey, TValue>>(globalTypes.Count);
-                foreach (var type in globalTypes)
-                {
-                    var closedType = type.IsGenericTypeDefinition
-                        ? type.MakeGenericType(typeof(TKey), typeof(TValue))
-                        : type;
-                    var interceptor = (IConsumerInterceptor<TKey, TValue>)
-                        ActivatorUtilities.CreateInstance(sp, closedType);
-                    globalInterceptors.Add(interceptor);
-                }
+            // Register as IInitializableKafkaClient (resolves the same keyed singleton instance).
+            _services.AddSingleton<IInitializableKafkaClient>(sp =>
+                sp.GetRequiredKeyedService<IKafkaConsumer<TKey, TValue>>(serviceKey!));
+        }
+        else
+        {
+            _services.AddSingleton<IKafkaConsumer<TKey, TValue>>(sp =>
+                BuildConsumer(sp, builder, globalTypes));
 
-                builder.AddInterceptorsFirst(globalInterceptors);
-            }
-
-            if (loggerFactory is not null)
-            {
-                builder.WithLoggerFactory(loggerFactory);
-            }
-
-            return builder.Build();
-        });
-
-        // Register as IInitializableKafkaClient (resolves the same singleton instance)
-        _services.AddSingleton<IInitializableKafkaClient>(sp =>
-            sp.GetRequiredService<IKafkaConsumer<TKey, TValue>>());
+            // Register as IInitializableKafkaClient (resolves the same singleton instance).
+            _services.AddSingleton<IInitializableKafkaClient>(sp =>
+                sp.GetRequiredService<IKafkaConsumer<TKey, TValue>>());
+        }
 
         if (configureDeadLetterQueue is not null)
         {
@@ -259,6 +306,33 @@ public sealed class DekafBuilder
     }
 
     /// <summary>
+    /// Adds a keyed consumer configured from an <see cref="IConfiguration"/> section.
+    /// Fluent configuration runs after binding, so it can override config values and add services such as deserializers.
+    /// </summary>
+    /// <param name="serviceKey">Key used to resolve the consumer through keyed DI.</param>
+    /// <param name="configuration">Configuration section using <see cref="ConsumerOptions"/> property names.</param>
+    /// <param name="configure">Optional additional consumer configuration.</param>
+    /// <param name="configureDeadLetterQueue">Optional dead letter queue configuration for hosted consumer services.</param>
+    public DekafBuilder AddConsumer<TKey, TValue>(
+        object serviceKey,
+        IConfiguration configuration,
+        Action<ConsumerBuilder<TKey, TValue>>? configure = null,
+        Action<DeadLetterQueueBuilder>? configureDeadLetterQueue = null)
+    {
+        ArgumentNullException.ThrowIfNull(serviceKey);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        return AddConsumer<TKey, TValue>(
+            serviceKey,
+            consumer =>
+            {
+                DekafConfigurationBinding.ApplyConsumer(configuration, consumer);
+                configure?.Invoke(consumer);
+            },
+            configureDeadLetterQueue);
+    }
+
+    /// <summary>
     /// Adds an admin client to the service collection.
     /// </summary>
     public DekafBuilder AddAdminClient(Action<AdminClientServiceBuilder> configure)
@@ -292,6 +366,68 @@ public sealed class DekafBuilder
             admin.ApplyConfiguration(configuration);
             configure?.Invoke(admin);
         });
+    }
+
+    private static IKafkaProducer<TKey, TValue> BuildProducer<TKey, TValue>(
+        IServiceProvider serviceProvider,
+        ProducerBuilder<TKey, TValue> builder,
+        IReadOnlyList<Type> globalTypes)
+    {
+        var loggerFactory = serviceProvider.GetService<ILoggerFactory>();
+
+        if (globalTypes.Count > 0)
+        {
+            var globalInterceptors = new List<IProducerInterceptor<TKey, TValue>>(globalTypes.Count);
+            foreach (var type in globalTypes)
+            {
+                var closedType = type.IsGenericTypeDefinition
+                    ? type.MakeGenericType(typeof(TKey), typeof(TValue))
+                    : type;
+                var interceptor = (IProducerInterceptor<TKey, TValue>)
+                    ActivatorUtilities.CreateInstance(serviceProvider, closedType);
+                globalInterceptors.Add(interceptor);
+            }
+
+            builder.AddInterceptorsFirst(globalInterceptors);
+        }
+
+        if (loggerFactory is not null)
+        {
+            builder.WithLoggerFactory(loggerFactory);
+        }
+
+        return builder.Build();
+    }
+
+    private static IKafkaConsumer<TKey, TValue> BuildConsumer<TKey, TValue>(
+        IServiceProvider serviceProvider,
+        ConsumerBuilder<TKey, TValue> builder,
+        IReadOnlyList<Type> globalTypes)
+    {
+        var loggerFactory = serviceProvider.GetService<ILoggerFactory>();
+
+        if (globalTypes.Count > 0)
+        {
+            var globalInterceptors = new List<IConsumerInterceptor<TKey, TValue>>(globalTypes.Count);
+            foreach (var type in globalTypes)
+            {
+                var closedType = type.IsGenericTypeDefinition
+                    ? type.MakeGenericType(typeof(TKey), typeof(TValue))
+                    : type;
+                var interceptor = (IConsumerInterceptor<TKey, TValue>)
+                    ActivatorUtilities.CreateInstance(serviceProvider, closedType);
+                globalInterceptors.Add(interceptor);
+            }
+
+            builder.AddInterceptorsFirst(globalInterceptors);
+        }
+
+        if (loggerFactory is not null)
+        {
+            builder.WithLoggerFactory(loggerFactory);
+        }
+
+        return builder.Build();
     }
 }
 
