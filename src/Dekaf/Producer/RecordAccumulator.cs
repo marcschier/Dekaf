@@ -3219,9 +3219,12 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
 
             if (!sealAll)
             {
-                // This is a best-effort hint. If a concurrent append creates a batch after our
-                // queue snapshot, the next tick falls through and observes its queue entry.
-                Volatile.Write(ref _oldestBatchCreatedTicks, newOldestTicks);
+                // This is a best-effort lower-bound hint. Linger mode drains a queue snapshot,
+                // so a concurrent append or queued partition outside this snapshot may be older
+                // than newOldestTicks. Only lower the hint; raising it can delay an already
+                // expired batch until a newer batch reaches linger.
+                if (newOldestTicks != long.MaxValue)
+                    TrackOldestBatchCreated(newOldestTicks);
             }
             else
             {

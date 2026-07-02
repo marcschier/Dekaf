@@ -587,6 +587,38 @@ public class RecordAccumulatorReadyTests
     }
 
     [Test]
+    public async Task ExpireLingerAsync_DoesNotRaiseOldestBatchHint()
+    {
+        var options = CreateTestOptions(batchSize: 100_000, lingerMs: 10_000);
+        var accumulator = new RecordAccumulator(options);
+
+        try
+        {
+            var pooledKey = new PooledMemory(null, 0, isNull: true);
+            var pooledValue = new PooledMemory(null, 0, isNull: true);
+
+            var appended = await accumulator.AppendAsync(
+                "test-topic", 0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                pooledKey, pooledValue, null, 0, null, null, CancellationToken.None);
+
+            await Assert.That(appended).IsTrue();
+
+            var createdTicks = GetPrivateField<long>(accumulator, "_oldestBatchCreatedTicks");
+            var olderHint = Math.Max(0, createdTicks - Stopwatch.Frequency);
+            SetPrivateField(accumulator, "_oldestBatchCreatedTicks", olderHint);
+
+            await accumulator.ExpireLingerAsync(CancellationToken.None);
+
+            await Assert.That(GetPrivateField<long>(accumulator, "_oldestBatchCreatedTicks"))
+                .IsEqualTo(olderHint);
+        }
+        finally
+        {
+            await accumulator.DisposeAsync();
+        }
+    }
+
+    [Test]
     public async Task Drain_MaxRequestSizeExceeded_ReenqueuesSkippedPartitions()
     {
         // Regression test: when DrainBatchesForOneNode hits maxRequestSize and breaks,
@@ -1007,5 +1039,11 @@ public class RecordAccumulatorReadyTests
     {
         var field = instance.GetType().GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Instance);
         return (T)field!.GetValue(instance)!;
+    }
+
+    private static void SetPrivateField<T>(object instance, string fieldName, T value)
+    {
+        var field = instance.GetType().GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Instance);
+        field!.SetValue(instance, value);
     }
 }
