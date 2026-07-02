@@ -143,7 +143,6 @@ public sealed partial class KafkaConnection : IKafkaConnection
     private Socket? _socket;
     private Stream? _stream;
     private PipeReader? _reader;
-    private PipeWriter? _writer;
     private SocketPipe? _socketPipe;
     private DuplexPipe? _duplexPipe;
     private PipeMemoryPool? _pipeMemoryPool;
@@ -199,7 +198,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
     public int BrokerId { get; private set; } = -1;
     public string Host => _host;
     public int Port => _port;
-    public bool IsConnected => Volatile.Read(ref _disposed) == 0 && (_socket?.Connected ?? false) && _writer is not null;
+    public bool IsConnected => Volatile.Read(ref _disposed) == 0 && (_socket?.Connected ?? false) && _stream is not null;
 
     /// <summary>
     /// Gets the current SASL session state, if SASL authentication was performed.
@@ -395,14 +394,6 @@ public sealed partial class KafkaConnection : IKafkaConnection
             _pipeMemoryPool?.Dispose();
             _pipeMemoryPool = new PipeMemoryPool();
         }
-
-        // RetainedBufferPipeWriter keeps its internal buffer across FlushAsync calls, avoiding
-        // the per-flush rent/return cycle of StreamPipeWriter that causes hundreds of GB of
-        // allocation churn under high-throughput single-connection scenarios (idempotent producer).
-        // minimumBufferSize is kept modest (64 KB) — the writer allocates larger buffers on demand
-        // via GetMemory when needed, and retains the high-water-mark buffer for the connection's
-        // lifetime. See RetainedBufferPipeWriter for full rationale.
-        _writer = new RetainedBufferPipeWriter(_stream, _pipeMemoryPool, minimumBufferSize: 65536);
 
         // Use a read pump to decouple reads from PipeReader signaling.
         // PipeReader.Create(Stream).ReadAsync can block indefinitely when concurrent reads
@@ -835,16 +826,12 @@ public sealed partial class KafkaConnection : IKafkaConnection
                 .ConfigureAwait(false);
             try
             {
-                // Copy pre-serialized data into the PipeWriter (synchronous — no thread switch).
-                // Return the serialized array to the dedicated RentedBufferWriter pool immediately
-                // BEFORE FlushAsync. The dedicated pool uses lock-based (not TLS-based) caching,
-                // so cross-thread returns are safe — but returning early keeps the buffer available
-                // for reuse sooner.
-                CopyPreSerializedToPipeWriter(serializedArray, serializedLength);
-                DekafPools.SerializationBuffers.Return(serializedArray);
-                arrayToReturn = null; // Already returned — prevent double-return in finally
-
-                await FlushPipeWriterAsync(correlationId, cancellationToken, callerOwnsTimeout)
+                await WritePreSerializedToStreamAsync(
+                        serializedArray,
+                        serializedLength,
+                        correlationId,
+                        cancellationToken,
+                        callerOwnsTimeout)
                     .ConfigureAwait(false);
             }
             finally
@@ -859,34 +846,14 @@ public sealed partial class KafkaConnection : IKafkaConnection
         }
     }
 
-    /// <summary>
-    /// Copies pre-serialized request data into the PipeWriter's buffer (synchronous).
-    /// Must be called under the write lock. The caller should return the serialized array
-    /// to its pool immediately after this call — before any async operations — to prevent
-    /// cross-thread ArrayPool returns that cause WorkingSet growth.
-    /// </summary>
-    private void CopyPreSerializedToPipeWriter(byte[] serializedData, int length)
-    {
-        if (_writer is null)
-            throw new InvalidOperationException("Not connected");
-
-        // Write pre-serialized data atomically: single GetMemory/Advance ensures no partial
-        // frame is committed if the copy throws.
-        var memory = _writer.GetMemory(length);
-        serializedData.AsSpan(0, length).CopyTo(memory.Span);
-        _writer.Advance(length);
-    }
-
-    /// <summary>
-    /// Flushes the PipeWriter with timeout handling. Must be called under the write lock
-    /// after <see cref="CopyPreSerializedToPipeWriter"/>.
-    /// </summary>
-    private async ValueTask FlushPipeWriterAsync(
+    private async ValueTask WritePreSerializedToStreamAsync(
+        byte[] serializedData,
+        int length,
         int correlationId,
         CancellationToken cancellationToken,
         bool callerOwnsTimeout = false)
     {
-        if (_writer is null)
+        if (_stream is null)
             throw new InvalidOperationException("Not connected");
 
 #if DEBUG
@@ -894,16 +861,17 @@ public sealed partial class KafkaConnection : IKafkaConnection
             "callerOwnsTimeout path requires a timeout-bearing token");
 #endif
 
-        // Apply timeout to the flush operation.
+        var memory = serializedData.AsMemory(0, length);
+
+        // Apply timeout to the write operation.
         // When callerOwnsTimeout is true, the caller's cancellationToken already carries
         // a timeout (e.g. BrokerSender's sendTimeoutCts), so we skip the per-write CTS
         // rent and CancellationTokenRegistration allocation — a hot-path optimization.
-        FlushResult result;
         if (callerOwnsTimeout)
         {
             try
             {
-                result = await _writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+                await _stream.WriteAsync(memory, cancellationToken).ConfigureAwait(false);
             }
             // callerOwnsTimeout contract: token fires only on timeout, never explicit user cancellation.
             // Any OperationCanceledException here means the caller's timeout elapsed.
@@ -925,7 +893,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
             try
             {
-                result = await _writer.FlushAsync(timeoutCts.Token).ConfigureAwait(false);
+                await _stream.WriteAsync(memory, timeoutCts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
@@ -934,18 +902,6 @@ public sealed partial class KafkaConnection : IKafkaConnection
                 throw new KafkaException(
                     $"Flush timeout after {(int)_options.RequestTimeout.TotalMilliseconds}ms on connection to broker {BrokerId}");
             }
-        }
-
-        if (result.IsCompleted)
-        {
-            throw new IOException("Connection closed while writing");
-        }
-
-        // IsCanceled is set when PipeWriter.CancelPendingFlush() is called — distinct from
-        // the CancellationToken-based cancellation above which throws OperationCanceledException.
-        if (result.IsCanceled)
-        {
-            throw new IOException("Flush operation was canceled");
         }
     }
 
@@ -2019,9 +1975,6 @@ public sealed partial class KafkaConnection : IKafkaConnection
         }
 
         _receiveCts?.Dispose();
-
-        if (_writer is not null)
-            await _writer.CompleteAsync().ConfigureAwait(false);
 
         // Invariant: at most one pipe type is created per connection (plain TCP or TLS, never both).
         Debug.Assert(_socketPipe is null || _duplexPipe is null,
