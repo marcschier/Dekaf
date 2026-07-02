@@ -122,6 +122,64 @@ public class PooledValueTaskSourceTests
     }
 
     [Test]
+    public async Task RegisterCancellation_CancelsSource()
+    {
+        var pool = new ValueTaskSourcePool<int>();
+        var source = pool.Rent();
+        using var cts = new CancellationTokenSource();
+
+        source.RegisterCancellation(cts.Token);
+        cts.Cancel();
+
+        var exception = await Assert.ThrowsAsync<OperationCanceledException>(async () =>
+        {
+            await source.Task.ConfigureAwait(false);
+        });
+
+        await Assert.That(exception!.CancellationToken).IsEqualTo(cts.Token);
+    }
+
+    [Test]
+    public async Task RegisterCancellation_PreCanceledToken_ReturnsToPoolAfterAwait()
+    {
+        var pool = new ValueTaskSourcePool<int>(maxPoolSize: 1);
+        var source = pool.Rent();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        source.RegisterCancellation(cts.Token);
+
+        await Assert.ThrowsAsync<OperationCanceledException>(async () =>
+        {
+            await source.Task.ConfigureAwait(false);
+        });
+
+        await Assert.That(pool.ApproximateCount).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task RegisterCancellation_DisposesRegistrationBeforeReuse()
+    {
+        var pool = new ValueTaskSourcePool<int>(maxPoolSize: 1);
+        var source = pool.Rent();
+        using var cts = new CancellationTokenSource();
+
+        source.RegisterCancellation(cts.Token);
+        source.SetResult(1);
+        await source.Task.ConfigureAwait(false);
+
+        var reused = pool.Rent();
+        await Assert.That(reused).IsSameReferenceAs(source);
+
+        cts.Cancel();
+
+        reused.SetResult(2);
+        var result = await reused.Task.ConfigureAwait(false);
+
+        await Assert.That(result).IsEqualTo(2);
+    }
+
+    [Test]
     public async Task Source_ResetsAfterAwait_CanBeReused()
     {
         // Create a pool with max size 1 to ensure reuse

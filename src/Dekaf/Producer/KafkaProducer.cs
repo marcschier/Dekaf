@@ -467,28 +467,13 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
     /// GetResult() is called and the pool item is properly returned.
     /// The message delivery continues in background regardless.
     /// </summary>
-    private static async ValueTask<RecordMetadata> AwaitWithCancellation(
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ValueTask<RecordMetadata> AwaitWithCancellation(
         PooledValueTaskSource<RecordMetadata> completion,
         CancellationToken cancellationToken)
     {
-        // Capture both completion and token in a tuple for the callback
-        var state = (completion, cancellationToken);
-        var registration = cancellationToken.Register(
-            static s =>
-            {
-                var (comp, token) = ((PooledValueTaskSource<RecordMetadata>, CancellationToken))s!;
-                comp.TrySetCanceled(token);
-            },
-            state);
-
-        try
-        {
-            return await completion.Task.ConfigureAwait(false);
-        }
-        finally
-        {
-            await registration.DisposeAsync().ConfigureAwait(false);
-        }
+        completion.RegisterCancellation(cancellationToken);
+        return completion.Task;
     }
 
     /// <summary>
@@ -545,18 +530,10 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         CancellationToken cancellationToken)
     {
         var startTimestamp = Stopwatch.GetTimestamp();
-        CancellationTokenRegistration registration = default;
 
         if (cancellationToken.CanBeCanceled)
         {
-            var state = (completion, cancellationToken);
-            registration = cancellationToken.Register(
-                static s =>
-                {
-                    var (comp, token) = ((PooledValueTaskSource<RecordMetadata>, CancellationToken))s!;
-                    comp.TrySetCanceled(token);
-                },
-                state);
+            completion.RegisterCancellation(cancellationToken);
         }
 
         try
@@ -583,10 +560,6 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         finally
         {
             activity.Dispose();
-            if (cancellationToken.CanBeCanceled)
-            {
-                await registration.DisposeAsync().ConfigureAwait(false);
-            }
         }
     }
 
