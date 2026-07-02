@@ -93,7 +93,10 @@ public sealed class MetadataRequest : IKafkaRequest<MetadataResponse>
             return new MetadataRequest { Topics = topics };
         }
 
-        var topicList = new List<MetadataRequestTopic>();
+        var topicList = topicNames.TryGetNonEnumeratedCount(out var count)
+            ? new List<MetadataRequestTopic>(count)
+            : [];
+
         foreach (var name in topicNames)
         {
             topicList.Add(new MetadataRequestTopic { Name = name });
