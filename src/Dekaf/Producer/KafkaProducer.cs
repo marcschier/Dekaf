@@ -104,6 +104,9 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
     // Application-level retry policy (null = no retries, zero overhead on fast path)
     private readonly IRetryPolicy? _retryPolicy;
 
+    private readonly ConcurrentDictionary<string, TagList> _metricTagsCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, string> _activityNameCache = new(StringComparer.Ordinal);
+
     // Single thread-local cache consolidating all per-thread producer state.
     // Reduces 9 separate [ThreadStatic] lookups (each hitting GetGCThreadStaticsByIndexSlow)
     // to a single lookup per method entry point.
@@ -418,6 +421,10 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
             {
                 return AwaitWithActivity(completion!, activity, message.Topic, cancellationToken);
             }
+            if (ProducerMetricsEnabled())
+            {
+                return AwaitWithMetrics(completion!, message.Topic, cancellationToken);
+            }
             if (cancellationToken.CanBeCanceled)
             {
                 return AwaitWithCancellation(completion!, cancellationToken);
@@ -485,10 +492,53 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
     }
 
     /// <summary>
+    /// Awaits a completion source with metrics and optional cancellation support.
+    /// </summary>
+    private async ValueTask<RecordMetadata> AwaitWithMetrics(
+        PooledValueTaskSource<RecordMetadata> completion,
+        string topic,
+        CancellationToken cancellationToken)
+    {
+        var startTimestamp = Stopwatch.GetTimestamp();
+        CancellationTokenRegistration registration = default;
+
+        if (cancellationToken.CanBeCanceled)
+        {
+            var state = (completion, cancellationToken);
+            registration = cancellationToken.Register(
+                static s =>
+                {
+                    var (comp, token) = ((PooledValueTaskSource<RecordMetadata>, CancellationToken))s!;
+                    comp.TrySetCanceled(token);
+                },
+                state);
+        }
+
+        try
+        {
+            var metadata = await completion.Task.ConfigureAwait(false);
+            EmitProduceSuccessMetrics(topic, metadata, startTimestamp);
+            return metadata;
+        }
+        catch
+        {
+            Diagnostics.DekafMetrics.ProduceErrors.Add(1, GetMetricTags(topic));
+            throw;
+        }
+        finally
+        {
+            if (cancellationToken.CanBeCanceled)
+            {
+                await registration.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
     /// Awaits a completion source with Activity lifecycle and optional cancellation support.
     /// Records OTel metrics and sets span status/tags on completion.
     /// </summary>
-    private static async ValueTask<RecordMetadata> AwaitWithActivity(
+    private async ValueTask<RecordMetadata> AwaitWithActivity(
         PooledValueTaskSource<RecordMetadata> completion,
         Activity activity,
         string topic,
@@ -519,20 +569,14 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
             activity.SetTag(Diagnostics.DekafDiagnostics.MessagingMessageBodySize, metadata.KeySize + metadata.ValueSize);
             activity.SetStatus(ActivityStatusCode.Ok);
 
-            var tagList = new TagList { { Diagnostics.DekafDiagnostics.MessagingDestinationName, topic } };
-            Diagnostics.DekafMetrics.MessagesSent.Add(1, tagList);
-            Diagnostics.DekafMetrics.BytesSent.Add(metadata.KeySize + metadata.ValueSize, tagList);
-            Diagnostics.DekafMetrics.OperationDuration.Record(
-                Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds, tagList);
+            EmitProduceSuccessMetrics(topic, metadata, startTimestamp);
 
             return metadata;
         }
         catch (Exception ex)
         {
             Diagnostics.DekafDiagnostics.RecordException(activity, ex);
-
-            var tagList = new TagList { { Diagnostics.DekafDiagnostics.MessagingDestinationName, topic } };
-            Diagnostics.DekafMetrics.ProduceErrors.Add(1, tagList);
+            Diagnostics.DekafMetrics.ProduceErrors.Add(1, GetMetricTags(topic));
 
             throw;
         }
@@ -545,6 +589,28 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
             }
         }
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool ProducerMetricsEnabled()
+        => Diagnostics.DekafMetrics.MessagesSent.Enabled
+           || Diagnostics.DekafMetrics.BytesSent.Enabled
+           || Diagnostics.DekafMetrics.OperationDuration.Enabled
+           || Diagnostics.DekafMetrics.ProduceErrors.Enabled;
+
+    private void EmitProduceSuccessMetrics(string topic, RecordMetadata metadata, long startTimestamp)
+    {
+        var tagList = GetMetricTags(topic);
+        Diagnostics.DekafMetrics.MessagesSent.Add(1, tagList);
+        Diagnostics.DekafMetrics.BytesSent.Add(metadata.KeySize + metadata.ValueSize, tagList);
+        Diagnostics.DekafMetrics.OperationDuration.Record(
+            Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds, tagList);
+    }
+
+    private TagList GetMetricTags(string topic)
+        => _metricTagsCache.GetOrAdd(topic, static t => new TagList
+        {
+            { Diagnostics.DekafDiagnostics.MessagingDestinationName, t }
+        });
 
     /// <summary>
     /// Attempts synchronous produce for awaited ProduceAsync when metadata is cached.
@@ -628,6 +694,10 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
             {
                 return await AwaitWithActivity(fastCompletion!, activity, message.Topic, cancellationToken).ConfigureAwait(false);
             }
+            if (ProducerMetricsEnabled())
+            {
+                return await AwaitWithMetrics(fastCompletion!, message.Topic, cancellationToken).ConfigureAwait(false);
+            }
             if (cancellationToken.CanBeCanceled)
             {
                 return await AwaitWithCancellation(fastCompletion!, cancellationToken).ConfigureAwait(false);
@@ -653,6 +723,10 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         if (activity is not null)
         {
             return await AwaitWithActivity(completion, activity, message.Topic, cancellationToken).ConfigureAwait(false);
+        }
+        if (ProducerMetricsEnabled())
+        {
+            return await AwaitWithMetrics(completion, message.Topic, cancellationToken).ConfigureAwait(false);
         }
         if (cancellationToken.CanBeCanceled)
         {
@@ -999,7 +1073,7 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
             return null;
 
         var activity = Diagnostics.DekafDiagnostics.Source.StartActivity(
-            $"{message.Topic} publish", ActivityKind.Producer);
+            GetPublishActivityName(message.Topic), ActivityKind.Producer);
         if (activity is not null)
         {
             activity.SetTag(Diagnostics.DekafDiagnostics.MessagingSystem, Diagnostics.DekafDiagnostics.MessagingSystemValue);
@@ -1016,6 +1090,9 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
 
         return activity;
     }
+
+    private string GetPublishActivityName(string topic)
+        => _activityNameCache.GetOrAdd(topic, static t => $"{t} publish");
 
     /// <summary>
     /// Invokes OnAcknowledgement interceptors for all messages in a batch.
