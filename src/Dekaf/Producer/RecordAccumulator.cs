@@ -2067,6 +2067,8 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                         if (TryAppendToBatch(currentBatch, timestamp, key, value, headers, headerCount,
                             completionSource, callback, recordSize))
                         {
+                            if (completionSource is not null)
+                                QueueLingerPartition(pd, topicPartition);
                             batchToReturn = rentedBatch;
                             rentedBatch = null;
                             appendSucceeded = true;
@@ -2378,6 +2380,8 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                         if (TryAppendFromSpansToBatch(currentBatch, timestamp, keyData, keyIsNull, valueData, valueIsNull,
                             headers, headerCount, completionSource, callback, recordSize))
                         {
+                            if (completionSource is not null)
+                                QueueLingerPartition(pd, topicPartition);
                             batchToReturn = rentedBatch;
                             rentedBatch = null;
                             appendSucceeded = true;

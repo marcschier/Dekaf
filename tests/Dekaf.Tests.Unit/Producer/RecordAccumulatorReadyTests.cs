@@ -587,6 +587,43 @@ public class RecordAccumulatorReadyTests
     }
 
     [Test]
+    public async Task LingerPartitionsQueue_AwaitedAppendRequeuesWhenFlagCleared()
+    {
+        var options = CreateTestOptions(batchSize: 100_000, lingerMs: 10_000);
+        var accumulator = new RecordAccumulator(options);
+        var pool = new ValueTaskSourcePool<RecordMetadata>();
+
+        try
+        {
+            var pooledKey = new PooledMemory(null, 0, isNull: true);
+            var pooledValue = new PooledMemory(null, 0, isNull: true);
+
+            var firstCompletion = pool.Rent();
+            accumulator.TryAppendWithCompletion("test-topic", 0,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                pooledKey, pooledValue, null, 0, firstCompletion);
+
+            var lingerQueue = GetPrivateField<ConcurrentQueue<TopicPartition>>(accumulator, "_lingerPartitions");
+            await Assert.That(lingerQueue.TryDequeue(out _)).IsTrue();
+
+            var partitionDeque = GetPartitionDeque(accumulator, "test-topic", 0);
+            SetInstanceField(partitionDeque, "LingerQueued", 0);
+
+            var secondCompletion = pool.Rent();
+            accumulator.TryAppendWithCompletion("test-topic", 0,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                pooledKey, pooledValue, null, 0, secondCompletion);
+
+            await Assert.That(lingerQueue.Count).IsEqualTo(1);
+        }
+        finally
+        {
+            await accumulator.DisposeAsync();
+            await pool.DisposeAsync();
+        }
+    }
+
+    [Test]
     public async Task ExpireLingerAsync_DoesNotRaiseOldestBatchHint()
     {
         var options = CreateTestOptions(batchSize: 100_000, lingerMs: 10_000);
@@ -1044,6 +1081,21 @@ public class RecordAccumulatorReadyTests
     private static void SetPrivateField<T>(object instance, string fieldName, T value)
     {
         var field = instance.GetType().GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Instance);
+        field!.SetValue(instance, value);
+    }
+
+    private static object GetPartitionDeque(RecordAccumulator accumulator, string topic, int partition)
+    {
+        var method = typeof(RecordAccumulator).GetMethod(
+            "GetOrCreateDeque",
+            BindingFlags.NonPublic | BindingFlags.Instance,
+            [typeof(string), typeof(int)]);
+        return method!.Invoke(accumulator, [topic, partition])!;
+    }
+
+    private static void SetInstanceField<T>(object instance, string fieldName, T value)
+    {
+        var field = instance.GetType().GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
         field!.SetValue(instance, value);
     }
 }
