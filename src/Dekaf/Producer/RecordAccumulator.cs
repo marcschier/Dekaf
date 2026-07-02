@@ -798,9 +798,14 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
     private long _oldestBatchCreatedTicks = long.MaxValue;
 
     // Track whether there are pending awaited produces (ProduceAsync with completion sources).
-    // These need immediate flushing via ShouldFlush() regardless of LingerMs, so we can't
-    // skip enumeration when this counter is non-zero.
+    // These need micro-linger checks regardless of LingerMs, so ExpireLingerAsync drains the
+    // active linger queue when this counter is non-zero.
     private int _pendingAwaitedProduceCount;
+
+    // Push-based notification queue for partitions with an unsealed CurrentBatch.
+    // Linger drains this instead of scanning _partitionDeques every 1ms, making awaited-produce
+    // checks O(active unsealed partitions) instead of O(all partitions ever touched).
+    private readonly ConcurrentQueue<TopicPartition> _lingerPartitions = new();
 
     // Push-based notification queue for partitions with sealed batches ready to send.
     // Populated by append rotation, SealBatchesAsync, and Reenqueue when a batch
@@ -966,6 +971,9 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
 
         /// <summary>Current unsealed batch accepting new records. Null if no active batch.</summary>
         public PartitionBatch? CurrentBatch;
+
+        /// <summary>1 when this partition has an entry in the linger notification queue.</summary>
+        public int LingerQueued;
 
         /// <summary>
         /// True while a thread has detached CurrentBatch and is completing it outside Lock.
@@ -1907,6 +1915,38 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         return deque;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void TrackCurrentBatchForLinger(PartitionDeque pd, TopicPartition topicPartition, PartitionBatch batch)
+    {
+        TrackOldestBatchCreated(batch.CreatedAtStopwatchTimestamp);
+        QueueLingerPartition(pd, topicPartition);
+    }
+
+    private void TrackOldestBatchCreated(long createdTicks)
+    {
+        var current = Volatile.Read(ref _oldestBatchCreatedTicks);
+        while (createdTicks < current)
+        {
+            var original = Interlocked.CompareExchange(ref _oldestBatchCreatedTicks, createdTicks, current);
+            if (original == current)
+                break;
+            current = original;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void QueueLingerPartition(PartitionDeque pd, TopicPartition topicPartition)
+    {
+        if (Interlocked.Exchange(ref pd.LingerQueued, 1) == 0)
+            _lingerPartitions.Enqueue(topicPartition);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void MarkLingerPartitionDequeued(PartitionDeque pd)
+    {
+        Volatile.Write(ref pd.LingerQueued, 0);
+    }
+
     /// <summary>
     /// Async append method for all produce paths (fire-and-forget and awaitable).
     /// Hot path: if <see cref="TryReserveMemory"/> succeeds, completes synchronously with no async state machine.
@@ -2027,6 +2067,8 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                         if (TryAppendToBatch(currentBatch, timestamp, key, value, headers, headerCount,
                             completionSource, callback, recordSize))
                         {
+                            if (completionSource is not null)
+                                QueueLingerPartition(pd, topicPartition);
                             batchToReturn = rentedBatch;
                             rentedBatch = null;
                             appendSucceeded = true;
@@ -2048,6 +2090,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                         rentedBatch = null;
                         pd.CurrentBatch = newBatch;
                         Interlocked.Increment(ref _unsealedBatchCount);
+                        TrackCurrentBatchForLinger(pd, topicPartition, newBatch);
 
                         if (TryAppendToBatch(newBatch, timestamp, key, value, headers, headerCount,
                             completionSource, callback, recordSize))
@@ -2059,6 +2102,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                         else
                         {
                             pd.CurrentBatch = null;
+                            MarkLingerPartitionDequeued(pd);
                             Interlocked.Decrement(ref _unsealedBatchCount);
                             ClearRotationInProgressUnderLock(pd);
                             ownsRotation = false;
@@ -2336,6 +2380,8 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                         if (TryAppendFromSpansToBatch(currentBatch, timestamp, keyData, keyIsNull, valueData, valueIsNull,
                             headers, headerCount, completionSource, callback, recordSize))
                         {
+                            if (completionSource is not null)
+                                QueueLingerPartition(pd, topicPartition);
                             batchToReturn = rentedBatch;
                             rentedBatch = null;
                             appendSucceeded = true;
@@ -2357,6 +2403,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                         rentedBatch = null;
                         pd.CurrentBatch = newBatch;
                         Interlocked.Increment(ref _unsealedBatchCount);
+                        TrackCurrentBatchForLinger(pd, topicPartition, newBatch);
 
                         if (TryAppendFromSpansToBatch(newBatch, timestamp, keyData, keyIsNull, valueData, valueIsNull,
                             headers, headerCount, completionSource, callback, recordSize))
@@ -2368,6 +2415,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                         else
                         {
                             pd.CurrentBatch = null;
+                            MarkLingerPartitionDequeued(pd);
                             Interlocked.Decrement(ref _unsealedBatchCount);
                             ClearRotationInProgressUnderLock(pd);
                             ownsRotation = false;
@@ -2603,6 +2651,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
     private PartitionBatch DetachCurrentBatchForSealUnderLock(PartitionDeque pd, PartitionBatch currentBatch)
     {
         pd.CurrentBatch = null;
+        MarkLingerPartitionDequeued(pd);
         pd.RotationInProgress = true;
         Interlocked.Decrement(ref _unsealedBatchCount);
         return currentBatch;
@@ -3013,20 +3062,21 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
             {
                 Interlocked.Decrement(ref _unsealedBatchCount);
                 pd.CurrentBatch = null;
+                MarkLingerPartitionDequeued(pd);
             }
         }
     }
 
     /// <remarks>
     /// Optimized with multiple fast paths:
-    /// 1. Empty dictionary check - avoids enumeration overhead
-    /// 2. Oldest batch age check - skips enumeration if no batch can possibly be ready
-    /// With LingerMs=5ms and 1ms timer, this reduces enumeration from 5x to 1x per batch lifetime.
+    /// 1. No-unsealed-batch check avoids linger work entirely.
+    /// 2. Oldest batch age check skips active queue draining if no fire-and-forget batch can be ready.
+    /// 3. Active linger queue avoids scanning all historical partition deques under awaited load.
     /// Also uses synchronous TryWrite when possible to avoid async overhead.
     /// </remarks>
     public ValueTask ExpireLingerAsync(CancellationToken cancellationToken)
     {
-        // Fast path 1: no unsealed batches to check - avoid enumeration and async overhead entirely
+        // Fast path 1: no unsealed batches to check - avoid queue draining and async overhead entirely
         if (!HasUnsealedBatches())
         {
             // Reset oldest batch tracking since there are no batches
@@ -3035,10 +3085,8 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         }
 
         // Fast path 2: if the oldest batch hasn't reached linger time yet AND there are no
-        // pending awaited produces, skip enumeration. Awaited produces (ProduceAsync) use a
-        // micro-linger (min(1ms, LingerMs/10)) so they need more frequent enumeration checks.
-        // This is the key optimization: with LingerMs=5 and 1ms timer, we'd enumerate 5x per batch.
-        // By tracking the oldest batch, we skip 4 out of 5 enumerations for fire-and-forget workloads.
+        // pending awaited produces, skip active queue checks. Awaited produces (ProduceAsync)
+        // use a micro-linger (min(1ms, LingerMs/10)) so they need more frequent checks.
         if (Volatile.Read(ref _pendingAwaitedProduceCount) == 0)
         {
             var oldestTicks = Volatile.Read(ref _oldestBatchCreatedTicks);
@@ -3047,7 +3095,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                 var millisSinceOldest = (long)Stopwatch.GetElapsedTime(oldestTicks).TotalMilliseconds;
                 if (millisSinceOldest < _options.LingerMs)
                 {
-                    // No batch is old enough to flush yet - skip the O(n) enumeration
+                    // No batch is old enough to flush yet.
                     return ValueTask.CompletedTask;
                 }
             }
@@ -3096,7 +3144,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
     /// </summary>
     /// <param name="sealAll">
     /// true = flush mode: seals ALL batches (Keys.ToArray snapshot, blocking lock).
-    /// false = linger mode: seals only expired batches (foreach enumeration, non-blocking lock).
+    /// false = linger mode: seals expired batches from the active linger notification queue.
     /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
     private async ValueTask SealBatchesAsync(bool sealAll, CancellationToken cancellationToken)
@@ -3120,89 +3168,39 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
             var newOldestTicks = long.MaxValue;
             var anySealed = false;
 
-            foreach (var kvp in _partitionDeques)
+            if (sealAll)
             {
-                var pd = kvp.Value;
-                ReadyBatch? sealedBatch = null;
-                PartitionBatch? batchToComplete = null;
-                var spinner = new SpinWait();
-
-                while (true)
+                foreach (var kvp in _partitionDeques)
                 {
-                    var waitForRotation = false;
-
-                    {
-                        using var guard = new SpinLockGuard(ref pd.Lock);
-
-                        if (pd.RotationInProgress)
-                        {
-                            waitForRotation = true;
-                        }
-                        else if (pd.CurrentBatch is null)
-                        {
-                            break;
-                        }
-                        else if (sealAll || pd.CurrentBatch.ShouldFlush(now, _options.LingerMs))
-                        {
-                            ProducerDebugCounters.RecordBatchFlushedFromDictionary();
-                            batchToComplete = DetachCurrentBatchForSealUnderLock(pd, pd.CurrentBatch);
-                            break;
-                        }
-                        else
-                        {
-                            // Batch not ready for flush - track its creation time for oldest batch calculation
-                            var batchCreatedTicks = pd.CurrentBatch.CreatedAtStopwatchTimestamp;
-                            if (batchCreatedTicks < newOldestTicks)
-                                newOldestTicks = batchCreatedTicks;
-                            break;
-                        }
-                    }
-
-                    if (waitForRotation)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        spinner.SpinOnce();
-                    }
-                }
-
-                if (batchToComplete is not null)
-                {
-                    try
-                    {
-                        sealedBatch = CompleteDetachedBatch(batchToComplete);
-                    }
-                    catch
-                    {
-                        ClearRotationInProgress(pd);
-                        throw;
-                    }
-
-                    {
-                        using var guard = new SpinLockGuard(ref pd.Lock);
-                        if (sealedBatch is not null)
-                            EnqueueCompletedBatchUnderLock(pd, sealedBatch);
-                        ClearRotationInProgressUnderLock(pd);
-                    }
-
-                    if (sealedBatch is not null)
-                    {
-                        PublishSealedBatch(sealedBatch, signalWakeup: false);
+                    if (TrySealCurrentBatch(kvp.Key, kvp.Value, now, sealAll: true, cancellationToken, ref newOldestTicks))
                         anySealed = true;
-                    }
+                }
+            }
+            else
+            {
+                var count = _lingerPartitions.Count;
+                for (var i = 0; i < count; i++)
+                {
+                    if (!_lingerPartitions.TryDequeue(out var topicPartition))
+                        break;
+
+                    if (!_partitionDeques.TryGetValue(topicPartition, out var pd))
+                        continue;
+
+                    MarkLingerPartitionDequeued(pd);
+                    if (TrySealCurrentBatch(topicPartition, pd, now, sealAll: false, cancellationToken, ref newOldestTicks))
+                        anySealed = true;
                 }
             }
 
             if (!sealAll)
             {
-                // Update the oldest batch tracking for next check using CAS to prevent race condition.
-                var current = Volatile.Read(ref _oldestBatchCreatedTicks);
-                while (newOldestTicks < current)
-                {
-                    var original = Interlocked.CompareExchange(ref _oldestBatchCreatedTicks, newOldestTicks, current);
-                    if (original == current)
-                        break;
-                    current = original;
-                }
+                // This is a best-effort lower-bound hint. Linger mode drains a queue snapshot,
+                // so a concurrent append or queued partition outside this snapshot may be older
+                // than newOldestTicks. Only lower the hint; raising it can delay an already
+                // expired batch until a newer batch reaches linger.
+                if (newOldestTicks != long.MaxValue)
+                    TrackOldestBatchCreated(newOldestTicks);
             }
             else
             {
@@ -3221,6 +3219,91 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
 
     private ValueTask ExpireLingerAsyncCore(CancellationToken cancellationToken)
         => SealBatchesAsync(sealAll: false, cancellationToken);
+
+    private bool TrySealCurrentBatch(
+        TopicPartition topicPartition,
+        PartitionDeque pd,
+        long now,
+        bool sealAll,
+        CancellationToken cancellationToken,
+        ref long newOldestTicks)
+    {
+        ReadyBatch? sealedBatch = null;
+        PartitionBatch? batchToComplete = null;
+        var spinner = new SpinWait();
+
+        while (true)
+        {
+            var waitForRotation = false;
+
+            {
+                using var guard = new SpinLockGuard(ref pd.Lock);
+
+                if (pd.RotationInProgress)
+                {
+                    waitForRotation = true;
+                }
+                else if (pd.CurrentBatch is null)
+                {
+                    break;
+                }
+                else if (sealAll || pd.CurrentBatch.ShouldFlush(now, _options.LingerMs))
+                {
+                    ProducerDebugCounters.RecordBatchFlushedFromDictionary();
+                    batchToComplete = DetachCurrentBatchForSealUnderLock(pd, pd.CurrentBatch);
+                    break;
+                }
+                else
+                {
+                    var batchCreatedTicks = pd.CurrentBatch.CreatedAtStopwatchTimestamp;
+                    if (batchCreatedTicks < newOldestTicks)
+                        newOldestTicks = batchCreatedTicks;
+
+                    if (!sealAll)
+                        QueueLingerPartition(pd, topicPartition);
+                    break;
+                }
+            }
+
+            if (!waitForRotation)
+                break;
+
+            if (!sealAll)
+            {
+                QueueLingerPartition(pd, topicPartition);
+                break;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            spinner.SpinOnce();
+        }
+
+        if (batchToComplete is null)
+            return false;
+
+        try
+        {
+            sealedBatch = CompleteDetachedBatch(batchToComplete);
+        }
+        catch
+        {
+            ClearRotationInProgress(pd);
+            throw;
+        }
+
+        {
+            using var guard = new SpinLockGuard(ref pd.Lock);
+            if (sealedBatch is not null)
+                EnqueueCompletedBatchUnderLock(pd, sealedBatch);
+            ClearRotationInProgressUnderLock(pd);
+        }
+
+        if (sealedBatch is null)
+            return false;
+
+        PublishSealedBatch(sealedBatch, signalWakeup: false);
+        return true;
+    }
 
     /// <summary>
     /// Tracks a batch entering the pipeline: increments counter and adds to reference-tracking dictionary.
@@ -3726,6 +3809,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                     }
                     _batchPool.Return(current);
                     pd.CurrentBatch = null;
+                    MarkLingerPartitionDequeued(pd);
                     Interlocked.Decrement(ref _unsealedBatchCount);
                 }
 

@@ -1,5 +1,7 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Reflection;
 using Dekaf.Compression;
 using Dekaf.Metadata;
 using Dekaf.Producer;
@@ -532,8 +534,12 @@ public class RecordAccumulatorReadyTests
                 DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 pooledKey, pooledValue, null, 0, completion);
 
+            var lingerQueue = GetPrivateField<ConcurrentQueue<TopicPartition>>(accumulator, "_lingerPartitions");
+            await Assert.That(lingerQueue.Count).IsEqualTo(1);
+
             // Seal via linger expiry (doesn't wait for delivery like FlushAsync does)
             await accumulator.ExpireLingerAsync(CancellationToken.None);
+            await Assert.That(lingerQueue.IsEmpty).IsTrue();
 
             // Act: Ready() should find the sealed batch
             var readyNodes = new HashSet<int>();
@@ -547,6 +553,107 @@ public class RecordAccumulatorReadyTests
             await accumulator.DisposeAsync();
             await pool.DisposeAsync();
             await metadataManager.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task LingerPartitionsQueue_SameCurrentBatch_QueuesOnce()
+    {
+        var options = CreateTestOptions(batchSize: 100_000, lingerMs: 10_000);
+        var accumulator = new RecordAccumulator(options);
+        var pool = new ValueTaskSourcePool<RecordMetadata>();
+
+        try
+        {
+            var pooledKey = new PooledMemory(null, 0, isNull: true);
+            var pooledValue = new PooledMemory(null, 0, isNull: true);
+
+            for (var i = 0; i < 10; i++)
+            {
+                var completion = pool.Rent();
+                accumulator.TryAppendWithCompletion("test-topic", 0,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    pooledKey, pooledValue, null, 0, completion);
+            }
+
+            var lingerQueue = GetPrivateField<ConcurrentQueue<TopicPartition>>(accumulator, "_lingerPartitions");
+            await Assert.That(lingerQueue.Count).IsEqualTo(1);
+        }
+        finally
+        {
+            await accumulator.DisposeAsync();
+            await pool.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task LingerPartitionsQueue_AwaitedAppendRequeuesWhenFlagCleared()
+    {
+        var options = CreateTestOptions(batchSize: 100_000, lingerMs: 10_000);
+        var accumulator = new RecordAccumulator(options);
+        var pool = new ValueTaskSourcePool<RecordMetadata>();
+
+        try
+        {
+            var pooledKey = new PooledMemory(null, 0, isNull: true);
+            var pooledValue = new PooledMemory(null, 0, isNull: true);
+
+            var firstCompletion = pool.Rent();
+            accumulator.TryAppendWithCompletion("test-topic", 0,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                pooledKey, pooledValue, null, 0, firstCompletion);
+
+            var lingerQueue = GetPrivateField<ConcurrentQueue<TopicPartition>>(accumulator, "_lingerPartitions");
+            await Assert.That(lingerQueue.TryDequeue(out _)).IsTrue();
+
+            var partitionDeque = GetPartitionDeque(accumulator, "test-topic", 0);
+            SetInstanceField(partitionDeque, "LingerQueued", 0);
+
+            var secondCompletion = pool.Rent();
+            accumulator.TryAppendWithCompletion("test-topic", 0,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                pooledKey, pooledValue, null, 0, secondCompletion);
+
+            await Assert.That(lingerQueue.Count).IsEqualTo(1);
+        }
+        finally
+        {
+            await accumulator.DisposeAsync();
+            await pool.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task ExpireLingerAsync_DoesNotRaiseOldestBatchHint()
+    {
+        var options = CreateTestOptions(batchSize: 100_000, lingerMs: 10_000);
+        var accumulator = new RecordAccumulator(options);
+
+        try
+        {
+            var pooledKey = new PooledMemory(null, 0, isNull: true);
+            var pooledValue = new PooledMemory(null, 0, isNull: true);
+
+            var appended = await accumulator.AppendAsync(
+                "test-topic", 0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                pooledKey, pooledValue, null, 0, null, null, CancellationToken.None);
+
+            await Assert.That(appended).IsTrue();
+
+            var createdTicks = GetPrivateField<long>(accumulator, "_oldestBatchCreatedTicks");
+            var olderHint = Math.Max(0, createdTicks - Stopwatch.Frequency * 20);
+            SetPrivateField(accumulator, "_oldestBatchCreatedTicks", olderHint);
+            var lingerQueue = GetPrivateField<ConcurrentQueue<TopicPartition>>(accumulator, "_lingerPartitions");
+
+            await accumulator.ExpireLingerAsync(CancellationToken.None);
+
+            await Assert.That(GetPrivateField<long>(accumulator, "_oldestBatchCreatedTicks"))
+                .IsEqualTo(olderHint);
+            await Assert.That(lingerQueue.Count).IsEqualTo(1);
+        }
+        finally
+        {
+            await accumulator.DisposeAsync();
         }
     }
 
@@ -965,5 +1072,32 @@ public class RecordAccumulatorReadyTests
 
         manager.Metadata.Update(response);
         return manager;
+    }
+
+    private static T GetPrivateField<T>(object instance, string fieldName)
+    {
+        var field = instance.GetType().GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Instance);
+        return (T)field!.GetValue(instance)!;
+    }
+
+    private static void SetPrivateField<T>(object instance, string fieldName, T value)
+    {
+        var field = instance.GetType().GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Instance);
+        field!.SetValue(instance, value);
+    }
+
+    private static object GetPartitionDeque(RecordAccumulator accumulator, string topic, int partition)
+    {
+        var method = typeof(RecordAccumulator).GetMethod(
+            "GetOrCreateDeque",
+            BindingFlags.NonPublic | BindingFlags.Instance,
+            [typeof(string), typeof(int)]);
+        return method!.Invoke(accumulator, [topic, partition])!;
+    }
+
+    private static void SetInstanceField<T>(object instance, string fieldName, T value)
+    {
+        var field = instance.GetType().GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+        field!.SetValue(instance, value);
     }
 }
