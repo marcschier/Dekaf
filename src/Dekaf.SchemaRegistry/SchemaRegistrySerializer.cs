@@ -40,8 +40,7 @@ public sealed class SchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisposab
     private readonly bool _ownsClient;
 
     private readonly ConcurrentDictionary<string, int> _schemaIdCache = new();
-    private readonly ConcurrentDictionary<SubjectCacheKey, SubjectSchemaIdCacheEntry> _subjectSchemaIdCache = new();
-    private SubjectSchemaIdCacheEntry? _lastSubjectSchemaId;
+    private readonly SubjectSchemaIdCache _subjectSchemaIdCache = new();
 
     /// <summary>
     /// Creates a new Schema Registry serializer.
@@ -117,26 +116,16 @@ public sealed class SchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisposab
     }
 
     private int GetSchemaIdForContext(string topic, bool isKey)
-    {
-        var last = _lastSubjectSchemaId;
-        if (last is not null && last.Matches(topic, isKey))
-            return last.SchemaId;
-
-        var key = new SubjectCacheKey(topic, isKey);
-        if (_subjectSchemaIdCache.TryGetValue(key, out var cached))
-        {
-            _lastSubjectSchemaId = cached;
-            return cached.SchemaId;
-        }
-
-        var subject = GetSubjectName(topic, isKey);
-        var schema = _getSchema(subject);
-        var schemaId = GetSchemaIdSync(subject, schema);
-        var entry = new SubjectSchemaIdCacheEntry(topic, isKey, schemaId);
-        _subjectSchemaIdCache[key] = entry;
-        _lastSubjectSchemaId = entry;
-        return schemaId;
-    }
+        => _subjectSchemaIdCache.GetOrAdd(
+            topic,
+            isKey,
+            this,
+            static (serializer, topic, isKey) => serializer.GetSubjectName(topic, isKey),
+            static (serializer, subject) =>
+            {
+                var schema = serializer._getSchema(subject);
+                return serializer.GetSchemaIdSync(subject, schema);
+            });
 
     private int GetSchemaIdSync(string subject, Schema schema)
     {
@@ -169,14 +158,6 @@ public sealed class SchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisposab
             SubjectNameStrategy.TopicRecordName => $"{topic}-{typeof(T).FullName}{suffix}",
             _ => topic + suffix
         };
-    }
-
-    private readonly record struct SubjectCacheKey(string Topic, bool IsKey);
-
-    private sealed record SubjectSchemaIdCacheEntry(string Topic, bool IsKey, int SchemaId)
-    {
-        public bool Matches(string topic, bool isKey) =>
-            IsKey == isKey && string.Equals(Topic, topic, StringComparison.Ordinal);
     }
 
     public ValueTask DisposeAsync()

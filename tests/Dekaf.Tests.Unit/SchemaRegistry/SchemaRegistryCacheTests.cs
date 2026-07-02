@@ -21,7 +21,8 @@ public sealed class SchemaRegistryCacheTests
     private sealed class CountingSchemaRegistryClient : ISchemaRegistryClient
     {
         private readonly ConcurrentDictionary<string, int> _callCounts = new();
-        private int _nextId = 1;
+        private readonly ConcurrentDictionary<string, int> _idsBySubject = new();
+        private int _nextId;
 
         /// <summary>
         /// Returns the number of times GetOrRegisterSchemaAsync was called for a given subject.
@@ -34,10 +35,13 @@ public sealed class SchemaRegistryCacheTests
         /// </summary>
         public int TotalCallCount => _callCounts.Values.Sum();
 
+        public int GetSchemaId(string subject) =>
+            _idsBySubject[subject];
+
         public Task<int> GetOrRegisterSchemaAsync(string subject, Schema schema, CancellationToken cancellationToken = default)
         {
             _callCounts.AddOrUpdate(subject, 1, static (_, count) => count + 1);
-            var id = Interlocked.Increment(ref _nextId);
+            var id = _idsBySubject.GetOrAdd(subject, static (_, state) => Interlocked.Increment(ref state._nextId), this);
             return Task.FromResult(id);
         }
 
@@ -118,6 +122,24 @@ public sealed class SchemaRegistryCacheTests
             Topic = topic,
             Component = isKey ? SerializationComponent.Key : SerializationComponent.Value
         };
+
+    [Test]
+    public async Task SubjectSchemaIdCache_StopsAddingEntriesAtMaxCachedEntries()
+    {
+        var cache = new SubjectSchemaIdCache();
+
+        for (var i = 0; i < SubjectSchemaIdCache.MaxCachedEntries + 10; i++)
+        {
+            _ = cache.GetOrAdd(
+                $"topic-{i}",
+                isKey: false,
+                state: 0,
+                static (_, topic, isKey) => topic + (isKey ? "-key" : "-value"),
+                static (_, subject) => subject.Length);
+        }
+
+        await Assert.That(cache.CachedEntryCount).IsEqualTo(SubjectSchemaIdCache.MaxCachedEntries);
+    }
 
     [Test]
     public async Task Serializer_CachesSchemaId_AcrossMultipleSubjects()
@@ -215,6 +237,38 @@ public sealed class SchemaRegistryCacheTests
 
         await Assert.That(strategy.CallCount).IsEqualTo(1);
         await Assert.That(registry.GetCallCount("topic-value")).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task JsonSerializer_UsesCorrectSchemaId_ConcurrentlyAcrossTopics()
+    {
+        var registry = new CountingSchemaRegistryClient();
+
+        await using var serializer = new JsonSchemaRegistrySerializer<string>(
+            registry,
+            """{ "type": "string" }""");
+
+        var topics = Enumerable.Range(0, 32)
+            .Select(static i => $"topic-{i}")
+            .ToArray();
+        var results = new ConcurrentBag<(string Topic, int SchemaId)>();
+
+        Parallel.For(0, 4096, i =>
+        {
+            var topic = topics[i % topics.Length];
+            var buffer = new ArrayBufferWriter<byte>();
+
+            serializer.Serialize($"msg-{i}", ref buffer, CreateContext(topic));
+
+            var schemaId = BinaryPrimitives.ReadInt32BigEndian(buffer.WrittenSpan.Slice(1, 4));
+            results.Add((topic, schemaId));
+        });
+
+        foreach (var result in results)
+        {
+            var expectedSchemaId = registry.GetSchemaId(result.Topic + "-value");
+            await Assert.That(result.SchemaId).IsEqualTo(expectedSchemaId);
+        }
     }
 
     [Test]

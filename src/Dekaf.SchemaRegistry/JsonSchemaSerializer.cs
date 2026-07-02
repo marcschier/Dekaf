@@ -34,10 +34,8 @@ public sealed class JsonSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
     private readonly Schema _schema;
     private readonly bool _ownsClient;
 
-    private int _cachedSchemaId = -1;
-    private string? _cachedSubject;
-    private readonly ConcurrentDictionary<SubjectCacheKey, SubjectSchemaIdCacheEntry> _subjectSchemaIdCache = new();
-    private SubjectSchemaIdCacheEntry? _lastSubjectSchemaId;
+    private readonly ConcurrentDictionary<string, int> _schemaIdCache = new();
+    private readonly SubjectSchemaIdCache _subjectSchemaIdCache = new();
 
     /// <summary>
     /// Creates a new JSON Schema Registry serializer.
@@ -123,42 +121,26 @@ public sealed class JsonSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
     }
 
     private int GetSchemaIdForContext(string topic, bool isKey)
-    {
-        var last = _lastSubjectSchemaId;
-        if (last is not null && last.Matches(topic, isKey))
-            return last.SchemaId;
-
-        var key = new SubjectCacheKey(topic, isKey);
-        if (_subjectSchemaIdCache.TryGetValue(key, out var cached))
-        {
-            _lastSubjectSchemaId = cached;
-            return cached.SchemaId;
-        }
-
-        var subject = GetSubjectName(topic, isKey);
-        var schemaId = GetSchemaIdSync(subject);
-        var entry = new SubjectSchemaIdCacheEntry(topic, isKey, schemaId);
-        _subjectSchemaIdCache[key] = entry;
-        _lastSubjectSchemaId = entry;
-        return schemaId;
-    }
+        => _subjectSchemaIdCache.GetOrAdd(
+            topic,
+            isKey,
+            this,
+            static (serializer, topic, isKey) => serializer.GetSubjectName(topic, isKey),
+            static (serializer, subject) => serializer.GetSchemaIdSync(subject));
 
     private int GetSchemaIdSync(string subject)
     {
-        if (_cachedSchemaId >= 0 && _cachedSubject == subject)
-            return _cachedSchemaId;
+        if (_schemaIdCache.TryGetValue(subject, out var cachedId))
+            return cachedId;
 
         var task = _autoRegisterSchemas
             ? _schemaRegistry.GetOrRegisterSchemaAsync(subject, _schema)
-            : _schemaRegistry.GetSchemaBySubjectAsync(subject).ContinueWith(t => t.Result.Id, TaskScheduler.Default);
+            : _schemaRegistry.GetSchemaBySubjectAsync(subject).ContinueWith(
+                static t => t.GetAwaiter().GetResult().Id, TaskScheduler.Default);
 
         // Add timeout to prevent indefinite blocking
         var id = task.WaitAsync(SchemaRegistryTimeout).ConfigureAwait(false).GetAwaiter().GetResult();
-
-        _cachedSchemaId = id;
-        _cachedSubject = subject;
-
-        return id;
+        return _schemaIdCache.GetOrAdd(subject, id);
     }
 
     private string GetSubjectName(string topic, bool isKey)
@@ -176,14 +158,6 @@ public sealed class JsonSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
             SubjectNameStrategy.TopicRecordName => $"{topic}-{typeof(T).FullName}{suffix}",
             _ => topic + suffix
         };
-    }
-
-    private readonly record struct SubjectCacheKey(string Topic, bool IsKey);
-
-    private sealed record SubjectSchemaIdCacheEntry(string Topic, bool IsKey, int SchemaId)
-    {
-        public bool Matches(string topic, bool isKey) =>
-            IsKey == isKey && string.Equals(Topic, topic, StringComparison.Ordinal);
     }
 
     public ValueTask DisposeAsync()

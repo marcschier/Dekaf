@@ -33,10 +33,9 @@ public sealed class ProtobufSchemaRegistrySerializer<T> : ISerializer<T>, IAsync
     private readonly bool _ownsClient;
     private readonly MessageDescriptor _descriptor;
     private readonly ConcurrentDictionary<string, int> _schemaIdCache = new();
-    private readonly ConcurrentDictionary<SubjectCacheKey, SubjectSchemaIdCacheEntry> _subjectSchemaIdCache = new();
+    private readonly SubjectSchemaIdCache _subjectSchemaIdCache = new();
     private readonly Schema _schema;
     private readonly byte[] _encodedMessageIndexes;
-    private SubjectSchemaIdCacheEntry? _lastSubjectSchemaId;
 
     /// <summary>
     /// Creates a new Protobuf Schema Registry serializer.
@@ -103,25 +102,12 @@ public sealed class ProtobufSchemaRegistrySerializer<T> : ISerializer<T>, IAsync
     }
 
     private int GetSchemaIdForContext(string topic, bool isKey)
-    {
-        var last = _lastSubjectSchemaId;
-        if (last is not null && last.Matches(topic, isKey))
-            return last.SchemaId;
-
-        var key = new SubjectCacheKey(topic, isKey);
-        if (_subjectSchemaIdCache.TryGetValue(key, out var cached))
-        {
-            _lastSubjectSchemaId = cached;
-            return cached.SchemaId;
-        }
-
-        var subject = GetSubjectName(topic, isKey);
-        var schemaId = GetSchemaIdSync(subject);
-        var entry = new SubjectSchemaIdCacheEntry(topic, isKey, schemaId);
-        _subjectSchemaIdCache[key] = entry;
-        _lastSubjectSchemaId = entry;
-        return schemaId;
-    }
+        => _subjectSchemaIdCache.GetOrAdd(
+            topic,
+            isKey,
+            this,
+            static (serializer, topic, isKey) => serializer.GetSubjectName(topic, isKey),
+            static (serializer, subject) => serializer.GetSchemaIdSync(subject));
 
     private int GetSchemaIdSync(string subject)
     {
@@ -168,14 +154,6 @@ public sealed class ProtobufSchemaRegistrySerializer<T> : ISerializer<T>, IAsync
             SubjectNameStrategy.TopicRecordName => $"{topic}-{_descriptor.FullName}{suffix}",
             _ => topic + suffix
         };
-    }
-
-    private readonly record struct SubjectCacheKey(string Topic, bool IsKey);
-
-    private sealed record SubjectSchemaIdCacheEntry(string Topic, bool IsKey, int SchemaId)
-    {
-        public bool Matches(string topic, bool isKey) =>
-            IsKey == isKey && string.Equals(Topic, topic, StringComparison.Ordinal);
     }
 
     private static MessageDescriptor GetMessageDescriptor()

@@ -41,13 +41,12 @@ public sealed class AvroSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
     private readonly AvroSerializerConfig _config;
     private readonly bool _ownsClient;
     private readonly ConcurrentDictionary<string, Lazy<Task<int>>> _schemaIdCache = new();
-    private readonly ConcurrentDictionary<SubjectCacheKey, SubjectSchemaIdCacheEntry> _subjectSchemaIdCache = new();
+    private readonly SubjectSchemaIdCache _subjectSchemaIdCache = new();
     private readonly ConcurrentDictionary<AvroSchema, GenericDatumWriter<GenericRecord>> _genericWriters =
         new(AvroSchemaReferenceComparer.Instance);
     private readonly ConcurrentDictionary<AvroSchema, SpecificDefaultWriter> _specificWriters =
         new(AvroSchemaReferenceComparer.Instance);
     private readonly AvroSchema? _writerSchema;
-    private SubjectSchemaIdCacheEntry? _lastSubjectSchemaId;
 
     /// <summary>
     /// Creates a new Avro Schema Registry serializer.
@@ -143,30 +142,17 @@ public sealed class AvroSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
     }
 
     private int GetSchemaIdForContext(string topic, bool isKey, T value)
-    {
-        var last = _lastSubjectSchemaId;
-        if (last is not null && last.Matches(topic, isKey))
-            return last.SchemaId;
-
-        var key = new SubjectCacheKey(topic, isKey);
-        if (_subjectSchemaIdCache.TryGetValue(key, out var cached))
-        {
-            _lastSubjectSchemaId = cached;
-            return cached.SchemaId;
-        }
-
-        var subject = GetSubjectName(topic, isKey);
-        var schemaId = GetSchemaIdCached(subject, value);
-        return CacheSubjectSchemaId(topic, isKey, schemaId);
-    }
+        => _subjectSchemaIdCache.GetOrAdd(
+            topic,
+            isKey,
+            new SubjectSchemaIdState(this, value),
+            static (state, topic, isKey) => state.Serializer.GetSubjectName(topic, isKey),
+            static (state, subject) => state.Serializer.GetSchemaIdCached(subject, state.Value));
 
     private int CacheSubjectSchemaId(string topic, bool isKey, int schemaId)
-    {
-        var entry = new SubjectSchemaIdCacheEntry(topic, isKey, schemaId);
-        _subjectSchemaIdCache[new SubjectCacheKey(topic, isKey)] = entry;
-        _lastSubjectSchemaId = entry;
-        return schemaId;
-    }
+        => _subjectSchemaIdCache.Cache(topic, isKey, schemaId);
+
+    private readonly record struct SubjectSchemaIdState(AvroSchemaRegistrySerializer<T> Serializer, T Value);
 
     private void WriteAvroValue(T value, BinaryEncoder encoder)
     {
@@ -328,14 +314,6 @@ public sealed class AvroSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
         }
 
         return typeof(T).FullName ?? typeof(T).Name;
-    }
-
-    private readonly record struct SubjectCacheKey(string Topic, bool IsKey);
-
-    private sealed record SubjectSchemaIdCacheEntry(string Topic, bool IsKey, int SchemaId)
-    {
-        public bool Matches(string topic, bool isKey) =>
-            IsKey == isKey && string.Equals(Topic, topic, StringComparison.Ordinal);
     }
 
     /// <summary>
