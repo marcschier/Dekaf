@@ -701,6 +701,13 @@ internal static class DekafConfigurationBinding
             throw new InvalidOperationException($"{key} must specify a duration.");
         }
 
+        value = value.Trim();
+        if (TryParseHoursMinutesSeconds(value, out var hoursMinutesSeconds))
+        {
+            AutoOffsetResetStrategy.ValidateDuration(hoursMinutesSeconds);
+            return hoursMinutesSeconds;
+        }
+
         if (TimeSpan.TryParse(value, CultureInfo.InvariantCulture, out var timeSpan))
         {
             AutoOffsetResetStrategy.ValidateDuration(timeSpan);
@@ -719,5 +726,30 @@ internal static class DekafConfigurationBinding
                 $"{key} must be a TimeSpan or ISO-8601 duration such as 'PT24H'.",
                 ex);
         }
+    }
+
+    private static bool TryParseHoursMinutesSeconds(string value, out TimeSpan duration)
+    {
+        duration = default;
+
+        var parts = value.Split(':');
+        if (parts.Length != 3 ||
+            parts[0].Contains('.', StringComparison.Ordinal) ||
+            parts[0].Contains(',', StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var hours) ||
+            !int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var minutes) ||
+            !int.TryParse(parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out var seconds) ||
+            (uint)minutes > 59 ||
+            (uint)seconds > 59)
+        {
+            return false;
+        }
+
+        duration = new TimeSpan(hours, minutes, seconds);
+        return true;
     }
 }
