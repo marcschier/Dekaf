@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using Dekaf.Errors;
 using Dekaf.Networking;
 
 namespace Dekaf.Tests.Unit.Networking;
@@ -56,6 +57,72 @@ public sealed class IncrementalFrameConsumptionTests
             ref buffer, ref context, ResponseBufferPool.Default);
 
         await Assert.That(started).IsFalse();
+    }
+
+    [Test]
+    public async Task TryStartPartialFrame_InvalidNegativeSize_ThrowsKafkaException()
+    {
+        var frame = new byte[8];
+        BinaryPrimitives.WriteInt32BigEndian(frame, -1);
+        var buffer = new ReadOnlySequence<byte>(frame);
+
+        var context = new KafkaConnection.PartialFrameContext();
+        KafkaException? thrown = null;
+        try
+        {
+            KafkaConnection.TryStartPartialFrame(
+                ref buffer, ref context, ResponseBufferPool.Default);
+        }
+        catch (KafkaException ex)
+        {
+            thrown = ex;
+        }
+
+        await Assert.That(thrown).IsNotNull();
+        await Assert.That(thrown!.Message).Contains("Invalid response frame size -1");
+        await Assert.That(context.IsActive).IsFalse();
+        await Assert.That(buffer.Length).IsEqualTo(frame.Length);
+    }
+
+    [Test]
+    public async Task TryStartPartialFrame_SizeAbovePoolLimit_ThrowsKafkaException()
+    {
+        var pool = new ResponseBufferPool(maxArrayLength: 16);
+        var frame = BuildPartialFrame(correlationId: 1, totalPayloadSize: 17, availablePayload: 4);
+        var buffer = new ReadOnlySequence<byte>(frame);
+
+        var context = new KafkaConnection.PartialFrameContext();
+        KafkaException? thrown = null;
+        try
+        {
+            KafkaConnection.TryStartPartialFrame(ref buffer, ref context, pool);
+        }
+        catch (KafkaException ex)
+        {
+            thrown = ex;
+        }
+
+        await Assert.That(thrown).IsNotNull();
+        await Assert.That(thrown!.Message).Contains("Invalid response frame size 17");
+        await Assert.That(context.IsActive).IsFalse();
+        await Assert.That(buffer.Length).IsEqualTo(frame.Length);
+    }
+
+    [Test]
+    public async Task ValidateResponseFrameSize_RejectsInvalidSizes()
+    {
+        foreach (var size in new[] { int.MinValue, -1, 0, 3, 17, int.MaxValue })
+        {
+            await Assert.That(() => KafkaConnection.ValidateResponseFrameSize(size, maxFrameSize: 16))
+                .Throws<KafkaException>();
+        }
+    }
+
+    [Test]
+    public void ValidateResponseFrameSize_AllowsMinimumAndMaximumSizes()
+    {
+        KafkaConnection.ValidateResponseFrameSize(frameSize: 4, maxFrameSize: 16);
+        KafkaConnection.ValidateResponseFrameSize(frameSize: 16, maxFrameSize: 16);
     }
 
     [Test]
