@@ -23,9 +23,9 @@ namespace Dekaf.Networking;
 /// to one set of array buckets (maxArraysPerBucket × bucketCount) regardless of how many
 /// connections exist. Without sharing, each connection independently retained up to
 /// <c>maxArraysPerBucket</c> arrays per size class — with 3 brokers × 10 connections/broker
-/// = 30 independent pools, each retaining up to 32 arrays in large buckets, causing
-/// multi-GB WorkingSet growth. With a shared pool, the same 32 array slots are recycled
-/// across all connections, capping total retention at ~128 MB for the 4 MB bucket.
+/// = 30 independent pools, each retaining arrays in large buckets, causing multi-GB
+/// WorkingSet growth. With a shared pool, one configured bucket depth is recycled across
+/// all connections instead of multiplying retention by connection count.
 /// <para/>
 /// Connections created outside a <see cref="ConnectionPool"/> (e.g., in tests) fall back
 /// to creating their own per-connection pool for backward compatibility.
