@@ -219,15 +219,8 @@ public sealed class JsonSchemaRegistryDeserializer<T> : IDeserializer<T>, IAsync
 
         var schemaId = BinaryPrimitives.ReadInt32BigEndian(span.Slice(1, 4));
 
-        // Optionally fetch schema for validation (schema is cached)
-        // For JSON, we typically just deserialize without validation
-        // but we still verify the schema exists
-        // Add timeout to prevent indefinite blocking
-        _ = _schemaRegistry.GetSchemaAsync(schemaId)
-            .WaitAsync(SchemaRegistryTimeout)
-            .ConfigureAwait(false)
-            .GetAwaiter()
-            .GetResult();
+        // Verify the schema exists. Cache hits avoid Task allocation and sync-over-async.
+        _ = _schemaRegistry.GetSchemaSync(schemaId, SchemaRegistryTimeout);
 
         // Extract JSON payload and deserialize
         return JsonSerializer.Deserialize<T>(span.Slice(5), _jsonOptions)!;

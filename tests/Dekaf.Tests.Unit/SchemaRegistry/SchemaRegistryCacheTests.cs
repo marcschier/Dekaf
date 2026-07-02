@@ -1,5 +1,9 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Buffers.Binary;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
 using Dekaf.SchemaRegistry;
 using Dekaf.Serialization;
 
@@ -50,6 +54,40 @@ public sealed class SchemaRegistryCacheTests
 
         public Task<bool> IsCompatibleAsync(string subject, Schema schema, string version = "latest", CancellationToken cancellationToken = default)
             => Task.FromResult(true);
+
+        public Task<IReadOnlyList<int>> DeleteSubjectAsync(string subject, bool permanent = false, CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public void Dispose() { }
+    }
+
+    private sealed class NonCachingSchemaRegistryClient(Schema schema) : ISchemaRegistryClient
+    {
+        public int GetSchemaCallCount { get; private set; }
+
+        public Task<int> GetOrRegisterSchemaAsync(string subject, Schema schema, CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public Task<int> RegisterSchemaAsync(string subject, Schema schema, CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public Task<Schema> GetSchemaAsync(int id, CancellationToken cancellationToken = default)
+        {
+            GetSchemaCallCount++;
+            return Task.FromResult(schema);
+        }
+
+        public Task<RegisteredSchema> GetSchemaBySubjectAsync(string subject, string version = "latest", CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public Task<IReadOnlyList<string>> GetAllSubjectsAsync(CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public Task<IReadOnlyList<int>> GetVersionsAsync(string subject, CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public Task<bool> IsCompatibleAsync(string subject, Schema schema, string version = "latest", CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
 
         public Task<IReadOnlyList<int>> DeleteSubjectAsync(string subject, bool permanent = false, CancellationToken cancellationToken = default)
             => throw new NotImplementedException();
@@ -138,6 +176,86 @@ public sealed class SchemaRegistryCacheTests
         using var handler = SchemaRegistryClient.CreateHttpHandler();
 
         await Assert.That(handler.PooledConnectionLifetime).IsEqualTo(TimeSpan.FromMinutes(2));
+    }
+
+    [Test]
+    public async Task Deserializer_UsesCachedSchema_AndPassesPayloadWithoutCopy()
+    {
+        var registry = new MockSchemaRegistryClient();
+        var schema = new Schema { SchemaType = SchemaType.Json, SchemaString = """{ "type": "string" }""" };
+        var schemaId = await registry.RegisterSchemaAsync("topic-value", schema);
+        var payloadBytes = "hello"u8.ToArray();
+        var wireBytes = new byte[5 + payloadBytes.Length];
+        wireBytes[0] = 0;
+        BinaryPrimitives.WriteInt32BigEndian(wireBytes.AsSpan(1, 4), schemaId);
+        payloadBytes.CopyTo(wireBytes.AsSpan(5));
+
+        ArraySegment<byte> payloadSegment = default;
+        await using var deserializer = SchemaRegistryDeserializer.Create(
+            registry,
+            (ReadOnlyMemory<byte> payload, Schema _) =>
+            {
+                MemoryMarshal.TryGetArray(payload, out var segment);
+                payloadSegment = segment;
+                return Encoding.UTF8.GetString(payload.Span);
+            });
+
+        var result = deserializer.Deserialize(
+            wireBytes,
+            new SerializationContext { Topic = "topic", Component = SerializationComponent.Value });
+
+        await Assert.That(result).IsEqualTo("hello");
+        await Assert.That(payloadSegment.Array).IsSameReferenceAs(wireBytes);
+        await Assert.That(payloadSegment.Offset).IsEqualTo(5);
+        await Assert.That(payloadSegment.Count).IsEqualTo(payloadBytes.Length);
+        await Assert.That(registry.TryGetCachedSchemaCallCount).IsEqualTo(1);
+        await Assert.That(registry.GetSchemaCallCount).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task Deserializer_FallsBackToGetSchema_WhenClientDoesNotExposeCache()
+    {
+        var schema = new Schema { SchemaType = SchemaType.Json, SchemaString = """{ "type": "string" }""" };
+        var registry = new NonCachingSchemaRegistryClient(schema);
+        var payloadBytes = "hello"u8.ToArray();
+        var wireBytes = new byte[5 + payloadBytes.Length];
+        wireBytes[0] = 0;
+        BinaryPrimitives.WriteInt32BigEndian(wireBytes.AsSpan(1, 4), 123);
+        payloadBytes.CopyTo(wireBytes.AsSpan(5));
+
+        await using var deserializer = SchemaRegistryDeserializer.Create(
+            registry,
+            static (ReadOnlyMemory<byte> payload, Schema _) => Encoding.UTF8.GetString(payload.Span));
+
+        var result = deserializer.Deserialize(
+            wireBytes,
+            new SerializationContext { Topic = "topic", Component = SerializationComponent.Value });
+
+        await Assert.That(result).IsEqualTo("hello");
+        await Assert.That(registry.GetSchemaCallCount).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task JsonDeserializer_UsesCachedSchema()
+    {
+        var registry = new MockSchemaRegistryClient();
+        var schema = new Schema { SchemaType = SchemaType.Json, SchemaString = """{ "type": "string" }""" };
+        var schemaId = await registry.RegisterSchemaAsync("topic-value", schema);
+        var payloadBytes = JsonSerializer.SerializeToUtf8Bytes("hello");
+        var wireBytes = new byte[5 + payloadBytes.Length];
+        wireBytes[0] = 0;
+        BinaryPrimitives.WriteInt32BigEndian(wireBytes.AsSpan(1, 4), schemaId);
+        payloadBytes.CopyTo(wireBytes.AsSpan(5));
+
+        await using var deserializer = new JsonSchemaRegistryDeserializer<string>(registry);
+
+        var result = deserializer.Deserialize(
+            wireBytes,
+            new SerializationContext { Topic = "topic", Component = SerializationComponent.Value });
+
+        await Assert.That(result).IsEqualTo("hello");
+        await Assert.That(registry.TryGetCachedSchemaCallCount).IsEqualTo(1);
+        await Assert.That(registry.GetSchemaCallCount).IsEqualTo(0);
     }
 
     private static Schema NewSchema(int id) => new()
