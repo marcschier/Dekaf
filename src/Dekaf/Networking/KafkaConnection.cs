@@ -161,9 +161,11 @@ public sealed partial class KafkaConnection : IKafkaConnection
     // Cap on _cancelledCorrelationIds to prevent unbounded growth when brokers
     // silently drop responses for timed-out requests.
     private const int MaxCancelledCorrelationIds = 10_000;
+    private const int PendingRequestShardCount = 16;
     private const int MinimumResponseFrameSize = 4; // Correlation ID is always first in the response header.
     private static int s_globalCorrelationId;
-    private readonly ConcurrentDictionary<int, PendingRequestEntry> _pendingRequests = new();
+    private readonly PendingRequestShard[] _pendingRequestShards;
+    private readonly SemaphoreSlim _pendingRequestSlots;
     private readonly ConcurrentDictionary<int, byte> _cancelledCorrelationIds = new();
     private readonly PendingRequestPool _pendingRequestPool;
     private readonly CancellationTokenSourcePool _timeoutCtsPool;
@@ -212,6 +214,17 @@ public sealed partial class KafkaConnection : IKafkaConnection
         public short Version { get; } = version;
     }
 
+    private sealed class PendingRequestShard
+    {
+        public PendingRequestShard(int capacity)
+        {
+            Requests = new Dictionary<int, PendingRequestEntry>(capacity);
+        }
+
+        public object Gate { get; } = new();
+        public Dictionary<int, PendingRequestEntry> Requests { get; }
+    }
+
     public KafkaConnection(
         string host,
         int port,
@@ -241,6 +254,8 @@ public sealed partial class KafkaConnection : IKafkaConnection
         _clientId = clientId;
         _options = options ?? new ConnectionOptions();
         var connectionSizes = PoolSizing.ForConnection(_options.MaxInFlightRequestsPerConnection);
+        _pendingRequestShards = CreatePendingRequestShards(connectionSizes.PendingRequests);
+        _pendingRequestSlots = new SemaphoreSlim(connectionSizes.PendingRequests, connectionSizes.PendingRequests);
         _pendingRequestPool = new PendingRequestPool(connectionSizes.PendingRequests);
         _timeoutCtsPool = new CancellationTokenSourcePool(connectionSizes.CancellationTokenSources);
         _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<KafkaConnection>.Instance;
@@ -289,6 +304,22 @@ public sealed partial class KafkaConnection : IKafkaConnection
         BrokerId = brokerId;
         _sharedPipeMemoryPool = sharedPipeMemoryPool;
     }
+
+    private static PendingRequestShard[] CreatePendingRequestShards(int capacity)
+    {
+        var shardCount = Math.Min(PendingRequestShardCount, capacity);
+        var capacityPerShard = Math.Max(1, (capacity + shardCount - 1) / shardCount);
+        var shards = new PendingRequestShard[shardCount];
+
+        for (var i = 0; i < shards.Length; i++)
+            shards[i] = new PendingRequestShard(capacityPerShard);
+
+        return shards;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private PendingRequestShard GetPendingRequestShard(int correlationId)
+        => _pendingRequestShards[(int)((uint)correlationId % (uint)_pendingRequestShards.Length)];
 
     public async ValueTask ConnectAsync(CancellationToken cancellationToken = default)
     {
@@ -450,9 +481,19 @@ public sealed partial class KafkaConnection : IKafkaConnection
         var headerVersion = TRequest.GetRequestHeaderVersion(apiVersion);
         var responseHeaderVersion = TRequest.GetResponseHeaderVersion(apiVersion);
 
+        await ReservePendingRequestSlotAsync(cancellationToken).ConfigureAwait(false);
         var pending = _pendingRequestPool.Rent();
         pending.Initialize(responseHeaderVersion, cancellationToken, registerCancellation: false);
-        _pendingRequests[correlationId] = new PendingRequestEntry(pending, pending.Version);
+        try
+        {
+            AddPendingRequest(correlationId, pending);
+        }
+        catch
+        {
+            ReleasePendingRequestSlot();
+            _pendingRequestPool.Return(pending);
+            throw;
+        }
 
         ThrowIfDisposedAfterAddingPendingRequest(correlationId);
 
@@ -475,7 +516,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
             // Clean up pending request on any failure (write lock cancelled, write failed,
             // or response error). AwaitAndParseResponseAsync has its own finally that also
             // tries TryRemove — the second attempt harmlessly returns false.
-            if (_pendingRequests.TryRemove(correlationId, out var removed))
+            if (TryRemovePendingRequest(correlationId, out var removed))
             {
                 _pendingRequestPool.Return(removed.Request);
             }
@@ -583,9 +624,19 @@ public sealed partial class KafkaConnection : IKafkaConnection
         var headerVersion = TRequest.GetRequestHeaderVersion(apiVersion);
         var responseHeaderVersion = TRequest.GetResponseHeaderVersion(apiVersion);
 
+        await ReservePendingRequestSlotAsync(cancellationToken).ConfigureAwait(false);
         var pending = _pendingRequestPool.Rent();
         pending.Initialize(responseHeaderVersion, cancellationToken, registerCancellation: false);
-        _pendingRequests[correlationId] = new PendingRequestEntry(pending, pending.Version);
+        try
+        {
+            AddPendingRequest(correlationId, pending);
+        }
+        catch
+        {
+            ReleasePendingRequestSlot();
+            _pendingRequestPool.Return(pending);
+            throw;
+        }
 
         ThrowIfDisposedAfterAddingPendingRequest(correlationId);
 
@@ -601,7 +652,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
         catch
         {
             // On failure, ensure we clean up the pending request
-            if (_pendingRequests.TryRemove(correlationId, out var removed))
+            if (TryRemovePendingRequest(correlationId, out var removed))
             {
                 _pendingRequestPool.Return(removed.Request);
             }
@@ -716,7 +767,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
         }
         finally
         {
-            if (_pendingRequests.TryRemove(correlationId, out var removed))
+            if (TryRemovePendingRequest(correlationId, out var removed))
             {
                 _pendingRequestPool.Return(removed.Request);
 
@@ -1070,7 +1121,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
     {
         LogReceivedResponse(correlationId, responseData.Length);
 
-        if (_pendingRequests.TryGetValue(correlationId, out var pending))
+        if (TryGetPendingRequest(correlationId, out var pending))
         {
             if (!pending.Request.TryComplete(pending.Version, responseData))
             {
@@ -1087,6 +1138,78 @@ public sealed partial class KafkaConnection : IKafkaConnection
             LogUnknownCorrelationId(correlationId);
             responseData.Dispose();
         }
+    }
+
+    private ValueTask ReservePendingRequestSlotAsync(CancellationToken cancellationToken)
+    {
+        if (_pendingRequestSlots.Wait(0, cancellationToken))
+            return ValueTask.CompletedTask;
+
+        return ReservePendingRequestSlotSlowAsync(cancellationToken);
+    }
+
+    private async ValueTask ReservePendingRequestSlotSlowAsync(CancellationToken cancellationToken)
+    {
+        await _pendingRequestSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private void ReleasePendingRequestSlot()
+    {
+        _pendingRequestSlots.Release();
+    }
+
+    private void ReleasePendingRequestSlots(int count)
+    {
+        if (count > 0)
+            _pendingRequestSlots.Release(count);
+    }
+
+    private void AddPendingRequest(int correlationId, PooledPendingRequest request)
+    {
+        var shard = GetPendingRequestShard(correlationId);
+        lock (shard.Gate)
+        {
+            if (!shard.Requests.TryAdd(correlationId, new PendingRequestEntry(request, request.Version)))
+                throw new InvalidOperationException($"Duplicate pending request correlation id {correlationId}.");
+        }
+    }
+
+    private bool TryGetPendingRequest(int correlationId, out PendingRequestEntry entry)
+    {
+        var shard = GetPendingRequestShard(correlationId);
+        lock (shard.Gate)
+        {
+            return shard.Requests.TryGetValue(correlationId, out entry);
+        }
+    }
+
+    private bool TryRemovePendingRequest(int correlationId, out PendingRequestEntry entry)
+    {
+        bool removed;
+        var shard = GetPendingRequestShard(correlationId);
+        lock (shard.Gate)
+        {
+            removed = shard.Requests.Remove(correlationId, out entry);
+        }
+
+        if (removed)
+            ReleasePendingRequestSlot();
+
+        return removed;
+    }
+
+    private int GetPendingRequestCount()
+    {
+        var count = 0;
+        foreach (var shard in _pendingRequestShards)
+        {
+            lock (shard.Gate)
+            {
+                count += shard.Requests.Count;
+            }
+        }
+
+        return count;
     }
 
     private bool TryReadResponse(
@@ -1206,7 +1329,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
     {
         if (Volatile.Read(ref _disposed) != 0)
         {
-            if (_pendingRequests.TryRemove(correlationId, out var removed))
+            if (TryRemovePendingRequest(correlationId, out var removed))
             {
                 _pendingRequestPool.Return(removed.Request);
             }
@@ -1229,22 +1352,37 @@ public sealed partial class KafkaConnection : IKafkaConnection
         // AwaitAndParseResponseAsync (or the catch in SendAsync/SendPipelinedAsync)
         // will TryRemove and return the request to the pool.
         //
-        // If we remove here, the awaiter can't find the request in the dictionary,
+        // If we remove here, the awaiter can't find the request in the table,
         // so it never returns it to the pool — causing a pool leak that forces
         // constant allocation of new PooledPendingRequest objects.
-        //
-        // Iterate twice to handle the ConcurrentDictionary race: a request added
-        // by SendPipelinedAsync between the _disposed check and TryAdd may be missed
-        // by the first foreach (ConcurrentDictionary enumerators are not strict snapshots).
-        // The second pass catches late arrivals, since _disposed is already set by this
-        // point and prevents any NEW requests from being registered.
-        for (var pass = 0; pass < 2; pass++)
+        foreach (var shard in _pendingRequestShards)
         {
-            foreach (var kvp in _pendingRequests)
+            lock (shard.Gate)
             {
-                kvp.Value.Request.TrySetException(kvp.Value.Version, ex);
+                foreach (var slot in shard.Requests.Values)
+                    slot.Request.TrySetException(slot.Version, ex);
             }
         }
+    }
+
+    private void ReturnAllPendingRequestsToPool()
+    {
+        var releasedSlots = 0;
+        foreach (var shard in _pendingRequestShards)
+        {
+            lock (shard.Gate)
+            {
+                foreach (var slot in shard.Requests.Values)
+                {
+                    _pendingRequestPool.Return(slot.Request);
+                    releasedSlots++;
+                }
+
+                shard.Requests.Clear();
+            }
+        }
+
+        ReleasePendingRequestSlots(releasedSlots);
     }
 
     private SslClientAuthenticationOptions BuildSslClientAuthenticationOptions()
@@ -1933,7 +2071,11 @@ public sealed partial class KafkaConnection : IKafkaConnection
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
 
-        LogConnectionDisposing(BrokerId, _pendingRequests.Count);
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            var pendingRequestCount = GetPendingRequestCount();
+            LogConnectionDisposing(BrokerId, pendingRequestCount);
+        }
 
         _receiveCts?.Cancel();
 
@@ -2028,14 +2170,9 @@ public sealed partial class KafkaConnection : IKafkaConnection
         // Sweep any remaining entries that had no awaiter (edge case: request registered
         // but cancelled before AwaitAndParseResponseAsync was entered). These won't be
         // cleaned up by a continuation since none was registered.
-        foreach (var kvp in _pendingRequests)
-        {
-            if (_pendingRequests.TryRemove(kvp.Key, out var orphaned))
-            {
-                _pendingRequestPool.Return(orphaned.Request);
-            }
-        }
+        ReturnAllPendingRequestsToPool();
 
+        _pendingRequestSlots.Dispose();
         _cancelledCorrelationIds.Clear();
     }
 
