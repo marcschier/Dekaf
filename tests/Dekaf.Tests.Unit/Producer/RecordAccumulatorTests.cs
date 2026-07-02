@@ -73,6 +73,127 @@ public class RecordAccumulatorTests
     }
 
     [Test]
+    public async Task BatchRotation_EnqueuesReadyBatchesInOrderAndClearsRotationGate()
+    {
+        var options = new ProducerOptions
+        {
+            BootstrapServers = new[] { "localhost:9092" },
+            ClientId = "test-producer",
+            BufferMemory = ulong.MaxValue,
+            BatchSize = 80,
+            LingerMs = 10_000
+        };
+
+        await using var accumulator = new RecordAccumulator(options);
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        for (var i = 0; i < 3; i++)
+        {
+            var value = new byte[30];
+            value[0] = (byte)(i + 1);
+
+            var appended = await accumulator.AppendFromSpansAsync(
+                "test-topic",
+                partition: 0,
+                timestamp + i,
+                ReadOnlySpan<byte>.Empty,
+                keyIsNull: true,
+                value,
+                valueIsNull: false,
+                headers: null,
+                headerCount: 0,
+                callback: null,
+                CancellationToken.None,
+                partitionCount: 1);
+
+            await Assert.That(appended).IsTrue();
+        }
+
+        await Assert.That(accumulator.TryDrainBatch(out var firstBatch)).IsTrue();
+        await Assert.That(accumulator.TryDrainBatch(out var secondBatch)).IsTrue();
+        await Assert.That(accumulator.TryDrainBatch(out _)).IsFalse();
+
+        await Assert.That(firstBatch!.RecordBatch.Records[0].Value.Span[0]).IsEqualTo((byte)1);
+        await Assert.That(secondBatch!.RecordBatch.Records[0].Value.Span[0]).IsEqualTo((byte)2);
+
+        var partitionDeque = GetPartitionDeque(accumulator, new TopicPartition("test-topic", 0));
+        var rotationField = partitionDeque.GetType().GetField("RotationInProgress");
+
+        await Assert.That(rotationField).IsNotNull();
+        await Assert.That((bool)rotationField!.GetValue(partitionDeque)!).IsFalse();
+
+        var now = DateTimeOffset.UtcNow;
+        firstBatch.CompleteSend(baseOffset: 0, now);
+        secondBatch.CompleteSend(baseOffset: 1, now);
+    }
+
+    [Test]
+    public async Task AppendFromSpansAsync_WithCallback_PreservesCallbackAfterRotation()
+    {
+        var options = new ProducerOptions
+        {
+            BootstrapServers = new[] { "localhost:9092" },
+            ClientId = "test-producer",
+            BufferMemory = ulong.MaxValue,
+            BatchSize = 80,
+            LingerMs = 10_000
+        };
+
+        await using var accumulator = new RecordAccumulator(options);
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var callbackCount = 0;
+        RecordMetadata callbackMetadata = default;
+        Exception? callbackError = null;
+
+        var firstValue = new byte[30];
+        await accumulator.AppendFromSpansAsync(
+            "test-topic",
+            partition: 0,
+            timestamp,
+            ReadOnlySpan<byte>.Empty,
+            keyIsNull: true,
+            firstValue,
+            valueIsNull: false,
+            headers: null,
+            headerCount: 0,
+            callback: (metadata, error) =>
+            {
+                callbackCount++;
+                callbackMetadata = metadata;
+                callbackError = error;
+            },
+            CancellationToken.None,
+            partitionCount: 1);
+
+        var secondValue = new byte[30];
+        await accumulator.AppendFromSpansAsync(
+            "test-topic",
+            partition: 0,
+            timestamp + 1,
+            ReadOnlySpan<byte>.Empty,
+            keyIsNull: true,
+            secondValue,
+            valueIsNull: false,
+            headers: null,
+            headerCount: 0,
+            callback: null,
+            CancellationToken.None,
+            partitionCount: 1);
+
+        await Assert.That(accumulator.TryDrainBatch(out var sealedBatch)).IsTrue();
+
+        var completedAt = DateTimeOffset.UtcNow;
+        sealedBatch!.CompleteSend(baseOffset: 42, completedAt);
+
+        await Assert.That(callbackCount).IsEqualTo(1);
+        await Assert.That(callbackError).IsNull();
+        await Assert.That(callbackMetadata.Topic).IsEqualTo("test-topic");
+        await Assert.That(callbackMetadata.Partition).IsEqualTo(0);
+        await Assert.That(callbackMetadata.Offset).IsEqualTo(42);
+        await Assert.That(callbackMetadata.Timestamp).IsEqualTo(completedAt);
+    }
+
+    [Test]
     public async Task PartitionBatch_Complete_CalledTwice_ReturnsIdempotent()
     {
         // This test verifies that calling Complete() multiple times on the same PartitionBatch
@@ -2112,6 +2233,15 @@ public class RecordAccumulatorTests
 
     private static ReadyBatch CompleteCurrentBatch(RecordAccumulator accumulator, TopicPartition topicPartition)
     {
+        var partitionDeque = GetPartitionDeque(accumulator, topicPartition);
+        var currentBatchField = partitionDeque!.GetType().GetField("CurrentBatch");
+        var partitionBatch = currentBatchField!.GetValue(partitionDeque);
+        var completeMethod = partitionBatch!.GetType().GetMethod("Complete");
+        return (ReadyBatch)completeMethod!.Invoke(partitionBatch, null)!;
+    }
+
+    private static object GetPartitionDeque(RecordAccumulator accumulator, TopicPartition topicPartition)
+    {
         var dequesField = typeof(RecordAccumulator).GetField("_partitionDeques",
             BindingFlags.NonPublic | BindingFlags.Instance);
         var deques = dequesField!.GetValue(accumulator)!;
@@ -2122,11 +2252,7 @@ public class RecordAccumulatorTests
         if (!found)
             throw new InvalidOperationException("Partition deque was not found.");
 
-        var partitionDeque = parameters[1];
-        var currentBatchField = partitionDeque!.GetType().GetField("CurrentBatch");
-        var partitionBatch = currentBatchField!.GetValue(partitionDeque);
-        var completeMethod = partitionBatch!.GetType().GetMethod("Complete");
-        return (ReadyBatch)completeMethod!.Invoke(partitionBatch, null)!;
+        return parameters[1]!;
     }
 
     private static T GetPrivateField<T>(object instance, string fieldName)
