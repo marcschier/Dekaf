@@ -604,6 +604,36 @@ public class RecordBatchTests
     }
 
     [Test]
+    public async Task PreCompress_UsesSerializedRecordSizeAsInitialOutputCapacity()
+    {
+        var codec = new CapturingCompressionCodec(CompressionType.Gzip);
+        var registry = new CompressionCodecRegistry();
+        registry.Register(codec);
+
+        using var batch = new RecordBatch
+        {
+            BaseOffset = 0,
+            BaseTimestamp = 0,
+            MaxTimestamp = 0,
+            Records =
+            [
+                new Record
+                {
+                    OffsetDelta = 0,
+                    TimestampDelta = 0,
+                    Key = "key"u8.ToArray(),
+                    Value = new byte[64 * 1024]
+                }
+            ]
+        };
+
+        batch.PreCompress(CompressionType.Gzip, registry);
+
+        await Assert.That(codec.SourceLength).IsGreaterThan(4096);
+        await Assert.That(codec.InitialArrayLength).IsGreaterThanOrEqualTo(codec.SourceLength);
+    }
+
+    [Test]
     public async Task Write_WithPreCompressedData_ProducesSameOutputAsInlineCompression()
     {
         var records = new Record[]
@@ -674,14 +704,18 @@ public class RecordBatchTests
         public CompressionType Type { get; } = type;
         public byte[]? OutputArray { get; private set; }
         public int BytesWritten { get; private set; }
+        public int InitialArrayLength { get; private set; }
+        public int SourceLength { get; private set; }
 
         public void Compress(ReadOnlySequence<byte> source, IBufferWriter<byte> destination)
         {
+            SourceLength = checked((int)source.Length);
             var memory = destination.GetMemory(Payload.Length);
             if (!MemoryMarshal.TryGetArray<byte>(memory, out var segment) || segment.Array is null)
                 throw new InvalidOperationException("Expected array-backed compression destination.");
 
             OutputArray = segment.Array;
+            InitialArrayLength = segment.Array.Length;
             Payload.CopyTo(memory.Span);
             BytesWritten = Payload.Length;
             destination.Advance(Payload.Length);
