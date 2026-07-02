@@ -40,6 +40,8 @@ public sealed class SchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisposab
     private readonly bool _ownsClient;
 
     private readonly ConcurrentDictionary<string, int> _schemaIdCache = new();
+    private readonly ConcurrentDictionary<SubjectCacheKey, SubjectSchemaIdCacheEntry> _subjectSchemaIdCache = new();
+    private SubjectSchemaIdCacheEntry? _lastSubjectSchemaId;
 
     /// <summary>
     /// Creates a new Schema Registry serializer.
@@ -94,11 +96,7 @@ public sealed class SchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisposab
     public void Serialize<TWriter>(T value, ref TWriter destination, SerializationContext context)
         where TWriter : IBufferWriter<byte>, allows ref struct
     {
-        var subject = GetSubjectName(context.Topic, context.Component == SerializationComponent.Key);
-        var schema = _getSchema(subject);
-
-        // Get or register schema ID (cached after first call per subject)
-        var schemaId = GetSchemaIdSync(subject, schema);
+        var schemaId = GetSchemaIdForContext(context.Topic, context.Component == SerializationComponent.Key);
 
         var payloadBuffer = SchemaRegistryBuffers.PayloadBuffer ??= new ArrayBufferWriter<byte>(initialCapacity: 4096);
         payloadBuffer.ResetWrittenCount();
@@ -116,6 +114,28 @@ public sealed class SchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisposab
         payloadBuffer.WrittenSpan.CopyTo(span.Slice(5));
 
         destination.Advance(totalSize);
+    }
+
+    private int GetSchemaIdForContext(string topic, bool isKey)
+    {
+        var last = _lastSubjectSchemaId;
+        if (last is not null && last.Matches(topic, isKey))
+            return last.SchemaId;
+
+        var key = new SubjectCacheKey(topic, isKey);
+        if (_subjectSchemaIdCache.TryGetValue(key, out var cached))
+        {
+            _lastSubjectSchemaId = cached;
+            return cached.SchemaId;
+        }
+
+        var subject = GetSubjectName(topic, isKey);
+        var schema = _getSchema(subject);
+        var schemaId = GetSchemaIdSync(subject, schema);
+        var entry = new SubjectSchemaIdCacheEntry(topic, isKey, schemaId);
+        _subjectSchemaIdCache[key] = entry;
+        _lastSubjectSchemaId = entry;
+        return schemaId;
     }
 
     private int GetSchemaIdSync(string subject, Schema schema)
@@ -149,6 +169,14 @@ public sealed class SchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisposab
             SubjectNameStrategy.TopicRecordName => $"{topic}-{typeof(T).FullName}{suffix}",
             _ => topic + suffix
         };
+    }
+
+    private readonly record struct SubjectCacheKey(string Topic, bool IsKey);
+
+    private sealed record SubjectSchemaIdCacheEntry(string Topic, bool IsKey, int SchemaId)
+    {
+        public bool Matches(string topic, bool isKey) =>
+            IsKey == isKey && string.Equals(Topic, topic, StringComparison.Ordinal);
     }
 
     public ValueTask DisposeAsync()

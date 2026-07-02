@@ -33,8 +33,10 @@ public sealed class ProtobufSchemaRegistrySerializer<T> : ISerializer<T>, IAsync
     private readonly bool _ownsClient;
     private readonly MessageDescriptor _descriptor;
     private readonly ConcurrentDictionary<string, int> _schemaIdCache = new();
+    private readonly ConcurrentDictionary<SubjectCacheKey, SubjectSchemaIdCacheEntry> _subjectSchemaIdCache = new();
     private readonly Schema _schema;
     private readonly byte[] _encodedMessageIndexes;
+    private SubjectSchemaIdCacheEntry? _lastSubjectSchemaId;
 
     /// <summary>
     /// Creates a new Protobuf Schema Registry serializer.
@@ -74,8 +76,7 @@ public sealed class ProtobufSchemaRegistrySerializer<T> : ISerializer<T>, IAsync
     {
         ArgumentNullException.ThrowIfNull(value);
 
-        var subject = GetSubjectName(context.Topic, context.Component == SerializationComponent.Key);
-        var schemaId = GetSchemaIdSync(subject);
+        var schemaId = GetSchemaIdForContext(context.Topic, context.Component == SerializationComponent.Key);
 
         // Serialize the protobuf message to bytes using ToByteArray() for compatibility
         // with both generated and hand-coded messages
@@ -99,6 +100,27 @@ public sealed class ProtobufSchemaRegistrySerializer<T> : ISerializer<T>, IAsync
         protoBytes.AsSpan().CopyTo(span.Slice(offset));
 
         destination.Advance(totalSize);
+    }
+
+    private int GetSchemaIdForContext(string topic, bool isKey)
+    {
+        var last = _lastSubjectSchemaId;
+        if (last is not null && last.Matches(topic, isKey))
+            return last.SchemaId;
+
+        var key = new SubjectCacheKey(topic, isKey);
+        if (_subjectSchemaIdCache.TryGetValue(key, out var cached))
+        {
+            _lastSubjectSchemaId = cached;
+            return cached.SchemaId;
+        }
+
+        var subject = GetSubjectName(topic, isKey);
+        var schemaId = GetSchemaIdSync(subject);
+        var entry = new SubjectSchemaIdCacheEntry(topic, isKey, schemaId);
+        _subjectSchemaIdCache[key] = entry;
+        _lastSubjectSchemaId = entry;
+        return schemaId;
     }
 
     private int GetSchemaIdSync(string subject)
@@ -146,6 +168,14 @@ public sealed class ProtobufSchemaRegistrySerializer<T> : ISerializer<T>, IAsync
             SubjectNameStrategy.TopicRecordName => $"{topic}-{_descriptor.FullName}{suffix}",
             _ => topic + suffix
         };
+    }
+
+    private readonly record struct SubjectCacheKey(string Topic, bool IsKey);
+
+    private sealed record SubjectSchemaIdCacheEntry(string Topic, bool IsKey, int SchemaId)
+    {
+        public bool Matches(string topic, bool isKey) =>
+            IsKey == isKey && string.Equals(Topic, topic, StringComparison.Ordinal);
     }
 
     private static MessageDescriptor GetMessageDescriptor()

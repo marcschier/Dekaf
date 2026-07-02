@@ -41,11 +41,13 @@ public sealed class AvroSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
     private readonly AvroSerializerConfig _config;
     private readonly bool _ownsClient;
     private readonly ConcurrentDictionary<string, Lazy<Task<int>>> _schemaIdCache = new();
+    private readonly ConcurrentDictionary<SubjectCacheKey, SubjectSchemaIdCacheEntry> _subjectSchemaIdCache = new();
     private readonly ConcurrentDictionary<AvroSchema, GenericDatumWriter<GenericRecord>> _genericWriters =
         new(AvroSchemaReferenceComparer.Instance);
     private readonly ConcurrentDictionary<AvroSchema, SpecificDefaultWriter> _specificWriters =
         new(AvroSchemaReferenceComparer.Instance);
     private readonly AvroSchema? _writerSchema;
+    private SubjectSchemaIdCacheEntry? _lastSubjectSchemaId;
 
     /// <summary>
     /// Creates a new Avro Schema Registry serializer.
@@ -86,7 +88,9 @@ public sealed class AvroSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
     {
         ArgumentNullException.ThrowIfNull(value);
         var subject = GetSubjectName(topic, isKey);
-        return await GetOrFetchSchemaIdAsync(subject, value, cancellationToken).ConfigureAwait(false);
+        var schemaId = await GetOrFetchSchemaIdAsync(subject, value, cancellationToken).ConfigureAwait(false);
+        CacheSubjectSchemaId(topic, isKey, schemaId);
+        return schemaId;
     }
 
     /// <summary>
@@ -104,8 +108,7 @@ public sealed class AvroSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
     {
         ArgumentNullException.ThrowIfNull(value);
 
-        var subject = GetSubjectName(context.Topic, context.Component == SerializationComponent.Key);
-        var schemaId = GetSchemaIdCached(subject, value);
+        var schemaId = GetSchemaIdForContext(context.Topic, context.Component == SerializationComponent.Key, value);
 
         var codecState = AvroCodecThreadStateCache.Serialization ??= new AvroSerializationThreadState();
         var memoryStream = codecState.Stream;
@@ -137,6 +140,32 @@ public sealed class AvroSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
             memoryStream.DetachBuffer();
             ArrayPool<byte>.Shared.Return(rentedBuffer);
         }
+    }
+
+    private int GetSchemaIdForContext(string topic, bool isKey, T value)
+    {
+        var last = _lastSubjectSchemaId;
+        if (last is not null && last.Matches(topic, isKey))
+            return last.SchemaId;
+
+        var key = new SubjectCacheKey(topic, isKey);
+        if (_subjectSchemaIdCache.TryGetValue(key, out var cached))
+        {
+            _lastSubjectSchemaId = cached;
+            return cached.SchemaId;
+        }
+
+        var subject = GetSubjectName(topic, isKey);
+        var schemaId = GetSchemaIdCached(subject, value);
+        return CacheSubjectSchemaId(topic, isKey, schemaId);
+    }
+
+    private int CacheSubjectSchemaId(string topic, bool isKey, int schemaId)
+    {
+        var entry = new SubjectSchemaIdCacheEntry(topic, isKey, schemaId);
+        _subjectSchemaIdCache[new SubjectCacheKey(topic, isKey)] = entry;
+        _lastSubjectSchemaId = entry;
+        return schemaId;
     }
 
     private void WriteAvroValue(T value, BinaryEncoder encoder)
@@ -299,6 +328,14 @@ public sealed class AvroSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
         }
 
         return typeof(T).FullName ?? typeof(T).Name;
+    }
+
+    private readonly record struct SubjectCacheKey(string Topic, bool IsKey);
+
+    private sealed record SubjectSchemaIdCacheEntry(string Topic, bool IsKey, int SchemaId)
+    {
+        public bool Matches(string topic, bool isKey) =>
+            IsKey == isKey && string.Equals(Topic, topic, StringComparison.Ordinal);
     }
 
     /// <summary>

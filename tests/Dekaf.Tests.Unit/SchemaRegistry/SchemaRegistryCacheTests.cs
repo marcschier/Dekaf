@@ -1,11 +1,15 @@
 using System.Buffers;
-using System.Collections.Concurrent;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using Avro.Generic;
 using Dekaf.SchemaRegistry;
+using Dekaf.SchemaRegistry.Avro;
+using Dekaf.SchemaRegistry.Protobuf;
 using Dekaf.Serialization;
+using AvroSchema = Avro.Schema;
 
 namespace Dekaf.Tests.Unit.SchemaRegistry;
 
@@ -95,6 +99,26 @@ public sealed class SchemaRegistryCacheTests
         public void Dispose() { }
     }
 
+    private sealed class CountingSubjectNameStrategy : ISubjectNameStrategy
+    {
+        private int _callCount;
+
+        public int CallCount => _callCount;
+
+        public string GetSubjectName(string topic, string? recordType, bool isKey)
+        {
+            Interlocked.Increment(ref _callCount);
+            return $"{topic}-{(isKey ? "key" : "value")}";
+        }
+    }
+
+    private static SerializationContext CreateContext(string topic = "topic", bool isKey = false) =>
+        new()
+        {
+            Topic = topic,
+            Component = isKey ? SerializationComponent.Key : SerializationComponent.Value
+        };
+
     [Test]
     public async Task Serializer_CachesSchemaId_AcrossMultipleSubjects()
     {
@@ -132,6 +156,105 @@ public sealed class SchemaRegistryCacheTests
         await Assert.That(registry.GetCallCount("topic-a-value")).IsEqualTo(1);
         await Assert.That(registry.GetCallCount("topic-b-value")).IsEqualTo(1);
         await Assert.That(registry.TotalCallCount).IsEqualTo(2);
+    }
+
+    [Test]
+    public async Task Serializer_CachesSubjectAndSchemaId_ForSameContext()
+    {
+        var registry = new CountingSchemaRegistryClient();
+        var strategy = new CountingSubjectNameStrategy();
+        var schema = new Schema { SchemaType = SchemaType.Json, SchemaString = """{ "type": "string" }""" };
+        var schemaFactoryCalls = 0;
+
+        await using var serializer = new SchemaRegistrySerializer<string>(
+            registry,
+            serialize: static (value, writer) =>
+            {
+                var byteCount = Encoding.UTF8.GetByteCount(value);
+                Encoding.UTF8.GetBytes(value, writer.GetSpan(byteCount));
+                writer.Advance(byteCount);
+            },
+            getSchema: _ =>
+            {
+                schemaFactoryCalls++;
+                return schema;
+            },
+            customSubjectNameStrategy: strategy);
+
+        var context = CreateContext();
+
+        var buffer1 = new ArrayBufferWriter<byte>();
+        serializer.Serialize("msg-1", ref buffer1, context);
+
+        var buffer2 = new ArrayBufferWriter<byte>();
+        serializer.Serialize("msg-2", ref buffer2, context);
+
+        await Assert.That(strategy.CallCount).IsEqualTo(1);
+        await Assert.That(schemaFactoryCalls).IsEqualTo(1);
+        await Assert.That(registry.GetCallCount("topic-value")).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task JsonSerializer_CachesSubjectAndSchemaId_ForSameContext()
+    {
+        var registry = new CountingSchemaRegistryClient();
+        var strategy = new CountingSubjectNameStrategy();
+
+        await using var serializer = new JsonSchemaRegistrySerializer<string>(
+            registry,
+            """{ "type": "string" }""",
+            strategy);
+
+        var context = CreateContext();
+
+        var buffer1 = new ArrayBufferWriter<byte>();
+        serializer.Serialize("msg-1", ref buffer1, context);
+
+        var buffer2 = new ArrayBufferWriter<byte>();
+        serializer.Serialize("msg-2", ref buffer2, context);
+
+        await Assert.That(strategy.CallCount).IsEqualTo(1);
+        await Assert.That(registry.GetCallCount("topic-value")).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task AvroSerializer_CachesSubjectAndSchemaId_ForSameContext()
+    {
+        var registry = new CountingSchemaRegistryClient();
+        var strategy = new CountingSubjectNameStrategy();
+        var config = new AvroSerializerConfig { CustomSubjectNameStrategy = strategy };
+        await using var serializer = new AvroSchemaRegistrySerializer<GenericRecord>(registry, config);
+        var record = CreateAvroRecord();
+        var context = CreateContext();
+
+        var buffer1 = new ArrayBufferWriter<byte>();
+        serializer.Serialize(record, ref buffer1, context);
+
+        var buffer2 = new ArrayBufferWriter<byte>();
+        serializer.Serialize(record, ref buffer2, context);
+
+        await Assert.That(strategy.CallCount).IsEqualTo(1);
+        await Assert.That(registry.GetCallCount("topic-value")).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task ProtobufSerializer_CachesSubjectAndSchemaId_ForSameContext()
+    {
+        var registry = new CountingSchemaRegistryClient();
+        var strategy = new CountingSubjectNameStrategy();
+        var config = new ProtobufSerializerConfig { CustomSubjectNameStrategy = strategy };
+        await using var serializer = new ProtobufSchemaRegistrySerializer<TestMessage>(registry, config);
+        var message = new TestMessage { Id = 1, Name = "Test", Value = 3.14 };
+        var context = CreateContext();
+
+        var buffer1 = new ArrayBufferWriter<byte>();
+        serializer.Serialize(message, ref buffer1, context);
+
+        var buffer2 = new ArrayBufferWriter<byte>();
+        serializer.Serialize(message, ref buffer2, context);
+
+        await Assert.That(strategy.CallCount).IsEqualTo(1);
+        await Assert.That(registry.GetCallCount("topic-value")).IsEqualTo(1);
     }
 
     [Test]
@@ -263,4 +386,23 @@ public sealed class SchemaRegistryCacheTests
         SchemaType = SchemaType.Json,
         SchemaString = $$"""{ "type": "string", "title": "schema-{{id}}" }"""
     };
+
+    private static GenericRecord CreateAvroRecord()
+    {
+        var schema = (Avro.RecordSchema)AvroSchema.Parse("""
+            {
+                "type": "record",
+                "name": "SimpleRecord",
+                "namespace": "test",
+                "fields": [
+                    { "name": "id", "type": "int" },
+                    { "name": "name", "type": "string" }
+                ]
+            }
+            """);
+        var record = new GenericRecord(schema);
+        record.Add("id", 1);
+        record.Add("name", "test");
+        return record;
+    }
 }
