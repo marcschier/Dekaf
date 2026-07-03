@@ -1025,6 +1025,8 @@ public sealed partial class MetadataManager : IAsyncDisposable
         _backgroundRefreshCts?.Cancel();
 
         await WaitForInitializationToDrainAsync().ConfigureAwait(false);
+        // An InitializeAsync racing disposal can create the background CTS while we drain it.
+        _backgroundRefreshCts?.Cancel();
 
         if (_backgroundRefreshTask is not null)
         {

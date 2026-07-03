@@ -343,6 +343,35 @@ public class MetadataManagerTests
     }
 
     [Test]
+    public async Task DisposeAsync_CancelsBackgroundRefreshCtsCreatedWhileInitializationDrains()
+    {
+        var manager = new MetadataManager(
+            Substitute.For<IConnectionPool>(),
+            ["localhost:9092"],
+            new MetadataOptions { MetadataRefreshInterval = TimeSpan.FromHours(1) });
+        var initializeLock = GetInstanceField<SemaphoreSlim>(manager, "_initializeLock");
+        await initializeLock.WaitAsync();
+        var firstCancelObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var firstCts = new CancellationTokenSource();
+        using var registration = firstCts.Token.Register(
+            static state => ((TaskCompletionSource)state!).TrySetResult(),
+            firstCancelObserved);
+        SetInstanceField(manager, "_backgroundRefreshCts", firstCts);
+
+        var disposeTask = manager.DisposeAsync().AsTask();
+        await firstCancelObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.That(disposeTask.IsCompleted).IsFalse();
+
+        var racedCts = new CancellationTokenSource();
+        SetInstanceField(manager, "_backgroundRefreshCts", racedCts);
+        initializeLock.Release();
+
+        await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await Assert.That(racedCts.IsCancellationRequested).IsTrue();
+    }
+
+    [Test]
     public async Task ObjectDisposedException_IsFatalMetadataError()
     {
         await Assert.That(IsFatalMetadataError(new ObjectDisposedException(nameof(MetadataManager)))).IsTrue();
