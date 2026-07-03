@@ -179,24 +179,22 @@ internal sealed class PooledReusableBufferWriter : IBufferWriter<byte>, IDisposa
 }
 
 /// <summary>
-/// Lightweight IBufferWriter backed by ArrayPool&lt;byte&gt;.Shared for decompression.
-/// After decompression, <see cref="DetachBuffer"/> transfers ownership of the underlying
-/// pooled array to the caller, eliminating a second memcpy that would otherwise be needed
-/// when using a shared scratch buffer (PooledReusableBufferWriter).
+/// Lightweight <see cref="IBufferWriter{T}"/> backed by a supplied array pool.
+/// <see cref="DetachBuffer"/> transfers ownership of the underlying pooled array to
+/// the caller, eliminating a second memcpy from reusable scratch storage.
 /// </summary>
-/// <remarks>
-/// Not reusable — each instance is created per decompression operation (per-batch cost, acceptable).
-/// The array is rented from ArrayPool&lt;byte&gt;.Shared so it can be returned by
-/// <see cref="LazyRecordList.Dispose"/> which also uses ArrayPool&lt;byte&gt;.Shared.
-/// </remarks>
-internal sealed class DecompressDirectBufferWriter : IBufferWriter<byte>, IDisposable
+internal sealed class DetachableBufferWriter : IBufferWriter<byte>, IDisposable
 {
+    private const int MinimumInitialCapacity = 256;
+
+    private readonly ArrayPool<byte> _pool;
     private byte[] _buffer;
     private int _written;
 
-    public DecompressDirectBufferWriter(int initialCapacity)
+    public DetachableBufferWriter(ArrayPool<byte> pool, int initialCapacity)
     {
-        _buffer = ArrayPool<byte>.Shared.Rent(Math.Max(256, initialCapacity));
+        _pool = pool;
+        _buffer = pool.Rent(Math.Max(MinimumInitialCapacity, initialCapacity));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -221,10 +219,6 @@ internal sealed class DecompressDirectBufferWriter : IBufferWriter<byte>, IDispo
         return _buffer.AsSpan(_written);
     }
 
-    /// <summary>
-    /// Transfers ownership of the internal pooled array to the caller.
-    /// The caller must return it to ArrayPool&lt;byte&gt;.Shared when done.
-    /// </summary>
     public byte[] DetachBuffer(out int length)
     {
         length = _written;
@@ -234,16 +228,13 @@ internal sealed class DecompressDirectBufferWriter : IBufferWriter<byte>, IDispo
         return buf;
     }
 
-    /// <summary>
-    /// Returns the rented buffer if ownership was not transferred via <see cref="DetachBuffer"/>.
-    /// </summary>
     public void Dispose()
     {
         var buf = _buffer;
         _buffer = [];
         _written = 0;
         if (buf.Length > 0)
-            ArrayPool<byte>.Shared.Return(buf, clearArray: false);
+            _pool.Return(buf, clearArray: false);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -268,9 +259,9 @@ internal sealed class DecompressDirectBufferWriter : IBufferWriter<byte>, IDispo
         if (newSize <= _buffer.Length)
             throw new InvalidOperationException("Cannot grow buffer: maximum size reached.");
 
-        var newBuffer = ArrayPool<byte>.Shared.Rent(newSize);
+        var newBuffer = _pool.Rent(newSize);
         _buffer.AsSpan(0, _written).CopyTo(newBuffer);
-        ArrayPool<byte>.Shared.Return(_buffer, clearArray: false);
+        _pool.Return(_buffer, clearArray: false);
         _buffer = newBuffer;
     }
 }
@@ -436,7 +427,7 @@ public sealed class RecordBatch : IDisposable
 
     /// <summary>
     /// Pre-compressed records data. When set, <see cref="Write"/> skips compression
-    /// and uses this data directly. The array is rented from <see cref="ArrayPool{T}"/>
+    /// and uses this data directly. The array is rented from <see cref="ProducerDataPool"/>
     /// and must be returned by the caller after Write() completes.
     /// Set by <see cref="PreCompress"/> before send so <see cref="Write"/> can emit
     /// the compressed payload directly.
@@ -478,21 +469,13 @@ public sealed class RecordBatch : IDisposable
 
             WriteRecords(records, ref recordsWriter);
 
-            // Compress to pooled scratch buffer
+            // Compress directly into a detachable producer-pool buffer.
             var registry = codecs ?? CompressionCodecRegistry.Default;
             var codec = registry.GetCodec(compression);
-            var compressedBuffer = GetCompressedBuffer(cache);
+            using var compressedBuffer = new DetachableBufferWriter(ProducerDataPool.BytePool, recordsBuffer.WrittenCount);
             codec.Compress(new ReadOnlySequence<byte>(recordsBuffer.WrittenMemory), compressedBuffer);
 
-            // Copy to a pooled array for storage (scratch buffer will be reused).
-            // Uses ProducerDataPool (not ArrayPool<byte>.Shared) because PreCompress and
-            // ReturnPreCompressedBuffer may run on different producer threads; cross-thread
-            // ArrayPool<byte>.Shared use causes TLS accumulation.
-            var compressedLength = compressedBuffer.WrittenCount;
-            var pooledArray = Producer.ProducerDataPool.BytePool.Rent(compressedLength);
-            compressedBuffer.WrittenSpan.CopyTo(pooledArray);
-
-            PreCompressedRecords = pooledArray;
+            PreCompressedRecords = compressedBuffer.DetachBuffer(out var compressedLength);
             PreCompressedLength = compressedLength;
             PreCompressedType = compression;
         }
@@ -959,7 +942,7 @@ public sealed class RecordBatch : IDisposable
             var registry = codecs ?? CompressionCodecRegistry.Default;
             var codec = registry.GetCodec(compression);
             var estimatedSize = recordsLength * 4; // Estimate 4x expansion
-            using var decompressWriter = new DecompressDirectBufferWriter(estimatedSize);
+            using var decompressWriter = new DetachableBufferWriter(ArrayPool<byte>.Shared, estimatedSize);
             codec.Decompress(new ReadOnlySequence<byte>(rawRecordData), decompressWriter);
 
             // Transfer ownership of the pooled array — Dispose is a no-op after DetachBuffer.

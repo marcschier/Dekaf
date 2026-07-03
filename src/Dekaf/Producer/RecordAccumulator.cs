@@ -5381,7 +5381,7 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
         }
 
         // Return pre-compressed buffer and RecordBatch to pool.
-        // ReturnPreCompressedBuffer() releases the ArrayPool buffer, then ReturnToPool()
+        // ReturnPreCompressedBuffer() releases the producer-pool buffer, then ReturnToPool()
         // clears all references and returns the RecordBatch object for reuse.
         if (_recordBatch is not null)
         {
