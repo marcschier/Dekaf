@@ -726,6 +726,10 @@ public sealed partial class KafkaConnection : IKafkaConnection
                 {
                     pooledBuffer = await pending.AsValueTask().ConfigureAwait(false);
                 }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(cancellationToken);
+                }
                 catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
                     throw CreateResponseTimeoutException(TRequest.ApiKey, correlationId);
@@ -941,6 +945,10 @@ public sealed partial class KafkaConnection : IKafkaConnection
             try
             {
                 await _stream.WriteAsync(memory, timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(cancellationToken);
             }
             catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
@@ -1188,6 +1196,10 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
             _pendingRequestSlots.Release();
             throw new ObjectDisposedException(nameof(KafkaConnection));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(cancellationToken);
         }
         catch (OperationCanceledException) when (Volatile.Read(ref _disposed) != 0 && !cancellationToken.IsCancellationRequested)
         {
@@ -2905,6 +2917,7 @@ internal sealed class PooledPendingRequest : IValueTaskSource<PooledResponseBuff
     private ManualResetValueTaskSourceCore<PooledResponseBuffer> _core = new() { RunContinuationsAsynchronously = true };
     private short _responseHeaderVersion;
     private CancellationTokenRegistration _cancellationRegistration;
+    private CancellationToken _cancellationToken;
     private int _state; // High 16 bits = core version; low 16 bits = State*
 
     /// <summary>
@@ -2913,6 +2926,7 @@ internal sealed class PooledPendingRequest : IValueTaskSource<PooledResponseBuff
     public void Initialize(short responseHeaderVersion, CancellationToken cancellationToken, bool registerCancellation = true)
     {
         _responseHeaderVersion = responseHeaderVersion;
+        _cancellationToken = cancellationToken;
         _state = CreateState(_core.Version, StatePending);
 
         // Register for cancellation if the token can be cancelled
@@ -2930,6 +2944,7 @@ internal sealed class PooledPendingRequest : IValueTaskSource<PooledResponseBuff
     /// </summary>
     public void RegisterCancellation(CancellationToken cancellationToken)
     {
+        _cancellationToken = cancellationToken;
         var newRegistration = cancellationToken.CanBeCanceled
             ? cancellationToken.Register(
                 static state => ((PooledPendingRequest)state!).OnCancelled(),
@@ -2953,7 +2968,7 @@ internal sealed class PooledPendingRequest : IValueTaskSource<PooledResponseBuff
 
     private void OnCancelled()
     {
-        TrySetCanceled();
+        TrySetCanceled(_cancellationToken);
     }
 
     /// <summary>
@@ -3050,6 +3065,13 @@ internal sealed class PooledPendingRequest : IValueTaskSource<PooledResponseBuff
     /// Returns false if already completed.
     /// </summary>
     public bool TrySetCanceled()
+        => TrySetCanceled(_cancellationToken);
+
+    /// <summary>
+    /// Attempts to cancel the request with the token that triggered cancellation.
+    /// Returns false if already completed.
+    /// </summary>
+    public bool TrySetCanceled(CancellationToken cancellationToken)
     {
         var version = _core.Version;
         if (!TryClaimCompletion(version))
@@ -3060,7 +3082,7 @@ internal sealed class PooledPendingRequest : IValueTaskSource<PooledResponseBuff
         // Mark as completed before publishing completion; a continuation may
         // return this instance to the pool afterwards.
         Volatile.Write(ref _state, CreateState(version, StateCompleted));
-        _core.SetException(new OperationCanceledException());
+        _core.SetException(new OperationCanceledException(cancellationToken));
         return true;
     }
 
@@ -3172,6 +3194,7 @@ internal sealed class PooledPendingRequest : IValueTaskSource<PooledResponseBuff
         // Dispose cancellation registration
         _cancellationRegistration.Dispose();
         _cancellationRegistration = default;
+        _cancellationToken = default;
 
         // Reset the core for reuse
         _core.Reset();

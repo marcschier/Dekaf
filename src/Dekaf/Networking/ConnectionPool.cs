@@ -188,6 +188,10 @@ public sealed partial class ConnectionPool : IConnectionPool
     /// Increases the shared PipeMemoryPool bucket capacity if <paramref name="bucketCapacity"/>
     /// exceeds the current value. New connections will use the larger pool; existing connections
     /// continue using the previous pool until they are recycled.
+    /// <para/>
+    /// The previous pool is not disposed during the swap because active pipes may still return
+    /// segments to it. Its lifetime is bounded by the connections that captured it: once those
+    /// connections and their in-flight pipe segments are gone, the old pool becomes GC-eligible.
     /// </summary>
     internal void RatchetPipeMemoryBucketCapacity(int bucketCapacity)
     {
