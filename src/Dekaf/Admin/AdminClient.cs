@@ -1916,6 +1916,169 @@ public sealed class AdminClient : IAdminClient
         }, cancellationToken).ConfigureAwait(false);
     }
 
+    public async ValueTask<IReadOnlyDictionary<string, TransactionDescription>> DescribeTransactionsAsync(
+        IEnumerable<string> transactionalIds,
+        DescribeTransactionsOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var transactionalIdList = transactionalIds.ToList();
+
+        return await WithRetryAsync<IReadOnlyDictionary<string, TransactionDescription>>(async () =>
+        {
+            // DescribeTransactions ideally routes to each transaction coordinator (FindCoordinator keyType=1);
+            // use the controller until coordinator-routed integration coverage is available.
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new DescribeTransactionsRequest
+            {
+                TransactionalIds = transactionalIdList
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.DescribeTransactions,
+                DescribeTransactionsRequest.LowestSupportedVersion,
+                DescribeTransactionsRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<DescribeTransactionsRequest, DescribeTransactionsResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            var results = new Dictionary<string, TransactionDescription>();
+            foreach (var transaction in response.TransactionStates)
+            {
+                var topicPartitions = transaction.Topics
+                    .SelectMany(t => t.Partitions.Select(p => new TopicPartition(t.Topic, p)))
+                    .ToList();
+
+                results[transaction.TransactionalId] = new TransactionDescription
+                {
+                    TransactionalId = transaction.TransactionalId,
+                    ErrorCode = transaction.ErrorCode,
+                    TransactionState = transaction.TransactionState,
+                    TransactionTimeoutMs = transaction.TransactionTimeoutMs,
+                    TransactionStartTimeMs = transaction.TransactionStartTimeMs,
+                    ProducerId = transaction.ProducerId,
+                    ProducerEpoch = transaction.ProducerEpoch,
+                    TopicPartitions = topicPartitions
+                };
+            }
+
+            return results;
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<IReadOnlyList<TransactionListing>> ListTransactionsAsync(
+        ListTransactionsOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var opts = options ?? new ListTransactionsOptions();
+
+        return await WithRetryAsync<IReadOnlyList<TransactionListing>>(async () =>
+        {
+            // ListTransactions is normally fanned out to all brokers; use the controller until
+            // cluster-wide integration tests are available.
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new ListTransactionsRequest
+            {
+                StateFilters = opts.StateFilters,
+                ProducerIdFilters = opts.ProducerIdFilters
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.ListTransactions,
+                ListTransactionsRequest.LowestSupportedVersion,
+                ListTransactionsRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<ListTransactionsRequest, ListTransactionsResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response.ErrorCode != Protocol.ErrorCode.None)
+            {
+                throw new KafkaException(response.ErrorCode, $"ListTransactions failed: {response.ErrorCode}");
+            }
+
+            return response.TransactionStates.Select(t => new TransactionListing
+            {
+                TransactionalId = t.TransactionalId,
+                ProducerId = t.ProducerId,
+                TransactionState = t.TransactionState
+            }).ToList();
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<IReadOnlyDictionary<TopicPartition, ProducerDescription>> DescribeProducersAsync(
+        IEnumerable<TopicPartition> partitions,
+        DescribeProducersOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var topics = partitions
+            .GroupBy(p => p.Topic)
+            .Select(g => new DescribeProducersRequestTopic
+            {
+                Name = g.Key,
+                PartitionIndexes = g.Select(p => p.Partition).ToList()
+            })
+            .ToList();
+
+        return await WithRetryAsync<IReadOnlyDictionary<TopicPartition, ProducerDescription>>(async () =>
+        {
+            // DescribeProducers ideally routes to partition leaders; use the controller until
+            // leader-routed integration coverage is available.
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new DescribeProducersRequest
+            {
+                Topics = topics
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.DescribeProducers,
+                DescribeProducersRequest.LowestSupportedVersion,
+                DescribeProducersRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<DescribeProducersRequest, DescribeProducersResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            var results = new Dictionary<TopicPartition, ProducerDescription>();
+            foreach (var topic in response.Topics)
+            {
+                foreach (var partition in topic.Partitions)
+                {
+                    var topicPartition = new TopicPartition(topic.Name, partition.PartitionIndex);
+                    results[topicPartition] = new ProducerDescription
+                    {
+                        TopicPartition = topicPartition,
+                        ErrorCode = partition.ErrorCode,
+                        ErrorMessage = partition.ErrorMessage,
+                        ActiveProducers = partition.ActiveProducers.Select(p => new ActiveProducerDescription
+                        {
+                            ProducerId = p.ProducerId,
+                            ProducerEpoch = p.ProducerEpoch,
+                            LastSequence = p.LastSequence,
+                            LastTimestamp = p.LastTimestamp,
+                            CoordinatorEpoch = p.CoordinatorEpoch,
+                            CurrentTxnStartOffset = p.CurrentTxnStartOffset
+                        }).ToList()
+                    };
+                }
+            }
+
+            return results;
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
     public async ValueTask<IReadOnlyDictionary<TopicPartition, AlterPartitionReassignmentResult>> AlterPartitionReassignmentsAsync(
         IReadOnlyDictionary<TopicPartition, IReadOnlyList<int>?> reassignments,
         AlterPartitionReassignmentsOptions? options = null,
