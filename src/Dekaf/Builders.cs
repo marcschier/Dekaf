@@ -1026,6 +1026,7 @@ public sealed class ConsumerBuilder<TKey, TValue>
     private string? _clientId;
     private string? _groupId;
     private string? _groupInstanceId;
+    private string? _clientRack;
     private string? _groupRemoteAssignor;
     private OffsetCommitMode _offsetCommitMode = OffsetCommitMode.Auto;
     private int _autoCommitIntervalMs = 5000;
@@ -1117,6 +1118,16 @@ public sealed class ConsumerBuilder<TKey, TValue>
     public ConsumerBuilder<TKey, TValue> WithGroupInstanceId(string groupInstanceId)
     {
         _groupInstanceId = groupInstanceId;
+        return this;
+    }
+
+    /// <summary>
+    /// Sets the client rack for rack-aware fetch-from-follower (KIP-392).
+    /// </summary>
+    /// <param name="rack">The client rack identifier sent on Fetch requests.</param>
+    public ConsumerBuilder<TKey, TValue> WithClientRack(string rack)
+    {
+        _clientRack = rack;
         return this;
     }
 
@@ -1922,6 +1933,7 @@ public sealed class ConsumerBuilder<TKey, TValue>
             ClientId = _clientId,
             GroupId = _groupId,
             GroupInstanceId = _groupInstanceId,
+            ClientRack = _clientRack,
             GroupRemoteAssignor = _groupRemoteAssignor,
             OffsetCommitMode = _offsetCommitMode,
             AutoCommitIntervalMs = _autoCommitIntervalMs,
