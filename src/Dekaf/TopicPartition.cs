@@ -10,6 +10,12 @@ public readonly record struct TopicPartition(string Topic, int Partition);
 /// </summary>
 public readonly record struct TopicPartitionOffset(string Topic, int Partition, long Offset);
 
+internal readonly record struct TopicPartitionOffsetAndLeaderEpoch(
+    string Topic,
+    int Partition,
+    long Offset,
+    int CommittedLeaderEpoch);
+
 /// <summary>
 /// Represents a topic, partition, and timestamp for offset lookup.
 /// </summary>

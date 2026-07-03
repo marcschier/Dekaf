@@ -95,6 +95,23 @@ public sealed class ConsumerDirtyCommitTests
         await Assert.That(requests).IsEmpty();
     }
 
+    [Test]
+    public async Task CommitAsync_WithConsumedLeaderEpoch_SendsCommittedLeaderEpoch()
+    {
+        var requests = new List<OffsetCommitRequest>();
+        await using var consumer = CreateConsumer(requests, ErrorCode.None);
+        var partition = new TopicPartition("topic-a", 0);
+
+        SetConsumedPosition(consumer, partition, position: 11, dirty: true, leaderEpoch: 4);
+
+        await consumer.CommitAsync(CancellationToken.None);
+
+        await Assert.That(requests.Count).IsEqualTo(1);
+        var requestPartition = requests[0].Topics[0].Partitions[0];
+        await Assert.That(requestPartition.CommittedOffset).IsEqualTo(11);
+        await Assert.That(requestPartition.CommittedLeaderEpoch).IsEqualTo(4);
+    }
+
     private static KafkaConsumer<string, string> CreateConsumer(
         List<OffsetCommitRequest> requests,
         ErrorCode responseError)
@@ -155,6 +172,20 @@ public sealed class ConsumerDirtyCommitTests
         method.Invoke(consumer, [partition, position, dirty]);
     }
 
+    private static void SetConsumedPosition(
+        KafkaConsumer<string, string> consumer,
+        TopicPartition partition,
+        long position,
+        bool dirty,
+        int leaderEpoch)
+    {
+        var method = typeof(KafkaConsumer<string, string>).GetMethod(
+            "SetConsumedPosition",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        method.Invoke(consumer, [partition, position, dirty, leaderEpoch]);
+    }
+
     private static OffsetCommitRequest CloneRequest(OffsetCommitRequest request)
     {
         return new OffsetCommitRequest
@@ -171,7 +202,8 @@ public sealed class ConsumerDirtyCommitTests
                         .Select(static partition => new OffsetCommitRequestPartition
                         {
                             PartitionIndex = partition.PartitionIndex,
-                            CommittedOffset = partition.CommittedOffset
+                            CommittedOffset = partition.CommittedOffset,
+                            CommittedLeaderEpoch = partition.CommittedLeaderEpoch
                         })
                         .ToArray()
                 })
