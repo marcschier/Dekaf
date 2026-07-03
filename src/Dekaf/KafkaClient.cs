@@ -107,7 +107,7 @@ public sealed class KafkaClientBuilder
 
     public KafkaClientBuilder WithBootstrapServers(params string[] servers)
     {
-        _bootstrapServers = [..servers];
+        _bootstrapServers = [.. servers];
         return this;
     }
 
@@ -177,6 +177,24 @@ public sealed class KafkaClientBuilder
         _oauthConfig = config ?? throw new ArgumentNullException(nameof(config));
         _oauthTokenProvider = null;
         return this;
+    }
+
+    public KafkaClientBuilder WithOAuthBearerJwtBearer(OAuthBearerJwtBearerOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var oauthConfig = options.ToOAuthBearerConfig();
+        _saslMechanism = SaslMechanism.OAuthBearer;
+        _oauthConfig = oauthConfig;
+        _oauthTokenProvider = null;
+        return this;
+    }
+
+    public KafkaClientBuilder WithOAuthBearerJwtBearer(Action<OAuthBearerJwtBearerOptions> configure)
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+        var options = new OAuthBearerJwtBearerOptions();
+        configure(options);
+        return WithOAuthBearerJwtBearer(options);
     }
 
     public KafkaClientBuilder WithOAuthBearer(Func<CancellationToken, ValueTask<OAuthBearerToken>> tokenProvider)

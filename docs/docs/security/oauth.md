@@ -13,7 +13,7 @@ using Dekaf;
 
 var oauthConfig = new OAuthBearerConfig
 {
-    TokenEndpoint = "https://auth.example.com/oauth2/token",
+    TokenEndpointUrl = "https://auth.example.com/oauth2/token",
     ClientId = "my-kafka-client",
     ClientSecret = "client-secret",
     Scope = "kafka"
@@ -41,13 +41,45 @@ var producer = await Kafka.CreateProducer<string, string>()
         var token = await GetTokenFromIdentityProviderAsync(ct);
         return new OAuthBearerToken
         {
-            Value = token.AccessToken,
-            ExpiresAt = token.ExpiresAt,
-            Principal = token.Subject
+            TokenValue = token.AccessToken,
+            Expiration = token.ExpiresAt,
+            PrincipalName = token.Subject
         };
     })
     .BuildAsync();
 ```
+
+## JWT-Bearer Grant
+
+Use the JWT-bearer grant when your identity provider exchanges a signed assertion for
+an access token:
+
+```csharp
+using System.Security.Cryptography;
+using Dekaf;
+
+var privateKey = RSA.Create();
+privateKey.ImportFromPem(File.ReadAllText("client-key.pem"));
+
+await using var producer = await Kafka.CreateProducer<string, string>()
+    .WithBootstrapServers("kafka.example.com:9092")
+    .UseTls()
+    .WithOAuthBearerJwtBearer(options =>
+    {
+        options.TokenEndpoint = "https://auth.example.com/oauth2/token";
+        options.ClientId = "my-kafka-client";
+        options.PrivateKey = privateKey;
+        options.Audience = "kafka";
+        options.Scopes = ["kafka:produce", "kafka:consume"];
+        options.KeyId = "key-2026-07";
+    })
+    .BuildAsync();
+```
+
+Dekaf signs assertions with RSA or ECDSA keys, posts `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`
+and `assertion=<jwt>` to the token endpoint, then caches the returned access token until it nears expiration.
+Keep the `PrivateKey` object alive until every client configured with it has been disposed; token refreshes reuse
+the same key object to sign new assertions.
 
 ## Azure AD Example
 
@@ -68,8 +100,9 @@ var producer = await Kafka.CreateProducer<string, string>()
 
         return new OAuthBearerToken
         {
-            Value = token.Token,
-            ExpiresAt = token.ExpiresOn
+            TokenValue = token.Token,
+            Expiration = token.ExpiresOn,
+            PrincipalName = "azure-ad"
         };
     })
     .BuildAsync();
@@ -91,8 +124,9 @@ var producer = await Kafka.CreateProducer<string, string>()
         var token = await GenerateMskIamTokenAsync(ct);
         return new OAuthBearerToken
         {
-            Value = token,
-            ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(5)
+            TokenValue = token,
+            Expiration = DateTimeOffset.UtcNow.AddMinutes(5),
+            PrincipalName = "aws-msk"
         };
     })
     .BuildAsync();
@@ -109,7 +143,7 @@ Dekaf automatically refreshes tokens before they expire. The token provider is c
 
     var token = await _tokenService.GetTokenAsync(ct);
 
-    _logger.LogDebug("Token expires at {ExpiresAt}", token.ExpiresAt);
+    _logger.LogDebug("Token expires at {ExpiresAt}", token.Expiration);
 
     return token;
 })
@@ -149,9 +183,9 @@ public class OAuthKafkaClientFactory
 
         return new OAuthBearerToken
         {
-            Value = token.AccessToken,
-            ExpiresAt = token.ExpiresAt,
-            Principal = token.Claims.Subject
+            TokenValue = token.AccessToken,
+            Expiration = token.ExpiresAt,
+            PrincipalName = token.Claims.Subject
         };
     }
 }
