@@ -20,6 +20,7 @@ public sealed class QueryWatermarkOffsetsRetryTests
         var pool = Substitute.For<IConnectionPool>();
         var connection = Substitute.For<IKafkaConnection>();
         var listOffsetCalls = 0;
+        var earliestOffsetCalls = 0;
 
         pool.GetConnectionAsync("localhost", 9092, Arg.Any<CancellationToken>())
             .Returns(new ValueTask<IKafkaConnection>(connection));
@@ -39,13 +40,18 @@ public sealed class QueryWatermarkOffsetsRetryTests
             .Returns(_ =>
             {
                 listOffsetCalls++;
+                var request = (ListOffsetsRequest)_[0]!;
+                var timestamp = request.Topics[0].Partitions[0].Timestamp;
 
-                return new ValueTask<ListOffsetsResponse>(listOffsetCalls switch
+                if (timestamp == -2)
                 {
-                    1 => CreateListOffsetsResponse(ErrorCode.NotLeaderOrFollower, -1),
-                    2 => CreateListOffsetsResponse(ErrorCode.None, 10),
-                    _ => CreateListOffsetsResponse(ErrorCode.None, 42)
-                });
+                    earliestOffsetCalls++;
+                    return new ValueTask<ListOffsetsResponse>(earliestOffsetCalls == 1
+                        ? CreateListOffsetsResponse(ErrorCode.NotLeaderOrFollower, -1)
+                        : CreateListOffsetsResponse(ErrorCode.None, 10));
+                }
+
+                return new ValueTask<ListOffsetsResponse>(CreateListOffsetsResponse(ErrorCode.None, 42));
             });
 
         await using var metadataManager = new MetadataManager(pool, ["localhost:9092"]);
@@ -72,7 +78,7 @@ public sealed class QueryWatermarkOffsetsRetryTests
 
         await Assert.That(watermarks.Low).IsEqualTo(10);
         await Assert.That(watermarks.High).IsEqualTo(42);
-        await Assert.That(listOffsetCalls).IsEqualTo(3);
+        await Assert.That(listOffsetCalls).IsEqualTo(4);
         _ = connection.Received(1).SendAsync<MetadataRequest, MetadataResponse>(
             Arg.Any<MetadataRequest>(),
             Arg.Any<short>(),
