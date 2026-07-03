@@ -319,7 +319,7 @@ public sealed class ConsumerLeaderDiscoveryTests
             .GetMethod("HandleNotLeaderOrFollowerAsync", BindingFlags.NonPublic | BindingFlags.Instance)
             ?? throw new InvalidOperationException("HandleNotLeaderOrFollowerAsync method not found");
 
-        var result = method.Invoke(consumer, [Topic, partitionResponse, nodeEndpoints]);
+        var result = method.Invoke(consumer, [Topic, partitionResponse, nodeEndpoints, CancellationToken.None]);
         if (result is not ValueTask valueTask)
             throw new InvalidOperationException("HandleNotLeaderOrFollowerAsync did not return ValueTask");
 

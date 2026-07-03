@@ -52,6 +52,11 @@ public sealed class ConsumerOptions
     public string? GroupInstanceId { get; init; }
 
     /// <summary>
+    /// Client rack identifier for rack-aware fetch-from-follower (KIP-392).
+    /// </summary>
+    public string? ClientRack { get; init; }
+
+    /// <summary>
     /// The server-side partition assignor for KIP-848 group coordination.
     /// Common values are "uniform" and "range".
     /// When null, the broker uses its default assignor.
