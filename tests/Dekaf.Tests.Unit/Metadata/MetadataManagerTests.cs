@@ -372,9 +372,81 @@ public class MetadataManagerTests
     }
 
     [Test]
-    public async Task ObjectDisposedException_IsFatalMetadataError()
+    public async Task RefreshMetadataAsync_ObjectDisposedConnection_TriesNextEndpoint()
     {
-        await Assert.That(IsFatalMetadataError(new ObjectDisposedException(nameof(MetadataManager)))).IsTrue();
+        var pool = Substitute.For<IConnectionPool>();
+        var connection = Substitute.For<IKafkaConnection>();
+        var firstEndpointAttempts = 0;
+        var secondEndpointAttempts = 0;
+
+        pool.GetConnectionAsync("broker1", 9092, Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                Interlocked.Increment(ref firstEndpointAttempts);
+                return ValueTask.FromException<IKafkaConnection>(new ObjectDisposedException("KafkaConnection"));
+            });
+
+        pool.GetConnectionAsync("broker2", 9093, Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                Interlocked.Increment(ref secondEndpointAttempts);
+                return new ValueTask<IKafkaConnection>(connection);
+            });
+
+        connection.SendAsync<MetadataRequest, MetadataResponse>(
+                Arg.Any<MetadataRequest>(),
+                Arg.Any<short>(),
+                Arg.Any<CancellationToken>())
+            .Returns(new ValueTask<MetadataResponse>(CreateMetadataResponse((2, "broker2", 9093))));
+
+        await using var manager = new MetadataManager(
+            pool,
+            ["broker1:9092", "broker2:9093"],
+            new MetadataOptions { EnableBackgroundRefresh = false });
+        SetMetadataApiVersion(manager);
+
+        await manager.RefreshMetadataAsync();
+
+        await Assert.That(firstEndpointAttempts).IsEqualTo(1);
+        await Assert.That(secondEndpointAttempts).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task BackgroundRefreshLoop_ObjectDisposedConnection_DoesNotResetInitialized()
+    {
+        var pool = Substitute.For<IConnectionPool>();
+        using var cts = new CancellationTokenSource();
+
+        pool.GetConnectionAsync("localhost", 9092, Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                cts.Cancel();
+                return ValueTask.FromException<IKafkaConnection>(new ObjectDisposedException("KafkaConnection"));
+            });
+
+        var manager = new MetadataManager(
+            pool,
+            ["localhost:9092"],
+            new MetadataOptions { MetadataRefreshInterval = TimeSpan.Zero });
+        SetMetadataApiVersion(manager);
+        SetInstanceField(manager, "_initialized", true);
+
+        var loop = InvokeBackgroundRefreshLoop(manager, cts.Token);
+        await loop.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await Assert.That(GetInstanceField<bool>(manager, "_initialized")).IsTrue();
+        await manager.DisposeAsync();
+    }
+
+    [Test]
+    public async Task ObjectDisposedException_IsFatalMetadataErrorOnlyWhenManagerDisposed()
+    {
+        var manager = CreateTestManager();
+        await Assert.That(IsFatalMetadataError(manager, new ObjectDisposedException("KafkaConnection"))).IsFalse();
+
+        await manager.DisposeAsync();
+
+        await Assert.That(IsFatalMetadataError(manager, new ObjectDisposedException(nameof(MetadataManager)))).IsTrue();
     }
 
     [Test]
@@ -423,13 +495,13 @@ public class MetadataManagerTests
         field.SetValue(metadataManager, MetadataRequest.HighestSupportedVersion);
     }
 
-    private static bool IsFatalMetadataError(Exception exception)
+    private static bool IsFatalMetadataError(MetadataManager metadataManager, Exception exception)
     {
         var method = typeof(MetadataManager)
-            .GetMethod("IsFatalMetadataError", BindingFlags.NonPublic | BindingFlags.Static)
+            .GetMethod("IsFatalMetadataError", BindingFlags.NonPublic | BindingFlags.Instance)
             ?? throw new InvalidOperationException("IsFatalMetadataError method not found");
 
-        return (bool)method.Invoke(null, [exception])!;
+        return (bool)method.Invoke(metadataManager, [exception])!;
     }
 
     private static Task InvokeBackgroundRefreshLoop(MetadataManager metadataManager, CancellationToken cancellationToken)

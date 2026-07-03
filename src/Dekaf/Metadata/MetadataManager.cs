@@ -219,8 +219,15 @@ public sealed partial class MetadataManager : IAsyncDisposable
     /// credentials, or authorization decision applies everywhere, so fail fast and surface the
     /// real cause instead of masking it as a generic metadata-refresh failure.
     /// </summary>
-    private static bool IsFatalMetadataError(Exception ex) =>
-        ex is BrokerVersionException or AuthenticationException or AuthorizationException or ObjectDisposedException;
+    private bool IsFatalMetadataError(Exception ex)
+    {
+        if (ex is BrokerVersionException or AuthenticationException or AuthorizationException)
+            return true;
+
+        // KafkaConnection instances can be disposed independently during pool churn. Only the
+        // manager's own disposal is fatal; recycled connections should fall through to retry.
+        return ex is ObjectDisposedException && Volatile.Read(ref _disposed) != 0;
+    }
 
     public async ValueTask InitializeAsync(CancellationToken cancellationToken = default)
     {
