@@ -235,6 +235,31 @@ public interface IAdminClient : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Reassigns partition replicas across brokers (KIP-455). A null replica list for a
+    /// partition cancels an ongoing reassignment for that partition.
+    /// </summary>
+    /// <param name="reassignments">Target replica sets per partition; a null value cancels a pending reassignment.</param>
+    /// <param name="options">Optional configuration options.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The per-partition results.</returns>
+    ValueTask<IReadOnlyDictionary<TopicPartition, AlterPartitionReassignmentResult>> AlterPartitionReassignmentsAsync(
+        IReadOnlyDictionary<TopicPartition, IReadOnlyList<int>?> reassignments,
+        AlterPartitionReassignmentsOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Lists the ongoing partition reassignments in the cluster (KIP-455).
+    /// </summary>
+    /// <param name="partitions">The partitions to list reassignments for, or null to list all.</param>
+    /// <param name="options">Optional configuration options.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The ongoing reassignment for each partition that currently has one.</returns>
+    ValueTask<IReadOnlyDictionary<TopicPartition, OngoingPartitionReassignmentInfo>> ListPartitionReassignmentsAsync(
+        IEnumerable<TopicPartition>? partitions = null,
+        ListPartitionReassignmentsOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Describes share groups.
     /// </summary>
     ValueTask<IReadOnlyDictionary<string, ShareGroupDescription>> DescribeShareGroupsAsync(
@@ -608,4 +633,73 @@ public sealed class ElectLeadersResultInfo
     /// Error message, if any.
     /// </summary>
     public string? ErrorMessage { get; init; }
+}
+
+/// <summary>
+/// Options for AlterPartitionReassignments.
+/// </summary>
+public sealed class AlterPartitionReassignmentsOptions
+{
+    /// <summary>
+    /// Timeout in milliseconds.
+    /// </summary>
+    public int TimeoutMs { get; init; } = 60000;
+}
+
+/// <summary>
+/// Options for ListPartitionReassignments.
+/// </summary>
+public sealed class ListPartitionReassignmentsOptions
+{
+    /// <summary>
+    /// Timeout in milliseconds.
+    /// </summary>
+    public int TimeoutMs { get; init; } = 60000;
+}
+
+/// <summary>
+/// Result of AlterPartitionReassignments for a single partition.
+/// </summary>
+public sealed class AlterPartitionReassignmentResult
+{
+    /// <summary>
+    /// The topic partition.
+    /// </summary>
+    public required TopicPartition TopicPartition { get; init; }
+
+    /// <summary>
+    /// Error code for this partition (None if successful).
+    /// </summary>
+    public Protocol.ErrorCode ErrorCode { get; init; }
+
+    /// <summary>
+    /// Error message, if any.
+    /// </summary>
+    public string? ErrorMessage { get; init; }
+}
+
+/// <summary>
+/// Describes an ongoing reassignment for a single partition.
+/// </summary>
+public sealed class OngoingPartitionReassignmentInfo
+{
+    /// <summary>
+    /// The topic partition.
+    /// </summary>
+    public required TopicPartition TopicPartition { get; init; }
+
+    /// <summary>
+    /// The current replica set (broker IDs).
+    /// </summary>
+    public required IReadOnlyList<int> Replicas { get; init; }
+
+    /// <summary>
+    /// The replicas being added as part of this reassignment.
+    /// </summary>
+    public required IReadOnlyList<int> AddingReplicas { get; init; }
+
+    /// <summary>
+    /// The replicas being removed as part of this reassignment.
+    /// </summary>
+    public required IReadOnlyList<int> RemovingReplicas { get; init; }
 }

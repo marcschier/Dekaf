@@ -1916,6 +1916,147 @@ public sealed class AdminClient : IAdminClient
         }, cancellationToken).ConfigureAwait(false);
     }
 
+    public async ValueTask<IReadOnlyDictionary<TopicPartition, AlterPartitionReassignmentResult>> AlterPartitionReassignmentsAsync(
+        IReadOnlyDictionary<TopicPartition, IReadOnlyList<int>?> reassignments,
+        AlterPartitionReassignmentsOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var opts = options ?? new AlterPartitionReassignmentsOptions();
+
+        // Materialize the grouped topic list before retry to avoid re-enumeration.
+        var topics = reassignments
+            .GroupBy(kvp => kvp.Key.Topic)
+            .Select(g => new ReassignableTopic
+            {
+                Name = g.Key,
+                Partitions = g.Select(kvp => new ReassignablePartition
+                {
+                    PartitionIndex = kvp.Key.Partition,
+                    Replicas = kvp.Value
+                }).ToList()
+            })
+            .ToList();
+
+        return await WithRetryAsync<IReadOnlyDictionary<TopicPartition, AlterPartitionReassignmentResult>>(async () =>
+        {
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new AlterPartitionReassignmentsRequest
+            {
+                TimeoutMs = opts.TimeoutMs,
+                Topics = topics
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.AlterPartitionReassignments,
+                AlterPartitionReassignmentsRequest.LowestSupportedVersion,
+                AlterPartitionReassignmentsRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<AlterPartitionReassignmentsRequest, AlterPartitionReassignmentsResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response.ErrorCode != Protocol.ErrorCode.None)
+            {
+                throw new KafkaException(response.ErrorCode,
+                    $"AlterPartitionReassignments failed: {response.ErrorMessage ?? response.ErrorCode.ToString()}");
+            }
+
+            var results = new Dictionary<TopicPartition, AlterPartitionReassignmentResult>();
+            foreach (var topic in response.Responses)
+            {
+                foreach (var partition in topic.Partitions)
+                {
+                    var tp = new TopicPartition(topic.Name, partition.PartitionIndex);
+                    results[tp] = new AlterPartitionReassignmentResult
+                    {
+                        TopicPartition = tp,
+                        ErrorCode = partition.ErrorCode,
+                        ErrorMessage = partition.ErrorMessage
+                    };
+                }
+            }
+
+            return results;
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<IReadOnlyDictionary<TopicPartition, OngoingPartitionReassignmentInfo>> ListPartitionReassignmentsAsync(
+        IEnumerable<TopicPartition>? partitions = null,
+        ListPartitionReassignmentsOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var opts = options ?? new ListPartitionReassignmentsOptions();
+
+        // Materialize before retry to avoid re-enumeration of potentially lazy sequences.
+        IReadOnlyList<ListPartitionReassignmentsTopics>? topics = null;
+        if (partitions is not null)
+        {
+            var partitionList = partitions.ToList();
+            if (partitionList.Count > 0)
+            {
+                topics = partitionList
+                    .GroupBy(p => p.Topic)
+                    .Select(g => new ListPartitionReassignmentsTopics
+                    {
+                        Name = g.Key,
+                        PartitionIndexes = g.Select(p => p.Partition).ToList()
+                    })
+                    .ToList();
+            }
+        }
+
+        return await WithRetryAsync<IReadOnlyDictionary<TopicPartition, OngoingPartitionReassignmentInfo>>(async () =>
+        {
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new ListPartitionReassignmentsRequest
+            {
+                TimeoutMs = opts.TimeoutMs,
+                Topics = topics
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.ListPartitionReassignments,
+                ListPartitionReassignmentsRequest.LowestSupportedVersion,
+                ListPartitionReassignmentsRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<ListPartitionReassignmentsRequest, ListPartitionReassignmentsResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response.ErrorCode != Protocol.ErrorCode.None)
+            {
+                throw new KafkaException(response.ErrorCode,
+                    $"ListPartitionReassignments failed: {response.ErrorMessage ?? response.ErrorCode.ToString()}");
+            }
+
+            var results = new Dictionary<TopicPartition, OngoingPartitionReassignmentInfo>();
+            foreach (var topic in response.Topics)
+            {
+                foreach (var partition in topic.Partitions)
+                {
+                    var tp = new TopicPartition(topic.Name, partition.PartitionIndex);
+                    results[tp] = new OngoingPartitionReassignmentInfo
+                    {
+                        TopicPartition = tp,
+                        Replicas = partition.Replicas,
+                        AddingReplicas = partition.AddingReplicas,
+                        RemovingReplicas = partition.RemovingReplicas
+                    };
+                }
+            }
+
+            return results;
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
     public async ValueTask<IReadOnlyDictionary<string, ShareGroupDescription>> DescribeShareGroupsAsync(
         IEnumerable<string> groupIds,
         CancellationToken cancellationToken = default)
