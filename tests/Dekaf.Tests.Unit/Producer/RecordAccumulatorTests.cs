@@ -1,8 +1,11 @@
 using System.Buffers;
 using System.Reflection;
+using System.Text;
 using Dekaf.Errors;
 using Dekaf.Producer;
+using Dekaf.Protocol;
 using Dekaf.Protocol.Records;
+using Dekaf.Serialization;
 
 namespace Dekaf.Tests.Unit.Producer;
 
@@ -32,7 +35,7 @@ public class RecordAccumulatorTests
             BootstrapServers = new[] { "localhost:9092" },
             ClientId = "test-producer",
             BufferMemory = ulong.MaxValue,
-            BatchSize = 30,
+            BatchSize = 10,
             LingerMs = 10
         };
         var callbackCount = 0;
@@ -80,7 +83,7 @@ public class RecordAccumulatorTests
             BootstrapServers = new[] { "localhost:9092" },
             ClientId = "test-producer",
             BufferMemory = ulong.MaxValue,
-            BatchSize = 80,
+            BatchSize = 60,
             LingerMs = 10_000
         };
 
@@ -128,6 +131,222 @@ public class RecordAccumulatorTests
     }
 
     [Test]
+    public async Task AppendFromSpansAsync_SealedBatch_UsesPreEncodedArenaRecords()
+    {
+        var options = new ProducerOptions
+        {
+            BootstrapServers = new[] { "localhost:9092" },
+            ClientId = "test-producer",
+            BufferMemory = ulong.MaxValue,
+            BatchSize = 1000,
+            LingerMs = 10_000
+        };
+
+        await using var accumulator = new RecordAccumulator(options);
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var key = Encoding.UTF8.GetBytes("key-1");
+        var value = Encoding.UTF8.GetBytes("value-1");
+
+        var appended = await accumulator.AppendFromSpansAsync(
+            "test-topic",
+            partition: 0,
+            timestamp,
+            key,
+            keyIsNull: false,
+            value,
+            valueIsNull: false,
+            headers: null,
+            headerCount: 0,
+            callback: null,
+            CancellationToken.None,
+            partitionCount: 1);
+
+        await Assert.That(appended).IsTrue();
+
+        var readyBatch = CompleteCurrentBatch(accumulator, new TopicPartition("test-topic", 0));
+        await Assert.That(readyBatch.RecordBatch.HasPreEncodedRecords).IsTrue();
+        await Assert.That(readyBatch.RecordBatch.HasPreCompressedRecords).IsFalse();
+
+        // The append-time accounting (DataSize) plus the fixed batch header must equal the
+        // full encoded size RecordBatch reports for MaxRequestSize drain accounting.
+        var encodedSize = readyBatch.RecordBatch.GetEncodedSize();
+        await Assert.That(encodedSize).IsEqualTo(readyBatch.DataSize + RecordBatch.TotalBatchHeaderSize);
+
+        var record = readyBatch.RecordBatch.Records[0];
+        await Assert.That(Encoding.UTF8.GetString(record.Key.Span)).IsEqualTo("key-1");
+        await Assert.That(Encoding.UTF8.GetString(record.Value.Span)).IsEqualTo("value-1");
+
+        var writer = new ArrayBufferWriter<byte>();
+        readyBatch.RecordBatch.Write(writer);
+        var reader = new KafkaProtocolReader(writer.WrittenMemory);
+        using var parsed = RecordBatch.Read(ref reader);
+
+        await Assert.That(parsed.Records.Count).IsEqualTo(1);
+        await Assert.That(Encoding.UTF8.GetString(parsed.Records[0].Key.Span)).IsEqualTo("key-1");
+        await Assert.That(Encoding.UTF8.GetString(parsed.Records[0].Value.Span)).IsEqualTo("value-1");
+
+        readyBatch.CompleteSend(baseOffset: 0, DateTimeOffset.FromUnixTimeMilliseconds(timestamp));
+    }
+
+    [Test]
+    public async Task AppendFromSpansAsync_FirstRecordLargerThanBatchSize_UsesExpandedArena()
+    {
+        const int batchSize = 128;
+        var options = new ProducerOptions
+        {
+            BootstrapServers = new[] { "localhost:9092" },
+            ClientId = "test-producer",
+            BufferMemory = ulong.MaxValue,
+            BatchSize = batchSize,
+            LingerMs = 10_000
+        };
+
+        await using var accumulator = new RecordAccumulator(options);
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var valueText = new string('x', batchSize * 3);
+        var value = Encoding.UTF8.GetBytes(valueText);
+
+        var appended = await accumulator.AppendFromSpansAsync(
+            "test-topic",
+            partition: 0,
+            timestamp,
+            ReadOnlySpan<byte>.Empty,
+            keyIsNull: true,
+            value,
+            valueIsNull: false,
+            headers: null,
+            headerCount: 0,
+            callback: null,
+            CancellationToken.None,
+            partitionCount: 1);
+
+        await Assert.That(appended).IsTrue();
+
+        var readyBatch = CompleteCurrentBatch(accumulator, new TopicPartition("test-topic", 0));
+        await Assert.That(readyBatch.RecordBatch.HasPreEncodedRecords).IsTrue();
+        await Assert.That(readyBatch.DataSize).IsGreaterThan(batchSize);
+
+        var writer = new ArrayBufferWriter<byte>();
+        readyBatch.RecordBatch.Write(writer);
+        var reader = new KafkaProtocolReader(writer.WrittenMemory);
+        using var parsed = RecordBatch.Read(ref reader);
+
+        await Assert.That(parsed.Records.Count).IsEqualTo(1);
+        await Assert.That(Encoding.UTF8.GetString(parsed.Records[0].Value.Span)).IsEqualTo(valueText);
+
+        readyBatch.CompleteSend(baseOffset: 0, DateTimeOffset.FromUnixTimeMilliseconds(timestamp));
+    }
+
+    [Test]
+    public async Task AppendFromSpansAsync_ArenaFullBeforeBatchSize_RotatesAndPreservesRecords()
+    {
+        var options = new ProducerOptions
+        {
+            BootstrapServers = new[] { "localhost:9092" },
+            ClientId = "test-producer",
+            BufferMemory = ulong.MaxValue,
+            BatchSize = 1000,
+            LingerMs = 10_000
+        };
+
+        await using var accumulator = new RecordAccumulator(options);
+        var topicPartition = new TopicPartition("test-topic", 0);
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        var appended = await accumulator.AppendFromSpansAsync(
+            topicPartition.Topic,
+            topicPartition.Partition,
+            timestamp,
+            ReadOnlySpan<byte>.Empty,
+            keyIsNull: true,
+            new byte[] { 1 },
+            valueIsNull: false,
+            headers: null,
+            headerCount: 0,
+            callback: null,
+            CancellationToken.None,
+            partitionCount: 1);
+
+        await Assert.That(appended).IsTrue();
+
+        var currentBatch = GetCurrentPartitionBatch(accumulator, topicPartition);
+        var arena = currentBatch.Arena!;
+        var remaining = arena.RemainingCapacity;
+        await Assert.That(remaining).IsGreaterThan(0);
+        await Assert.That(arena.TryAllocate(remaining, out _, out _)).IsTrue();
+        await Assert.That(currentBatch.EstimatedSize).IsLessThan(options.BatchSize);
+
+        appended = await accumulator.AppendFromSpansAsync(
+            topicPartition.Topic,
+            topicPartition.Partition,
+            timestamp + 1,
+            ReadOnlySpan<byte>.Empty,
+            keyIsNull: true,
+            new byte[] { 2 },
+            valueIsNull: false,
+            headers: null,
+            headerCount: 0,
+            callback: null,
+            CancellationToken.None,
+            partitionCount: 1);
+
+        await Assert.That(appended).IsTrue();
+
+        await Assert.That(accumulator.TryDrainBatch(out var firstBatch)).IsTrue();
+        await Assert.That(firstBatch!.RecordBatch.Records[0].Value.Span[0]).IsEqualTo((byte)1);
+
+        var secondBatch = CompleteCurrentBatch(accumulator, topicPartition);
+        await Assert.That(secondBatch.RecordBatch.Records[0].Value.Span[0]).IsEqualTo((byte)2);
+
+        var now = DateTimeOffset.UtcNow;
+        firstBatch.CompleteSend(baseOffset: 0, now);
+        secondBatch.CompleteSend(baseOffset: 1, now);
+    }
+
+    [Test]
+    public async Task PartitionBatch_TryAppendFromSpans_WhenHeaderEncodingThrows_RewindsArenaAllocation()
+    {
+        var options = CreateTestOptions();
+        var batch = new PartitionBatch(new TopicPartition("test-topic", 0), options);
+        var headerValue = new ThrowingReadOnlyMemoryManager(length: 8);
+        var headers = new[] { new Header("bad-header", headerValue.ReadOnlyMemory, isNull: false) };
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        await Assert.That(() => batch.TryAppendFromSpans(
+                timestamp,
+                ReadOnlySpan<byte>.Empty,
+                keyIsNull: true,
+                new byte[] { 1 },
+                valueIsNull: false,
+                headers,
+                headerCount: 1,
+                completionSource: null,
+                callback: null))
+            .Throws<InvalidOperationException>();
+
+        await Assert.That(batch.Arena!.Position).IsEqualTo(0);
+        await Assert.That(batch.RecordCount).IsEqualTo(0);
+
+        var result = batch.TryAppendFromSpans(
+            timestamp + 1,
+            ReadOnlySpan<byte>.Empty,
+            keyIsNull: true,
+            new byte[] { 2 },
+            valueIsNull: false,
+            headers: null,
+            headerCount: 0,
+            completionSource: null,
+            callback: null);
+
+        await Assert.That(result.Success).IsTrue();
+        await Assert.That(batch.RecordCount).IsEqualTo(1);
+        await Assert.That(batch.Arena!.Position).IsEqualTo(result.ActualSizeAdded);
+
+        var readyBatch = batch.Complete();
+        readyBatch!.CompleteSend(baseOffset: 0, DateTimeOffset.UtcNow);
+    }
+
+    [Test]
     public async Task AppendFromSpansAsync_WithCallback_PreservesCallbackAfterRotation()
     {
         var options = new ProducerOptions
@@ -135,7 +354,7 @@ public class RecordAccumulatorTests
             BootstrapServers = new[] { "localhost:9092" },
             ClientId = "test-producer",
             BufferMemory = ulong.MaxValue,
-            BatchSize = 80,
+            BatchSize = 60,
             LingerMs = 10_000
         };
 
@@ -290,11 +509,9 @@ public class RecordAccumulatorTests
             await Assert.That(result).IsTrue();
 
             var readyBatch = CompleteCurrentBatch(accumulator, topicPartition);
-            var pooledDataArraysCount = GetPrivateField<int>(readyBatch, "_pooledDataArraysCount");
             var record = readyBatch.RecordBatch.Records[0];
 
             await Assert.That(readyBatch.CompletionSourcesCount).IsEqualTo(1);
-            await Assert.That(pooledDataArraysCount).IsEqualTo(0);
             await Assert.That(record.Key.ToArray()).IsEquivalentTo(key);
             await Assert.That(record.Value.ToArray()).IsEquivalentTo(value);
 
@@ -401,7 +618,7 @@ public class RecordAccumulatorTests
             BootstrapServers = ["localhost:9092"],
             ClientId = "test-producer",
             BufferMemory = ulong.MaxValue,
-            BatchSize = PartitionBatch.EstimateRecordSize(0, 16, null, 0) + 8,
+            BatchSize = 30,
             LingerMs = 10
         };
         var accumulator = new RecordAccumulator(options);
@@ -945,10 +1162,11 @@ public class RecordAccumulatorTests
     }
 
     [Test]
-    public async Task TryAppendFireAndForget_WithPooledMemory_TracksArraysForCleanup()
+    public async Task TryAppendFireAndForget_WithPooledMemory_EncodesDataIntoBatch()
     {
-        // Verify that fire-and-forget correctly tracks pooled arrays for cleanup,
-        // even though it doesn't track completion sources.
+        // Fire-and-forget appends encode the pooled key/value into the batch arena at append
+        // time and return the raw arrays immediately, so the sealed batch must carry copies
+        // of the data (not references to the returned arrays).
 
         var options = CreateTestOptions();
         var accumulator = new RecordAccumulator(options);
@@ -977,25 +1195,18 @@ public class RecordAccumulatorTests
 
             await Assert.That(result).IsTrue();
 
-            // Get the batch and verify arrays are tracked
-            var dequesField = typeof(RecordAccumulator).GetField("_partitionDeques",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var deques = dequesField!.GetValue(accumulator)!;
+            // Clobber the (already returned) source arrays, then verify the sealed batch
+            // still round-trips the original data from its own encoded copy.
+            keyArray.AsSpan().Clear();
+            valueArray.AsSpan().Clear();
 
-            var topicPartition = new TopicPartition("test-topic", 0);
-            var tryGetValueMethod = deques.GetType().GetMethod("TryGetValue");
-            var parameters = new object[] { topicPartition, null! };
-            tryGetValueMethod!.Invoke(deques, parameters);
+            var readyBatch = CompleteCurrentBatch(accumulator, new TopicPartition("test-topic", 0));
+            await Assert.That(readyBatch.RecordBatch.HasPreEncodedRecords).IsTrue();
+            var record = readyBatch.RecordBatch.Records[0];
+            await Assert.That(record.Key.ToArray()).IsEquivalentTo(keyData);
+            await Assert.That(record.Value.ToArray()).IsEquivalentTo(valueData);
 
-            var partitionDeque = parameters[1];
-            var currentBatchField = partitionDeque!.GetType().GetField("CurrentBatch");
-            var partitionBatch = currentBatchField!.GetValue(partitionDeque);
-
-            // Verify pooled arrays are tracked (via reflection)
-            var pooledArrayCountField = partitionBatch!.GetType().GetField("_pooledArrayCount",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var pooledArrayCount = (int)pooledArrayCountField!.GetValue(partitionBatch)!;
-            await Assert.That(pooledArrayCount).IsEqualTo(2); // key + value arrays
+            readyBatch.CompleteSend(baseOffset: 0, DateTimeOffset.UtcNow);
         }
         finally
         {
@@ -1171,7 +1382,7 @@ public class RecordAccumulatorTests
 
         // Call TryAppend with null completionSource and null callback (fire-and-forget)
         var tryAppendMethod = partitionBatchType.GetMethods()
-            .Single(m => m.Name == "TryAppend" && m.GetParameters().Length == 8);
+            .Single(m => m.Name == "TryAppend" && m.GetParameters().Length == 7);
         var pooledKey = new PooledMemory(null, 0, isNull: true);
         var pooledValue = new PooledMemory(null, 0, isNull: true);
 
@@ -1181,10 +1392,9 @@ public class RecordAccumulatorTests
             pooledKey,
             pooledValue,
             null,   // headers
-            null,   // pooledHeaderArray
+            null,   // headerCount (coerced to 0)
             null,   // completionSource
-            null,   // callback
-            20      // estimatedRecordSize: base overhead for empty record (key=null, value=null, no headers)
+            null    // callback
         });
 
         // Verify append succeeded
@@ -1311,174 +1521,7 @@ public class RecordAccumulatorTests
         await Assert.That(result).IsFalse();
     }
 
-    [Test]
-    public async Task Append_FireAndForget_WithPooledMemory_TracksArrays()
-    {
-        var options = new ProducerOptions
-        {
-            BootstrapServers = new[] { "localhost:9092" },
-            ClientId = "test-producer",
-            BufferMemory = 100000,
-            BatchSize = 100000,
-            LingerMs = 10
-        };
-        var accumulator = new RecordAccumulator(options);
-
-        try
-        {
-            var keyArray = ArrayPool<byte>.Shared.Rent(10);
-            var valueArray = ArrayPool<byte>.Shared.Rent(20);
-
-            var result = await accumulator.AppendAsync(
-                "test-topic", 0,
-                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                new PooledMemory(keyArray, 10),
-                new PooledMemory(valueArray, 20),
-                null, 0, null, null, CancellationToken.None);
-
-            await Assert.That(result).IsTrue();
-
-            // Verify pooled arrays are tracked
-            var dequesField = typeof(RecordAccumulator).GetField("_partitionDeques",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var deques = dequesField!.GetValue(accumulator)!;
-
-            var topicPartition = new TopicPartition("test-topic", 0);
-            var tryGetValueMethod = deques.GetType().GetMethod("TryGetValue");
-            var parameters = new object[] { topicPartition, null! };
-            tryGetValueMethod!.Invoke(deques, parameters);
-
-            var partitionDeque = parameters[1];
-            var currentBatchField = partitionDeque!.GetType().GetField("CurrentBatch");
-            var partitionBatch = currentBatchField!.GetValue(partitionDeque);
-            var pooledArrayCountField = partitionBatch!.GetType().GetField("_pooledArrayCount",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var pooledArrayCount = (int)pooledArrayCountField!.GetValue(partitionBatch)!;
-            await Assert.That(pooledArrayCount).IsEqualTo(2); // key + value
-        }
-        finally
-        {
-            await accumulator.DisposeAsync();
-        }
-    }
-
     #endregion
-
-    #region RecordListWrapper Tests
-
-    [Test]
-    public async Task RecordListWrapper_Count_ReturnsCorrectValue()
-    {
-        var records = new Record[10];
-        for (var i = 0; i < 10; i++)
-        {
-            records[i] = new Record { OffsetDelta = i };
-        }
-
-        var wrapper = new RecordListWrapper(records, 5); // Only 5 valid elements
-
-        await Assert.That(wrapper.Count).IsEqualTo(5);
-    }
-
-    [Test]
-    public async Task RecordListWrapper_Indexer_ReturnsCorrectElements()
-    {
-        var records = new Record[10];
-        for (var i = 0; i < 10; i++)
-        {
-            records[i] = new Record { OffsetDelta = i * 10 };
-        }
-
-        var wrapper = new RecordListWrapper(records, 5);
-
-        await Assert.That(wrapper[0].OffsetDelta).IsEqualTo(0);
-        await Assert.That(wrapper[2].OffsetDelta).IsEqualTo(20);
-        await Assert.That(wrapper[4].OffsetDelta).IsEqualTo(40);
-    }
-
-    [Test]
-    public async Task RecordListWrapper_Indexer_ThrowsOnOutOfRange()
-    {
-        var records = new Record[10];
-        var wrapper = new RecordListWrapper(records, 5);
-
-        await Assert.That(() => _ = wrapper[5]).Throws<ArgumentOutOfRangeException>();
-        await Assert.That(() => _ = wrapper[-1]).Throws<ArgumentOutOfRangeException>();
-        await Assert.That(() => _ = wrapper[10]).Throws<ArgumentOutOfRangeException>();
-    }
-
-    [Test]
-    public async Task RecordListWrapper_Enumerator_IteratesCorrectElements()
-    {
-        var records = new Record[10];
-        for (var i = 0; i < 10; i++)
-        {
-            records[i] = new Record { OffsetDelta = i };
-        }
-
-        var wrapper = new RecordListWrapper(records, 5);
-        var enumerated = new List<int>();
-
-        foreach (var record in wrapper)
-        {
-            enumerated.Add(record.OffsetDelta);
-        }
-
-        await Assert.That(enumerated).Count().IsEqualTo(5);
-        await Assert.That(enumerated[0]).IsEqualTo(0);
-        await Assert.That(enumerated[4]).IsEqualTo(4);
-    }
-
-    [Test]
-    public async Task RecordListWrapper_AsSpan_ExposesValidRecordsOnly()
-    {
-        var records = new Record[4];
-        records[0] = new Record { OffsetDelta = 10 };
-        records[1] = new Record { OffsetDelta = 20 };
-        records[2] = new Record { OffsetDelta = 30 };
-        records[3] = new Record { OffsetDelta = 40 };
-
-        var wrapper = new RecordListWrapper(records, 2);
-        var snapshot = ReadWrapperSpan(wrapper);
-
-        await Assert.That(snapshot.Length).IsEqualTo(2);
-        await Assert.That(snapshot.FirstOffset).IsEqualTo(10);
-        await Assert.That(snapshot.SecondOffset).IsEqualTo(20);
-    }
-
-    [Test]
-    public async Task RecordListWrapper_IndexBasedIteration_MatchesEnumerator()
-    {
-        var records = new Record[10];
-        for (var i = 0; i < 10; i++)
-        {
-            records[i] = new Record { OffsetDelta = i * 2 };
-        }
-
-        var wrapper = new RecordListWrapper(records, 7);
-        var fromEnumerator = new List<int>();
-        var fromIndexer = new List<int>();
-
-        foreach (var record in wrapper)
-        {
-            fromEnumerator.Add(record.OffsetDelta);
-        }
-
-        for (var i = 0; i < wrapper.Count; i++)
-        {
-            fromIndexer.Add(wrapper[i].OffsetDelta);
-        }
-
-        await Assert.That(fromIndexer).IsEquivalentTo(fromEnumerator);
-    }
-
-    #endregion
-
-    private static (int Length, int FirstOffset, int SecondOffset) ReadWrapperSpan(RecordListWrapper wrapper)
-    {
-        var span = wrapper.AsSpan();
-        return (span.Length, span[0].OffsetDelta, span[1].OffsetDelta);
-    }
 
     #region ReadyBatch.Reset Safety Net
 
@@ -1630,10 +1673,6 @@ public class RecordAccumulatorTests
             new RecordBatch { Records = Array.Empty<Record>() },
             sources,
             messageCount,
-            pooledDataArrays: null,
-            pooledDataArraysCount: 0,
-            pooledHeaderArrays: null,
-            pooledHeaderArraysCount: 0,
             dataSize: 100);
 
         return batch;
@@ -1771,10 +1810,6 @@ public class RecordAccumulatorTests
                 new RecordBatch { Records = Array.Empty<Record>() },
                 newSources,
                 completionSourcesCount: 1,
-                pooledDataArrays: null,
-                pooledDataArraysCount: 0,
-                pooledHeaderArrays: null,
-                pooledHeaderArraysCount: 0,
                 dataSize: 200);
 
             await Assert.That((int)cleanedUpField.GetValue(batch)!).IsEqualTo(0);
@@ -2188,13 +2223,17 @@ public class RecordAccumulatorTests
             MaxBlockMs = 5000
         };
         var accumulator = new RecordAccumulator(options);
+        var syntheticReservation = 4096;
+        var remainingSyntheticReservation = syntheticReservation;
 
         try
         {
-            // Fill buffer via hot path
-            await FillBufferViaHotPath(accumulator, 100);
+            // Fill BufferMemory without creating batches. This keeps the test focused on
+            // PendingAppend drain behavior instead of disposal of synthetic hot-path batches.
+            await Assert.That(accumulator.TryReserveMemoryForTest(syntheticReservation)).IsTrue();
 
             var largeValue = new byte[2048];
+            var recordSize = PartitionBatch.EstimateRecordSize(0, largeValue.Length, null, 0);
 
             // Start an append that will block in the slow path
             var appendTask = Task.Run(async () =>
@@ -2205,19 +2244,15 @@ public class RecordAccumulatorTests
                     largeValue, valueIsNull: false,
                     null, 0, null, CancellationToken.None));
 
-            // Release enough memory to serve the pending append.
-            // Use a retry loop: if the background task hasn't enqueued yet,
-            // ReleaseMemory won't drain anything, but the task's own
-            // DrainPendingAppends call after Enqueue will pick it up.
-            // We retry to cover the case where memory was released before the enqueue.
-            while (!appendTask.IsCompleted)
-            {
-                var bufferedBytes = (int)accumulator.BufferedBytes;
-                if (bufferedBytes > 0)
-                    accumulator.ReleaseMemory(bufferedBytes);
-
+            while (accumulator.BufferPressureEvents == 0 && !appendTask.IsCompleted)
                 await Task.Yield();
-            }
+
+            await Assert.That(appendTask.IsCompleted).IsFalse();
+
+            // Release exactly the pending append's estimated reservation. DrainPendingAppends
+            // will reserve it, append it, then refund the estimate-vs-actual difference.
+            accumulator.ReleaseMemory(recordSize);
+            remainingSyntheticReservation -= recordSize;
 
             // The append should complete successfully
             var result = await appendTask.WaitAsync(TimeSpan.FromSeconds(5));
@@ -2225,6 +2260,11 @@ public class RecordAccumulatorTests
         }
         finally
         {
+            if (remainingSyntheticReservation > 0)
+            {
+                accumulator.ReleaseMemory(remainingSyntheticReservation);
+            }
+
             await accumulator.DisposeAsync();
         }
     }
@@ -2233,11 +2273,16 @@ public class RecordAccumulatorTests
 
     private static ReadyBatch CompleteCurrentBatch(RecordAccumulator accumulator, TopicPartition topicPartition)
     {
-        var partitionDeque = GetPartitionDeque(accumulator, topicPartition);
-        var currentBatchField = partitionDeque!.GetType().GetField("CurrentBatch");
-        var partitionBatch = currentBatchField!.GetValue(partitionDeque);
-        var completeMethod = partitionBatch!.GetType().GetMethod("Complete");
+        var partitionBatch = GetCurrentPartitionBatch(accumulator, topicPartition);
+        var completeMethod = partitionBatch.GetType().GetMethod("Complete");
         return (ReadyBatch)completeMethod!.Invoke(partitionBatch, null)!;
+    }
+
+    private static PartitionBatch GetCurrentPartitionBatch(RecordAccumulator accumulator, TopicPartition topicPartition)
+    {
+        var partitionDeque = GetPartitionDeque(accumulator, topicPartition);
+        var currentBatchField = partitionDeque.GetType().GetField("CurrentBatch");
+        return (PartitionBatch)currentBatchField!.GetValue(partitionDeque)!;
     }
 
     private static object GetPartitionDeque(RecordAccumulator accumulator, TopicPartition topicPartition)
@@ -2259,5 +2304,24 @@ public class RecordAccumulatorTests
     {
         var field = instance.GetType().GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Instance);
         return (T)field!.GetValue(instance)!;
+    }
+
+    private sealed class ThrowingReadOnlyMemoryManager(int length) : MemoryManager<byte>
+    {
+        public ReadOnlyMemory<byte> ReadOnlyMemory => CreateMemory(length);
+
+        public override Span<byte> GetSpan() =>
+            throw new InvalidOperationException("Header value span failed.");
+
+        public override MemoryHandle Pin(int elementIndex = 0) =>
+            throw new NotSupportedException();
+
+        public override void Unpin()
+        {
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+        }
     }
 }

@@ -235,9 +235,9 @@ internal static class ProducerDataPool
 /// Dedicated <see cref="ArrayPool{T}"/> instances for producer batch container arrays.
 /// <para/>
 /// <b>Why not <see cref="ArrayPool{T}.Shared"/>?</b>
-/// Batch container arrays (<c>Record[]</c>, <c>PooledValueTaskSource[]</c>, <c>byte[][]</c>,
-/// <c>Header[][]</c>, <c>Header[]</c>, <c>Action[]</c>) are rented on the producer/accumulator
-/// thread during batch creation but returned on BrokerSender LongRunning threads during
+/// Batch container arrays (<c>PooledValueTaskSource[]</c>, <c>Header[]</c>, <c>Action[]</c>)
+/// are rented on the producer/accumulator thread during batch creation but returned on
+/// BrokerSender LongRunning threads during
 /// <see cref="ReadyBatch.Cleanup"/>. <c>ArrayPool&lt;T&gt;.Shared</c> uses TLS-based caching
 /// (<c>TlsOverPerCoreLockedStacksArrayPool</c>) that retains returned arrays in per-thread slots
 /// that grow but never shrink. With N brokers, N BrokerSender threads each accumulate returned
@@ -267,22 +267,10 @@ internal static class ProducerContainerPools
         maxArrayLength: 1024,
         initialArraysPerBucket: 16);
 
-    /// <summary>Pool for Record[] container arrays used by PartitionBatch/ReadyBatch.</summary>
-    internal static readonly ArrayPool<Record> Records = ArrayPool<Record>.Create(
-        maxArrayLength: MaxRecordArrayLength, maxArraysPerBucket: 16);
-
     /// <summary>Pool for PooledValueTaskSource[] container arrays.</summary>
     internal static readonly ArrayPool<PooledValueTaskSource<RecordMetadata>> CompletionSources =
         ArrayPool<PooledValueTaskSource<RecordMetadata>>.Create(
             maxArrayLength: MaxRecordArrayLength, maxArraysPerBucket: 16);
-
-    /// <summary>Pool for byte[][] container arrays (pooled data array references).</summary>
-    internal static readonly ArrayPool<byte[]> DataArrayRefs = ArrayPool<byte[]>.Create(
-        maxArrayLength: MaxRecordArrayLength * 2, maxArraysPerBucket: 16);
-
-    /// <summary>Pool for Header[][] container arrays (pooled header array references).</summary>
-    internal static readonly ArrayPool<Header[]> HeaderArrayRefs = ArrayPool<Header[]>.Create(
-        maxArrayLength: 1024, maxArraysPerBucket: 16);
 
     /// <summary>Pool for Header[] arrays (per-message headers).</summary>
     internal static ArrayPool<Header> Headers => s_headers.Pool;
@@ -544,6 +532,7 @@ internal sealed class BatchArena
 
     private byte[] _buffer;
     private int _position;
+    private int _maxPooledCapacity;
 
     /// <summary>
     /// Creates a new arena with the specified capacity.
@@ -551,9 +540,15 @@ internal sealed class BatchArena
     /// </summary>
     /// <param name="capacity">Buffer size. Pinned on the POH permanently (not from ArrayPool) to avoid LOH fragmentation and Gen2 GC pressure.</param>
     public BatchArena(int capacity)
+        : this(capacity, capacity)
+    {
+    }
+
+    internal BatchArena(int capacity, int maxPooledCapacity)
     {
         _buffer = GC.AllocateUninitializedArray<byte>(capacity, pinned: true);
         _position = 0;
+        _maxPooledCapacity = maxPooledCapacity;
     }
 
     /// <summary>
@@ -561,25 +556,34 @@ internal sealed class BatchArena
     /// Pooled arenas retain their POH buffers for the pool's lifetime - no ArrayPool rent/return overhead.
     /// </summary>
     public static BatchArena RentOrCreate(int capacity)
+        => RentOrCreate(capacity, capacity);
+
+    public static BatchArena RentOrCreate(int capacity, int maxPooledCapacity)
     {
         var pool = Volatile.Read(ref s_pool);
         if (pool.TryPop(out var arena))
         {
-            arena.Reset(capacity);
+            arena.Reset(capacity, maxPooledCapacity);
             return arena;
         }
 
         Interlocked.Increment(ref s_misses);
-        return new BatchArena(capacity);
+        return new BatchArena(capacity, maxPooledCapacity);
     }
 
     /// <summary>
     /// Returns an arena to the pool for reuse, or drops the reference for GC collection if the pool is full.
     /// The POH buffer is never returned to ArrayPool.
     /// </summary>
-    public static void ReturnToPool(BatchArena arena)
+    public static bool ReturnToPool(BatchArena arena)
     {
         arena._position = 0;
+
+        if (arena._buffer.Length > arena._maxPooledCapacity)
+        {
+            arena._buffer = null!;
+            return false;
+        }
 
         var pool = Volatile.Read(ref s_pool);
         if (!pool.TryPush(arena))
@@ -587,15 +591,19 @@ internal sealed class BatchArena
             // Pool full — drop the reference so the GC can reclaim the POH segment
             // once all objects on it are dead. No ArrayPool return needed.
             arena._buffer = null!;
+            return false;
         }
+
+        return true;
     }
 
     /// <summary>
     /// Resets the arena for reuse. Keeps the existing buffer if it's large enough,
     /// otherwise allocates a new permanent buffer.
     /// </summary>
-    private void Reset(int capacity)
+    private void Reset(int capacity, int maxPooledCapacity)
     {
+        _maxPooledCapacity = maxPooledCapacity;
         if (_buffer is not null && _buffer.Length >= capacity)
         {
             // Skip clearing — _position reset to 0 means stale bytes are never read,
@@ -609,6 +617,8 @@ internal sealed class BatchArena
         _buffer = GC.AllocateUninitializedArray<byte>(capacity, pinned: true);
         _position = 0;
     }
+
+    internal int Capacity => _buffer.Length;
 
     /// <summary>
     /// Gets the current position in the arena (total bytes used).
@@ -666,6 +676,25 @@ internal sealed class BatchArena
     public ReadOnlySpan<byte> GetSpan(int offset, int length)
     {
         return _buffer.AsSpan(offset, length);
+    }
+
+    /// <summary>
+    /// Gets read-only memory for data at the specified offset and length.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ReadOnlyMemory<byte> GetMemory(int offset, int length)
+    {
+        return _buffer.AsMemory(offset, length);
+    }
+
+    /// <summary>
+    /// Rewinds the last allocation if no later allocation has occurred.
+    /// Used only while the owning partition lock is held to abandon a failed record encode.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryRewindLastAllocation(int offset, int length)
+    {
+        return Interlocked.CompareExchange(ref _position, offset, offset + length) == offset + length;
     }
 
     /// <summary>
@@ -1346,7 +1375,8 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                     && now < batch.RetryNotBefore)
                     continue;
 
-                if (ready.Count > 0 && size + batch.DataSize > maxRequestSize)
+                var batchRequestSize = batch.EncodedSize;
+                if (ready.Count > 0 && size + batchRequestSize > maxRequestSize)
                 {
                     // Ready() already consumed notifications for all partitions on this node.
                     // Re-enqueue this and remaining partitions so they aren't orphaned.
@@ -1370,7 +1400,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
             if (batch is not null)
             {
                 batch.AppendDiag('D');
-                size += batch.DataSize;
+                size += batch.EncodedSize;
                 ready.Add(batch);
             }
         }
@@ -1610,6 +1640,8 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         _compressionCodecs = compressionCodecs;
         _onBatchComplete = onBatchComplete;
 
+        ProducerOptions.ValidateArenaCapacity(options.BatchSize, options.ArenaCapacity);
+
         // Scale pool sizes with BufferMemory/BatchSize to prevent pool exhaustion.
         // Small batches (e.g., 16KB) create high batch churn (~6,250/sec at 100K msg/sec)
         // and need larger pools than the default 256 designed for 1MB batches.
@@ -1637,7 +1669,8 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         var preWarmCount = Math.Min(poolSize / 8, 16);
         _readyBatchPool.PreWarm(Math.Min(poolSize, 32));
         _batchPool.PreWarm(preWarmCount);
-        BatchArena.PreWarm(preWarmCount, options.BatchSize);
+        BatchArena.PreWarm(preWarmCount,
+            ProducerOptions.GetEffectiveArenaCapacity(options.BatchSize, options.ArenaCapacity));
 
         // Create per-partition-affine append worker channels.
         // Each channel is SingleReader (one worker) but allows multiple writers (caller threads).
@@ -1771,11 +1804,13 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         var reader = _appendWorkerChannels[workerIndex].Reader;
         await foreach (var workItem in reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
         {
+            var appendStarted = false;
             try
             {
                 workItem.CancellationToken.ThrowIfCancellationRequested();
 
-                if (!await AppendAsync(
+                appendStarted = true;
+                var appendTask = AppendAsync(
                     workItem.Topic,
                     workItem.Partition,
                     workItem.Timestamp,
@@ -1786,7 +1821,9 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                     workItem.Completion,
                     null,
                     workItem.CancellationToken,
-                    partitionCount: workItem.PartitionCount).ConfigureAwait(false))
+                    partitionCount: workItem.PartitionCount);
+
+                if (!await appendTask.ConfigureAwait(false))
                 {
                     CleanupWorkItemResources(in workItem);
                     workItem.Completion.TrySetException(new ObjectDisposedException(nameof(RecordAccumulator)));
@@ -1794,12 +1831,12 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
             }
             catch (OperationCanceledException) when (workItem.CancellationToken.IsCancellationRequested)
             {
-                CleanupWorkItemResources(in workItem);
+                if (!appendStarted)
+                    CleanupWorkItemResources(in workItem);
                 workItem.Completion.TrySetCanceled(workItem.CancellationToken);
             }
             catch (Exception ex)
             {
-                CleanupWorkItemResources(in workItem);
                 workItem.Completion.TrySetException(ex);
             }
         }
@@ -1972,7 +2009,18 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         if (Volatile.Read(ref _disposed) != 0)
             return new ValueTask<bool>(false);
 
-        var recordSize = PartitionBatch.EstimateRecordSize(key.Length, value.Length, headers, headerCount);
+        int recordSize;
+        try
+        {
+            recordSize = PartitionBatch.EstimateRecordSize(key.Length, value.Length, headers, headerCount);
+        }
+        catch
+        {
+            key.Return();
+            value.Return();
+            ReturnPooledHeaders(headers);
+            throw;
+        }
 
         // Hot path: non-blocking CAS reservation — no async state machine allocated
         if (TryReserveMemory(recordSize))
@@ -2022,161 +2070,189 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         ReadyBatch? sealedBatchToEnqueue = null;
         PartitionBatch? rentedBatch = null;
         var ownsRotation = false;
+        var ownsReservation = true;
+        var ownsRecordResources = true;
+        var ownsPendingCount = completionSource is not null;
         var spinner = new SpinWait();
 
-        while (true)
+        void ReleaseOwnedAppendState()
         {
-            PartitionBatch? batchToComplete = null;
-            PartitionBatch? batchToReturn = null;
-            ReadyBatch? batchToPublish = null;
-            ReadyBatch? batchToFail = null;
-            var waitForRotation = false;
-            var needBatch = false;
-            var appendSucceeded = false;
-            var disposed = false;
-            var messageTooLarge = false;
-
+            if (ownsPendingCount)
             {
-                using var guard = new SpinLockGuard(ref pd.Lock);
+                Interlocked.Decrement(ref _pendingAwaitedProduceCount);
+                ownsPendingCount = false;
+            }
+            if (ownsReservation)
+            {
+                ReleaseMemory(recordSize);
+                ownsReservation = false;
+            }
+            if (ownsRecordResources)
+            {
+                key.Return();
+                value.Return();
+                ReturnPooledHeaders(headers);
+                ownsRecordResources = false;
+            }
+        }
 
-                if (Volatile.Read(ref _disposed) != 0)
+        try
+        {
+            while (true)
+            {
+                PartitionBatch? batchToComplete = null;
+                PartitionBatch? batchToReturn = null;
+                ReadyBatch? batchToPublish = null;
+                ReadyBatch? batchToFail = null;
+                var waitForRotation = false;
+                var needBatch = false;
+                var appendSucceeded = false;
+                var disposed = false;
+                var messageTooLarge = false;
+
                 {
-                    batchToReturn = rentedBatch;
-                    rentedBatch = null;
-                    batchToFail = sealedBatchToEnqueue;
-                    sealedBatchToEnqueue = null;
-                    if (ownsRotation)
+                    using var guard = new SpinLockGuard(ref pd.Lock);
+
+                    if (Volatile.Read(ref _disposed) != 0)
                     {
-                        ClearRotationInProgressUnderLock(pd);
-                        ownsRotation = false;
-                    }
-                    disposed = true;
-                }
-                else if (pd.RotationInProgress && !ownsRotation)
-                {
-                    waitForRotation = true;
-                }
-                else
-                {
-                    if (sealedBatchToEnqueue is not null)
-                    {
-                        EnqueueCompletedBatchUnderLock(pd, sealedBatchToEnqueue);
-                        batchToPublish = sealedBatchToEnqueue;
+                        batchToReturn = rentedBatch;
+                        rentedBatch = null;
+                        batchToFail = sealedBatchToEnqueue;
                         sealedBatchToEnqueue = null;
-                    }
-
-                    if (pd.CurrentBatch is { } currentBatch)
-                    {
-                        if (TryAppendToBatch(currentBatch, timestamp, key, value, headers, headerCount,
-                            completionSource, callback, recordSize))
+                        if (ownsRotation)
                         {
-                            if (completionSource is not null)
-                                QueueLingerPartition(pd, topicPartition);
-                            batchToReturn = rentedBatch;
-                            rentedBatch = null;
-                            appendSucceeded = true;
+                            ClearRotationInProgressUnderLock(pd);
+                            ownsRotation = false;
                         }
-                        else
-                        {
-                            batchToComplete = DetachCurrentBatchForSealUnderLock(pd, currentBatch);
-                            ownsRotation = true;
-                            needBatch = true;
-                        }
+                        disposed = true;
                     }
-                    else if (rentedBatch is null)
+                    else if (pd.RotationInProgress && !ownsRotation)
                     {
-                        needBatch = true;
+                        waitForRotation = true;
                     }
                     else
                     {
-                        var newBatch = rentedBatch;
-                        rentedBatch = null;
-                        pd.CurrentBatch = newBatch;
-                        Interlocked.Increment(ref _unsealedBatchCount);
-                        TrackCurrentBatchForLinger(pd, topicPartition, newBatch);
-
-                        if (TryAppendToBatch(newBatch, timestamp, key, value, headers, headerCount,
-                            completionSource, callback, recordSize))
+                        if (sealedBatchToEnqueue is not null)
                         {
-                            ClearRotationInProgressUnderLock(pd);
-                            ownsRotation = false;
-                            appendSucceeded = true;
+                            EnqueueCompletedBatchUnderLock(pd, sealedBatchToEnqueue);
+                            batchToPublish = sealedBatchToEnqueue;
+                            sealedBatchToEnqueue = null;
+                        }
+
+                        if (pd.CurrentBatch is { } currentBatch)
+                        {
+                            if (TryAppendToBatch(currentBatch, timestamp, key, value, headers, headerCount,
+                                completionSource, callback, recordSize))
+                            {
+                                ownsReservation = false;
+                                ownsRecordResources = false;
+                                ownsPendingCount = false;
+                                if (completionSource is not null)
+                                    QueueLingerPartition(pd, topicPartition);
+                                batchToReturn = rentedBatch;
+                                rentedBatch = null;
+                                appendSucceeded = true;
+                            }
+                            else
+                            {
+                                batchToComplete = DetachCurrentBatchForSealUnderLock(pd, currentBatch);
+                                ownsRotation = true;
+                                needBatch = true;
+                            }
+                        }
+                        else if (rentedBatch is null)
+                        {
+                            needBatch = true;
                         }
                         else
                         {
-                            pd.CurrentBatch = null;
-                            MarkLingerPartitionDequeued(pd);
-                            Interlocked.Decrement(ref _unsealedBatchCount);
-                            ClearRotationInProgressUnderLock(pd);
-                            ownsRotation = false;
-                            batchToReturn = newBatch;
-                            messageTooLarge = true;
+                            var newBatch = rentedBatch;
+                            rentedBatch = null;
+                            pd.CurrentBatch = newBatch;
+                            Interlocked.Increment(ref _unsealedBatchCount);
+                            TrackCurrentBatchForLinger(pd, topicPartition, newBatch);
+
+                            if (TryAppendToBatch(newBatch, timestamp, key, value, headers, headerCount,
+                                completionSource, callback, recordSize))
+                            {
+                                ownsReservation = false;
+                                ownsRecordResources = false;
+                                ownsPendingCount = false;
+                                ClearRotationInProgressUnderLock(pd);
+                                ownsRotation = false;
+                                appendSucceeded = true;
+                            }
+                            else
+                            {
+                                pd.CurrentBatch = null;
+                                MarkLingerPartitionDequeued(pd);
+                                Interlocked.Decrement(ref _unsealedBatchCount);
+                                ClearRotationInProgressUnderLock(pd);
+                                ownsRotation = false;
+                                batchToReturn = newBatch;
+                                messageTooLarge = true;
+                            }
                         }
                     }
                 }
-            }
 
-            if (batchToPublish is not null)
-                PublishSealedBatch(batchToPublish);
+                if (batchToPublish is not null)
+                    PublishSealedBatch(batchToPublish);
 
-            if (batchToReturn is not null)
-                _batchPool.Return(batchToReturn);
+                if (batchToReturn is not null)
+                    _batchPool.Return(batchToReturn);
 
-            if (batchToFail is not null)
-            {
-                var disposedException = new ObjectDisposedException(nameof(RecordAccumulator));
-                batchToFail.Fail(disposedException);
-                if (batchToFail.TrySetMemoryReleased())
-                    ReleaseMemory(batchToFail.DataSize);
-            }
-
-            if (disposed)
-            {
-                if (completionSource is not null)
-                    Interlocked.Decrement(ref _pendingAwaitedProduceCount);
-                ReleaseMemory(recordSize);
-                key.Return();
-                value.Return();
-                ReturnPooledHeaders(headers);
-                return false;
-            }
-
-            if (messageTooLarge)
-            {
-                if (completionSource is not null)
-                    Interlocked.Decrement(ref _pendingAwaitedProduceCount);
-                ReleaseMemory(recordSize);
-                key.Return();
-                value.Return();
-                ReturnPooledHeaders(headers);
-                throw new KafkaException(ErrorCode.MessageTooLarge,
-                    $"Record of size {recordSize} exceeds maximum batch size of {_options.BatchSize}");
-            }
-
-            if (appendSucceeded)
-                return true;
-
-            if (waitForRotation)
-            {
-                spinner.SpinOnce();
-                continue;
-            }
-
-            if (batchToComplete is not null)
-            {
-                try
+                if (batchToFail is not null)
                 {
-                    sealedBatchToEnqueue = CompleteDetachedBatch(batchToComplete);
+                    var disposedException = new ObjectDisposedException(nameof(RecordAccumulator));
+                    batchToFail.Fail(disposedException);
+                    if (batchToFail.TrySetMemoryReleased())
+                        ReleaseMemory(batchToFail.DataSize);
                 }
-                catch
-                {
-                    ClearRotationInProgress(pd);
-                    throw;
-                }
-            }
 
-            if (needBatch && rentedBatch is null)
-                rentedBatch = RentBatch(topicPartition, partitionCount);
+                if (disposed)
+                {
+                    ReleaseOwnedAppendState();
+                    return false;
+                }
+
+                if (messageTooLarge)
+                {
+                    ReleaseOwnedAppendState();
+                    throw new KafkaException(ErrorCode.MessageTooLarge,
+                        $"Record of size {recordSize} exceeds maximum batch size of {_options.BatchSize}");
+                }
+
+                if (appendSucceeded)
+                    return true;
+
+                if (waitForRotation)
+                {
+                    spinner.SpinOnce();
+                    continue;
+                }
+
+                if (batchToComplete is not null)
+                {
+                    try
+                    {
+                        sealedBatchToEnqueue = CompleteDetachedBatch(batchToComplete);
+                    }
+                    catch
+                    {
+                        ClearRotationInProgress(pd);
+                        throw;
+                    }
+                }
+
+                if (needBatch && rentedBatch is null)
+                    rentedBatch = RentBatch(topicPartition, partitionCount);
+            }
+        }
+        catch
+        {
+            ReleaseOwnedAppendState();
+            throw;
         }
     }
 
@@ -2335,159 +2411,187 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         ReadyBatch? sealedBatchToEnqueue = null;
         PartitionBatch? rentedBatch = null;
         var ownsRotation = false;
+        var ownsReservation = true;
+        var ownsHeaderResources = returnHeadersOnFailure;
+        var ownsPendingCount = completionSource is not null;
         var spinner = new SpinWait();
 
-        while (true)
+        void ReleaseOwnedAppendState()
         {
-            PartitionBatch? batchToComplete = null;
-            PartitionBatch? batchToReturn = null;
-            ReadyBatch? batchToPublish = null;
-            ReadyBatch? batchToFail = null;
-            var waitForRotation = false;
-            var needBatch = false;
-            var appendSucceeded = false;
-            var disposed = false;
-            var messageTooLarge = false;
-
+            if (ownsPendingCount)
             {
-                using var guard = new SpinLockGuard(ref pd.Lock);
+                Interlocked.Decrement(ref _pendingAwaitedProduceCount);
+                ownsPendingCount = false;
+            }
+            if (ownsReservation)
+            {
+                ReleaseMemory(recordSize);
+                ownsReservation = false;
+            }
+            if (ownsHeaderResources)
+            {
+                ReturnPooledHeaders(headers);
+                ownsHeaderResources = false;
+            }
+        }
 
-                if (Volatile.Read(ref _disposed) != 0)
+        try
+        {
+            while (true)
+            {
+                PartitionBatch? batchToComplete = null;
+                PartitionBatch? batchToReturn = null;
+                ReadyBatch? batchToPublish = null;
+                ReadyBatch? batchToFail = null;
+                var waitForRotation = false;
+                var needBatch = false;
+                var appendSucceeded = false;
+                var disposed = false;
+                var messageTooLarge = false;
+
                 {
-                    batchToReturn = rentedBatch;
-                    rentedBatch = null;
-                    batchToFail = sealedBatchToEnqueue;
-                    sealedBatchToEnqueue = null;
-                    if (ownsRotation)
+                    using var guard = new SpinLockGuard(ref pd.Lock);
+
+                    if (Volatile.Read(ref _disposed) != 0)
                     {
-                        ClearRotationInProgressUnderLock(pd);
-                        ownsRotation = false;
-                    }
-                    disposed = true;
-                }
-                else if (pd.RotationInProgress && !ownsRotation)
-                {
-                    waitForRotation = true;
-                }
-                else
-                {
-                    if (sealedBatchToEnqueue is not null)
-                    {
-                        EnqueueCompletedBatchUnderLock(pd, sealedBatchToEnqueue);
-                        batchToPublish = sealedBatchToEnqueue;
+                        batchToReturn = rentedBatch;
+                        rentedBatch = null;
+                        batchToFail = sealedBatchToEnqueue;
                         sealedBatchToEnqueue = null;
-                    }
-
-                    if (pd.CurrentBatch is { } currentBatch)
-                    {
-                        if (TryAppendFromSpansToBatch(currentBatch, timestamp, keyData, keyIsNull, valueData, valueIsNull,
-                            headers, headerCount, completionSource, callback, recordSize))
+                        if (ownsRotation)
                         {
-                            if (completionSource is not null)
-                                QueueLingerPartition(pd, topicPartition);
-                            batchToReturn = rentedBatch;
-                            rentedBatch = null;
-                            appendSucceeded = true;
+                            ClearRotationInProgressUnderLock(pd);
+                            ownsRotation = false;
                         }
-                        else
-                        {
-                            batchToComplete = DetachCurrentBatchForSealUnderLock(pd, currentBatch);
-                            ownsRotation = true;
-                            needBatch = true;
-                        }
+                        disposed = true;
                     }
-                    else if (rentedBatch is null)
+                    else if (pd.RotationInProgress && !ownsRotation)
                     {
-                        needBatch = true;
+                        waitForRotation = true;
                     }
                     else
                     {
-                        var newBatch = rentedBatch;
-                        rentedBatch = null;
-                        pd.CurrentBatch = newBatch;
-                        Interlocked.Increment(ref _unsealedBatchCount);
-                        TrackCurrentBatchForLinger(pd, topicPartition, newBatch);
-
-                        if (TryAppendFromSpansToBatch(newBatch, timestamp, keyData, keyIsNull, valueData, valueIsNull,
-                            headers, headerCount, completionSource, callback, recordSize))
+                        if (sealedBatchToEnqueue is not null)
                         {
-                            ClearRotationInProgressUnderLock(pd);
-                            ownsRotation = false;
-                            appendSucceeded = true;
+                            EnqueueCompletedBatchUnderLock(pd, sealedBatchToEnqueue);
+                            batchToPublish = sealedBatchToEnqueue;
+                            sealedBatchToEnqueue = null;
+                        }
+
+                        if (pd.CurrentBatch is { } currentBatch)
+                        {
+                            if (TryAppendFromSpansToBatch(currentBatch, timestamp, keyData, keyIsNull, valueData, valueIsNull,
+                                headers, headerCount, completionSource, callback, recordSize))
+                            {
+                                ownsReservation = false;
+                                ownsHeaderResources = false;
+                                ownsPendingCount = false;
+                                if (completionSource is not null)
+                                    QueueLingerPartition(pd, topicPartition);
+                                batchToReturn = rentedBatch;
+                                rentedBatch = null;
+                                appendSucceeded = true;
+                            }
+                            else
+                            {
+                                batchToComplete = DetachCurrentBatchForSealUnderLock(pd, currentBatch);
+                                ownsRotation = true;
+                                needBatch = true;
+                            }
+                        }
+                        else if (rentedBatch is null)
+                        {
+                            needBatch = true;
                         }
                         else
                         {
-                            pd.CurrentBatch = null;
-                            MarkLingerPartitionDequeued(pd);
-                            Interlocked.Decrement(ref _unsealedBatchCount);
-                            ClearRotationInProgressUnderLock(pd);
-                            ownsRotation = false;
-                            batchToReturn = newBatch;
-                            messageTooLarge = true;
+                            var newBatch = rentedBatch;
+                            rentedBatch = null;
+                            pd.CurrentBatch = newBatch;
+                            Interlocked.Increment(ref _unsealedBatchCount);
+                            TrackCurrentBatchForLinger(pd, topicPartition, newBatch);
+
+                            if (TryAppendFromSpansToBatch(newBatch, timestamp, keyData, keyIsNull, valueData, valueIsNull,
+                                headers, headerCount, completionSource, callback, recordSize))
+                            {
+                                ownsReservation = false;
+                                ownsHeaderResources = false;
+                                ownsPendingCount = false;
+                                ClearRotationInProgressUnderLock(pd);
+                                ownsRotation = false;
+                                appendSucceeded = true;
+                            }
+                            else
+                            {
+                                pd.CurrentBatch = null;
+                                MarkLingerPartitionDequeued(pd);
+                                Interlocked.Decrement(ref _unsealedBatchCount);
+                                ClearRotationInProgressUnderLock(pd);
+                                ownsRotation = false;
+                                batchToReturn = newBatch;
+                                messageTooLarge = true;
+                            }
                         }
                     }
                 }
-            }
 
-            if (batchToPublish is not null)
-                PublishSealedBatch(batchToPublish);
+                if (batchToPublish is not null)
+                    PublishSealedBatch(batchToPublish);
 
-            if (batchToReturn is not null)
-                _batchPool.Return(batchToReturn);
+                if (batchToReturn is not null)
+                    _batchPool.Return(batchToReturn);
 
-            if (batchToFail is not null)
-            {
-                var disposedException = new ObjectDisposedException(nameof(RecordAccumulator));
-                batchToFail.Fail(disposedException);
-                if (batchToFail.TrySetMemoryReleased())
-                    ReleaseMemory(batchToFail.DataSize);
-            }
-
-            if (disposed)
-            {
-                if (completionSource is not null)
-                    Interlocked.Decrement(ref _pendingAwaitedProduceCount);
-                ReleaseMemory(recordSize);
-                if (returnHeadersOnFailure)
-                    ReturnPooledHeaders(headers);
-                return false;
-            }
-
-            if (messageTooLarge)
-            {
-                if (completionSource is not null)
-                    Interlocked.Decrement(ref _pendingAwaitedProduceCount);
-                ReleaseMemory(recordSize);
-                if (returnHeadersOnFailure)
-                    ReturnPooledHeaders(headers);
-                throw new KafkaException(ErrorCode.MessageTooLarge,
-                    $"Record of size {recordSize} exceeds maximum batch size of {_options.BatchSize}");
-            }
-
-            if (appendSucceeded)
-                return true;
-
-            if (waitForRotation)
-            {
-                spinner.SpinOnce();
-                continue;
-            }
-
-            if (batchToComplete is not null)
-            {
-                try
+                if (batchToFail is not null)
                 {
-                    sealedBatchToEnqueue = CompleteDetachedBatch(batchToComplete);
+                    var disposedException = new ObjectDisposedException(nameof(RecordAccumulator));
+                    batchToFail.Fail(disposedException);
+                    if (batchToFail.TrySetMemoryReleased())
+                        ReleaseMemory(batchToFail.DataSize);
                 }
-                catch
-                {
-                    ClearRotationInProgress(pd);
-                    throw;
-                }
-            }
 
-            if (needBatch && rentedBatch is null)
-                rentedBatch = RentBatch(topicPartition, partitionCount);
+                if (disposed)
+                {
+                    ReleaseOwnedAppendState();
+                    return false;
+                }
+
+                if (messageTooLarge)
+                {
+                    ReleaseOwnedAppendState();
+                    throw new KafkaException(ErrorCode.MessageTooLarge,
+                        $"Record of size {recordSize} exceeds maximum batch size of {_options.BatchSize}");
+                }
+
+                if (appendSucceeded)
+                    return true;
+
+                if (waitForRotation)
+                {
+                    spinner.SpinOnce();
+                    continue;
+                }
+
+                if (batchToComplete is not null)
+                {
+                    try
+                    {
+                        sealedBatchToEnqueue = CompleteDetachedBatch(batchToComplete);
+                    }
+                    catch
+                    {
+                        ClearRotationInProgress(pd);
+                        throw;
+                    }
+                }
+
+                if (needBatch && rentedBatch is null)
+                    rentedBatch = RentBatch(topicPartition, partitionCount);
+            }
+        }
+        catch
+        {
+            ReleaseOwnedAppendState();
+            throw;
         }
     }
 
@@ -2506,7 +2610,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         Action<RecordMetadata, Exception?>? callback,
         int estimatedSize)
     {
-        var result = batch.TryAppend(timestamp, key, value, headers, headerCount, completionSource, callback, estimatedSize);
+        var result = batch.TryAppend(timestamp, key, value, headers, headerCount, completionSource, callback);
 
         if (result.Success)
         {
@@ -2545,7 +2649,16 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
 
         var keyLength = keyIsNull ? 0 : keyData.Length;
         var valueLength = valueIsNull ? 0 : valueData.Length;
-        var recordSize = PartitionBatch.EstimateRecordSize(keyLength, valueLength, headers, headerCount);
+        int recordSize;
+        try
+        {
+            recordSize = PartitionBatch.EstimateRecordSize(keyLength, valueLength, headers, headerCount);
+        }
+        catch
+        {
+            ReturnPooledHeaders(headers);
+            throw;
+        }
 
         // Hot path: non-blocking CAS reservation — no async state machine allocated
         if (TryReserveMemory(recordSize))
@@ -2633,7 +2746,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         int estimatedSize)
     {
         var result = batch.TryAppendFromSpans(timestamp, keyData, keyIsNull, valueData, valueIsNull,
-            headers, headerCount, completionSource, callback, estimatedSize);
+            headers, headerCount, completionSource, callback);
 
         if (result.Success)
         {
@@ -2717,11 +2830,10 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
     }
 
     /// <summary>
-    /// Pre-serializes a sealed batch's records (compressing when configured). Called by the
+    /// Prepares a sealed batch's records for send, compressing when configured. Called by the
     /// sender thread from <see cref="Ready"/>, outside the partition SpinLock, before the
-    /// batch can drain. Doing this here keeps the per-record wire encoding off the per-broker
-    /// send-loop thread, which only has to copy + CRC the pre-serialized payload — the
-    /// coordinator encodes the next batch while the send loop writes the previous one.
+    /// batch can drain. Record bytes are already encoded at append time, so this step either
+    /// leaves the arena-backed records in place or compresses those encoded bytes.
     ///
     /// Thread safety: the batch is already sealed and in the deque; no other thread can
     /// modify it. The drain loop skips batches where <see cref="ReadyBatch.IsPreSerialized"/>
@@ -2732,6 +2844,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         try
         {
             readyBatch.RecordBatch.PreCompress(_options.CompressionType, _compressionCodecs);
+            readyBatch.SetEncodedSize(readyBatch.RecordBatch.GetEncodedSize(_options.CompressionType));
         }
         catch (Exception ex)
         {
@@ -4003,13 +4116,12 @@ internal sealed class PartitionBatch
     private ReadyBatchPool? _readyBatchPool; // Pool for renting ReadyBatch objects
     private BatchArrayReuseQueue? _arrayReuseQueue; // Reuse queue for working arrays
 
-    // Arena for zero-copy serialization - all message data in one contiguous buffer
+    // Arena holding the encoded record bytes - all records in one contiguous buffer
     private BatchArena? _arena;
 
-    // Zero-allocation array management: use pooled arrays instead of List<T>
-    private Record[] _records;
     private int _recordCount;
 
+    // Zero-allocation array management: use pooled arrays instead of List<T>
     private PooledValueTaskSource<RecordMetadata>[] _completionSources;
     private int _completionSourceCount;
 
@@ -4017,14 +4129,10 @@ internal sealed class PartitionBatch
     private Action<RecordMetadata, Exception?>?[]? _callbacks;
     private int _callbackCount;
 
-    // Legacy: pooled arrays for non-arena path (completion-tracked messages)
-    private byte[][] _pooledArrays;
-    private int _pooledArrayCount;
-
-    private Header[][] _pooledHeaderArrays;
-    private int _pooledHeaderArrayCount;
-
     private long _baseTimestamp;
+    private long _maxTimestamp;
+    private int _encodedRecordsStart;
+    private int _encodedRecordsLength;
     private int _estimatedSize;
     // Note: _offsetDelta removed - it always equals _recordCount at assignment time
     private long _createdStopwatchTimestamp;
@@ -4037,21 +4145,12 @@ internal sealed class PartitionBatch
     private bool _isTransactional;
 
     /// <summary>
-    /// Divisor for computing the arena overflow margin from BatchSize.
-    /// A divisor of 8 gives a 12.5% margin (BatchSize / 8) above BatchSize,
-    /// reducing per-message ArrayPool fallback when batches near capacity.
-    /// </summary>
-    private const int ArenaOverflowMarginDivisor = 8;
-
-    /// <summary>
-    /// Returns the effective arena capacity: explicit ArenaCapacity if set,
-    /// otherwise BatchSize + 12.5% margin to reduce per-message ArrayPool fallback.
-    /// Uses long arithmetic to avoid integer overflow when BatchSize is large.
+    /// Returns the effective arena capacity: BatchSize + 12.5% margin, or an explicit
+    /// ArenaCapacity. Records encode directly into the arena, so explicit values below
+    /// the BatchSize-derived minimum are rejected during producer construction.
     /// </summary>
     private static int GetEffectiveArenaCapacity(ProducerOptions options) =>
-        options.ArenaCapacity > 0
-            ? options.ArenaCapacity
-            : (int)Math.Min((long)options.BatchSize + options.BatchSize / ArenaOverflowMarginDivisor, int.MaxValue);
+        ProducerOptions.GetEffectiveArenaCapacity(options.BatchSize, options.ArenaCapacity);
 
     public PartitionBatch(TopicPartition topicPartition, ProducerOptions options)
     {
@@ -4063,21 +4162,13 @@ internal sealed class PartitionBatch
             ? Math.Clamp(options.InitialBatchRecordCapacity, 16, 16384)
             : ComputeInitialRecordCapacity(options.BatchSize);
 
-        // Create arena for zero-copy serialization
+        // Create arena for append-time record encoding
         _arena = new BatchArena(GetEffectiveArenaCapacity(options));
-
-        // Rent arrays from pool - eliminates List allocations
-        _records = ProducerContainerPools.Records.Rent(_initialRecordCapacity);
         _recordCount = 0;
 
+        // Rent arrays from pool - eliminates List allocations
         _completionSources = ProducerContainerPools.CompletionSources.Rent(_initialRecordCapacity);
         _completionSourceCount = 0;
-
-        _pooledArrays = ProducerContainerPools.DataArrayRefs.Rent(_initialRecordCapacity * 2);
-        _pooledArrayCount = 0;
-
-        _pooledHeaderArrays = ProducerContainerPools.HeaderArrayRefs.Rent(8); // Headers less common
-        _pooledHeaderArrayCount = 0;
     }
 
     private static int ComputeInitialRecordCapacity(int batchSize)
@@ -4135,9 +4226,10 @@ internal sealed class PartitionBatch
         _recordCount = 0;
         _completionSourceCount = 0;
         _callbackCount = 0;
-        _pooledArrayCount = 0;
-        _pooledHeaderArrayCount = 0;
         _baseTimestamp = 0;
+        _maxTimestamp = 0;
+        _encodedRecordsStart = 0;
+        _encodedRecordsLength = 0;
         _estimatedSize = 0;
         _isCompleted = 0;  // Only reset here - see remarks
         _completedBatch = null;
@@ -4160,24 +4252,18 @@ internal sealed class PartitionBatch
         // Rent or create arena for the pooled batch
         _arena = BatchArena.RentOrCreate(GetEffectiveArenaCapacity(options));
 
-        // Arrays were transferred to ReadyBatch by Complete() and are now null.
-        // Try to reclaim arrays from the reuse queue first (returned by ReadyBatch.Cleanup()),
-        // avoiding 4 ArrayPool Rent operations per batch cycle.
+        // The completion sources array was transferred to ReadyBatch by Complete() and is now null.
+        // Try to reclaim one from the reuse queue first (returned by ReadyBatch.Cleanup()),
+        // avoiding an ArrayPool Rent operation per batch cycle.
         if (_arrayReuseQueue is not null && _arrayReuseQueue.TryDequeue(out var reusable))
         {
-            _records = reusable.Records;
-            _completionSources = reusable.CompletionSources;
-            _pooledArrays = reusable.DataArrays;
-            _pooledHeaderArrays = reusable.HeaderArrays;
+            _completionSources = reusable;
         }
         else
         {
-            // Fallback: rent fresh arrays from dedicated pools (not ArrayPool<T>.Shared)
+            // Fallback: rent a fresh array from the dedicated pool (not ArrayPool<T>.Shared)
             // to prevent TLS accumulation from cross-thread rent/return patterns
-            _records = ProducerContainerPools.Records.Rent(_initialRecordCapacity);
             _completionSources = ProducerContainerPools.CompletionSources.Rent(_initialRecordCapacity);
-            _pooledArrays = ProducerContainerPools.DataArrayRefs.Rent(_initialRecordCapacity * 2);
-            _pooledHeaderArrays = ProducerContainerPools.HeaderArrayRefs.Rent(8);
         }
 
         // Reset counters and state for reuse.
@@ -4188,9 +4274,10 @@ internal sealed class PartitionBatch
         // and those messages would be lost when Reset() is later called.
         _recordCount = 0;
         _completionSourceCount = 0;
-        _pooledArrayCount = 0;
-        _pooledHeaderArrayCount = 0;
         _baseTimestamp = 0;
+        _maxTimestamp = 0;
+        _encodedRecordsStart = 0;
+        _encodedRecordsLength = 0;
         _estimatedSize = 0;
         // _isCompleted stays at 1 - batch is "completed" while in pool
         _completedBatch = null;
@@ -4225,106 +4312,33 @@ internal sealed class PartitionBatch
         Header[]? headers,
         int headerCount,
         PooledValueTaskSource<RecordMetadata>? completionSource,
-        Action<RecordMetadata, Exception?>? callback,
-        int estimatedRecordSize)
+        Action<RecordMetadata, Exception?>? callback)
     {
-        // Check if batch was completed
-        if (Volatile.Read(ref _isCompleted) != 0)
+        var result = TryAppendEncoded(
+            timestamp,
+            key.Span,
+            key.IsNull,
+            key.Length,
+            value.Span,
+            value.IsNull,
+            value.Length,
+            headers,
+            headerCount,
+            completionSource,
+            callback);
+
+        if (result.Success)
         {
-            return new RecordAppendResult(false);
+            key.Return();
+            value.Return();
+            RecordAccumulator.ReturnPooledHeaders(headers);
         }
 
-        // Defensive check: if arrays are null, batch is in inconsistent state (being pooled)
-        if (_records is null || _pooledArrays is null)
-        {
-            return new RecordAppendResult(false);
-        }
-
-        if (_recordCount == 0)
-        {
-            _baseTimestamp = timestamp;
-        }
-
-        // Check size limit
-        if (_estimatedSize + estimatedRecordSize > _options.BatchSize && _recordCount > 0)
-        {
-            return new RecordAppendResult(false);
-        }
-
-        // Grow arrays if needed (rare - only happens if batch fills beyond initial capacity)
-        if (_recordCount >= _records.Length)
-        {
-            GrowArray(ref _records, ref _recordCount, ProducerContainerPools.Records);
-        }
-        if (completionSource is not null && _completionSourceCount >= _completionSources.Length)
-        {
-            GrowArray(ref _completionSources, ref _completionSourceCount, ProducerContainerPools.CompletionSources);
-        }
-        if (_pooledArrayCount + 2 >= _pooledArrays.Length) // +2 for key and value
-        {
-            GrowArray(ref _pooledArrays, ref _pooledArrayCount, ProducerContainerPools.DataArrayRefs);
-        }
-        if (headers is not null && _pooledHeaderArrayCount >= _pooledHeaderArrays.Length)
-        {
-            GrowArray(ref _pooledHeaderArrays, ref _pooledHeaderArrayCount, ProducerContainerPools.HeaderArrayRefs);
-        }
-        if (callback is not null)
-        {
-            _callbacks ??= ProducerContainerPools.Callbacks.Rent(_initialRecordCapacity);
-            if (_callbackCount >= _callbacks.Length)
-            {
-                GrowArray(ref _callbacks!, ref _callbackCount, ProducerContainerPools.Callbacks);
-            }
-        }
-
-        // Track pooled arrays for returning to pool later
-        if (key.Array is not null)
-        {
-            _pooledArrays[_pooledArrayCount++] = key.Array;
-        }
-        if (value.Array is not null)
-        {
-            _pooledArrays[_pooledArrayCount++] = value.Array;
-        }
-        if (headers is not null)
-        {
-            _pooledHeaderArrays[_pooledHeaderArrayCount++] = headers;
-        }
-
-        var timestampDelta = timestamp - _baseTimestamp;
-        _records[_recordCount] = new Record
-        {
-            TimestampDelta = timestampDelta,
-            OffsetDelta = _recordCount,
-            Key = key.Memory,
-            IsKeyNull = key.IsNull,
-            Value = value.Memory,
-            IsValueNull = value.IsNull,
-            Headers = headers,
-            HeaderCount = headerCount,
-            CachedBodySize = Record.ComputeBodySize(timestampDelta, _recordCount, key.IsNull, key.Length, value.IsNull, value.Length, headers, headerCount)
-        };
-
-        if (completionSource is not null)
-        {
-            _completionSources[_completionSourceCount++] = completionSource;
-            ProducerDebugCounters.RecordCompletionSourceStoredInBatch();
-        }
-
-        if (callback is not null)
-        {
-            _callbacks![_callbackCount++] = callback;
-        }
-
-        _recordCount++;
-        _estimatedSize += estimatedRecordSize;
-
-        return new RecordAppendResult(Success: true, ActualSizeAdded: estimatedRecordSize);
+        return result;
     }
 
     /// <summary>
-    /// Appends a record from raw span data, using the arena for zero-copy when possible.
-    /// Falls back to ArrayPool rental when the arena is full.
+    /// Appends a record from raw span data, encoding directly into the batch arena.
     /// Caller must hold the per-partition deque lock.
     /// </summary>
     public RecordAppendResult TryAppendFromSpans(
@@ -4336,47 +4350,86 @@ internal sealed class PartitionBatch
         Header[]? headers,
         int headerCount,
         PooledValueTaskSource<RecordMetadata>? completionSource,
-        Action<RecordMetadata, Exception?>? callback,
-        int estimatedRecordSize)
+        Action<RecordMetadata, Exception?>? callback)
     {
         var keyLength = keyIsNull ? 0 : keyData.Length;
         var valueLength = valueIsNull ? 0 : valueData.Length;
 
+        var result = TryAppendEncoded(
+            timestamp,
+            keyData,
+            keyIsNull,
+            keyLength,
+            valueData,
+            valueIsNull,
+            valueLength,
+            headers,
+            headerCount,
+            completionSource,
+            callback);
+
+        if (result.Success)
+        {
+            RecordAccumulator.ReturnPooledHeaders(headers);
+        }
+
+        return result;
+    }
+
+    private RecordAppendResult TryAppendEncoded(
+        long timestamp,
+        ReadOnlySpan<byte> keyData,
+        bool keyIsNull,
+        int keyLength,
+        ReadOnlySpan<byte> valueData,
+        bool valueIsNull,
+        int valueLength,
+        Header[]? headers,
+        int headerCount,
+        PooledValueTaskSource<RecordMetadata>? completionSource,
+        Action<RecordMetadata, Exception?>? callback)
+    {
         // Check if batch was completed
         if (Volatile.Read(ref _isCompleted) != 0)
         {
             return new RecordAppendResult(false);
         }
 
-        // Defensive check: if arrays are null, batch is in inconsistent state (being pooled)
-        if (_records is null || _pooledArrays is null)
+        // Defensive check: if the array is null, batch is in inconsistent state (being pooled)
+        if (_completionSources is null)
         {
             return new RecordAppendResult(false);
         }
 
-        if (_recordCount == 0)
-        {
-            _baseTimestamp = timestamp;
-        }
+        var recordIndex = _recordCount;
+        var baseTimestamp = recordIndex == 0 ? timestamp : _baseTimestamp;
+        var timestampDelta = timestamp - baseTimestamp;
+        var bodySize = Record.ComputeBodySize(
+            timestampDelta,
+            recordIndex,
+            keyIsNull,
+            keyLength,
+            valueIsNull,
+            valueLength,
+            headers,
+            headerCount);
+        var encodedRecordSize = checked(Record.VarIntSize(bodySize) + bodySize);
 
         // Check size limit
-        if (_estimatedSize + estimatedRecordSize > _options.BatchSize && _recordCount > 0)
+        if ((long)_estimatedSize + encodedRecordSize > _options.BatchSize && recordIndex > 0)
         {
             return new RecordAppendResult(false);
+        }
+
+        if (recordIndex == 0)
+        {
+            EnsureArenaCanFitFirstRecord(encodedRecordSize);
         }
 
         // Grow arrays if needed (rare - only happens if batch fills beyond initial capacity)
-        if (_recordCount >= _records.Length)
-        {
-            GrowArray(ref _records, ref _recordCount, ProducerContainerPools.Records);
-        }
         if (completionSource is not null && _completionSourceCount >= _completionSources.Length)
         {
             GrowArray(ref _completionSources, ref _completionSourceCount, ProducerContainerPools.CompletionSources);
-        }
-        if (headers is not null && _pooledHeaderArrayCount >= _pooledHeaderArrays.Length)
-        {
-            GrowArray(ref _pooledHeaderArrays, ref _pooledHeaderArrayCount, ProducerContainerPools.HeaderArrayRefs);
         }
         if (callback is not null)
         {
@@ -4387,75 +4440,40 @@ internal sealed class PartitionBatch
             }
         }
 
-        // Pre-grow _pooledArrays for worst case (key + value fallback to ArrayPool)
-        if (_pooledArrayCount + 2 >= _pooledArrays.Length)
+        if (_arena is null || !_arena.TryAllocate(encodedRecordSize, out var encodedRecord, out var encodedOffset))
         {
-            GrowArray(ref _pooledArrays, ref _pooledArrayCount, ProducerContainerPools.DataArrayRefs);
+            return new RecordAppendResult(false);
         }
 
-        // Try to use arena for zero-copy serialization
-        ReadOnlyMemory<byte> keyMemory = ReadOnlyMemory<byte>.Empty;
-        ReadOnlyMemory<byte> valueMemory = ReadOnlyMemory<byte>.Empty;
-        bool usedArenaForKey = false;
-        bool usedArenaForValue = false;
-
-        if (!keyIsNull && keyLength > 0 && _arena is not null)
+        try
         {
-            if (_arena.TryAllocate(keyLength, out var keySpan, out var keyOffset))
-            {
-                keyData.CopyTo(keySpan);
-                keyMemory = _arena.Buffer.AsMemory(keyOffset, keyLength);
-                usedArenaForKey = true;
-            }
+            Record.Encode(
+                encodedRecord,
+                bodySize,
+                timestampDelta,
+                recordIndex,
+                keyData,
+                keyIsNull,
+                valueData,
+                valueIsNull,
+                headers,
+                headerCount);
+        }
+        catch
+        {
+            _arena.TryRewindLastAllocation(encodedOffset, encodedRecordSize);
+            throw;
         }
 
-        if (!valueIsNull && valueLength > 0 && _arena is not null)
+        if (recordIndex == 0)
         {
-            if (_arena.TryAllocate(valueLength, out var valueSpan, out var valueOffset))
-            {
-                valueData.CopyTo(valueSpan);
-                valueMemory = _arena.Buffer.AsMemory(valueOffset, valueLength);
-                usedArenaForValue = true;
-            }
+            _baseTimestamp = baseTimestamp;
+            _encodedRecordsStart = encodedOffset;
         }
 
-        // Fall back to ProducerDataPool for data that didn't fit in the arena.
-        // Uses dedicated pool instead of ArrayPool<byte>.Shared to prevent TLS-based
-        // working set growth from cross-thread rent/return (see ProducerDataPool docs).
-        if (!keyIsNull && keyLength > 0 && !usedArenaForKey)
-        {
-            var keyArray = ProducerDataPool.BytePool.Rent(keyLength);
-            keyData.CopyTo(keyArray);
-            keyMemory = keyArray.AsMemory(0, keyLength);
-            _pooledArrays[_pooledArrayCount++] = keyArray;
-        }
-
-        if (!valueIsNull && valueLength > 0 && !usedArenaForValue)
-        {
-            var valueArray = ProducerDataPool.BytePool.Rent(valueLength);
-            valueData.CopyTo(valueArray);
-            valueMemory = valueArray.AsMemory(0, valueLength);
-            _pooledArrays[_pooledArrayCount++] = valueArray;
-        }
-
-        if (headers is not null)
-        {
-            _pooledHeaderArrays[_pooledHeaderArrayCount++] = headers;
-        }
-
-        var timestampDelta = timestamp - _baseTimestamp;
-        _records[_recordCount] = new Record
-        {
-            TimestampDelta = timestampDelta,
-            OffsetDelta = _recordCount,
-            Key = keyMemory,
-            IsKeyNull = keyIsNull,
-            Value = valueMemory,
-            IsValueNull = valueIsNull,
-            Headers = headers,
-            HeaderCount = headerCount,
-            CachedBodySize = Record.ComputeBodySize(timestampDelta, _recordCount, keyIsNull, keyLength, valueIsNull, valueLength, headers, headerCount)
-        };
+        Debug.Assert(encodedOffset == _encodedRecordsStart + _encodedRecordsLength);
+        _encodedRecordsLength += encodedRecordSize;
+        _maxTimestamp = recordIndex == 0 ? timestamp : Math.Max(_maxTimestamp, timestamp);
 
         if (completionSource is not null)
         {
@@ -4468,10 +4486,28 @@ internal sealed class PartitionBatch
             _callbacks![_callbackCount++] = callback;
         }
 
-        _recordCount++;
-        _estimatedSize += estimatedRecordSize;
+        _recordCount = recordIndex + 1;
+        _estimatedSize += encodedRecordSize;
 
-        return new RecordAppendResult(Success: true, ActualSizeAdded: estimatedRecordSize);
+        return new RecordAppendResult(Success: true, ActualSizeAdded: encodedRecordSize);
+    }
+
+    private void EnsureArenaCanFitFirstRecord(int encodedRecordSize)
+    {
+        var arena = _arena;
+        if (arena is not null && encodedRecordSize <= arena.RemainingCapacity)
+        {
+            return;
+        }
+
+        var normalCapacity = GetEffectiveArenaCapacity(_options);
+        var capacity = Math.Max(normalCapacity, encodedRecordSize);
+        if (arena is not null)
+        {
+            BatchArena.ReturnToPool(arena);
+        }
+
+        _arena = BatchArena.RentOrCreate(capacity, normalCapacity);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -4537,9 +4573,6 @@ internal sealed class PartitionBatch
             return null;
         }
 
-        // Use pooled records array directly with wrapper to avoid allocation
-        // ReadyBatch will return the array to pool in Cleanup()
-        var pooledRecordsArray = _records;
         var attributes = RecordBatchAttributes.None;
         if (_isTransactional)
         {
@@ -4559,14 +4592,15 @@ internal sealed class PartitionBatch
         var batch = RecordBatch.RentFromPool();
         batch.BaseOffset = 0;
         batch.BaseTimestamp = _baseTimestamp;
-        batch.MaxTimestamp = _baseTimestamp + (_recordCount > 0 ? pooledRecordsArray[_recordCount - 1].TimestampDelta : 0);
+        batch.MaxTimestamp = _maxTimestamp;
         batch.LastOffsetDelta = _recordCount - 1;
         batch.ProducerId = _producerId;
         batch.ProducerEpoch = _producerEpoch;
         batch.BaseSequence = baseSequence;
         batch.Attributes = attributes;
-        batch.Records = new RecordListWrapper(pooledRecordsArray, _recordCount);
-        _records = null!;
+        var encodedRecords = _arena!.GetMemory(_encodedRecordsStart, _encodedRecordsLength);
+        batch.SetPreEncodedRecords(encodedRecords);
+        batch.Records = LazyRecordList.Create(encodedRecords, _recordCount);
 
         // Rent ReadyBatch from pool or create new if no pool available
         // This eliminates per-batch class allocations at high throughput
@@ -4579,12 +4613,7 @@ internal sealed class PartitionBatch
             batch,
             _completionSources,
             _completionSourceCount,
-            _pooledArrays,
-            _pooledArrayCount,
-            _pooledHeaderArrays,
-            _pooledHeaderArrayCount,
             _estimatedSize,
-            pooledRecordsArray,
             _arena,
             _callbacks,
             _callbackCount,
@@ -4594,8 +4623,6 @@ internal sealed class PartitionBatch
 
         // Null out references - ownership transferred to ReadyBatch
         _completionSources = null!;
-        _pooledArrays = null!;
-        _pooledHeaderArrays = null!;
         _arena = null;
         _callbacks = null;
 
@@ -4604,34 +4631,26 @@ internal sealed class PartitionBatch
 
     private void ReturnBatchArraysToPool()
     {
-        // Return all working arrays to dedicated pools (with null checks since they may have been transferred)
+        // Return working arrays to dedicated pools (with null checks since they may have been transferred)
         // clearArray: false for internal tracking arrays - they will be overwritten on next use
-        if (_records is not null)
-            ProducerContainerPools.Records.Return(_records, clearArray: false);
         if (_completionSources is not null)
             ProducerContainerPools.CompletionSources.Return(_completionSources, clearArray: false);
-        if (_pooledArrays is not null)
-            ProducerContainerPools.DataArrayRefs.Return(_pooledArrays, clearArray: false);
-        if (_pooledHeaderArrays is not null)
-            ProducerContainerPools.HeaderArrayRefs.Return(_pooledHeaderArrays, clearArray: false);
 
         // Return arena buffer if present
         _arena?.Return();
 
         // Null out references to prevent accidental reuse
-        _records = null!;
         _completionSources = null!;
-        _pooledArrays = null!;
-        _pooledHeaderArrays = null!;
         _arena = null;
     }
 
     /// <summary>
     /// Estimates the size of a record in the batch for buffer memory accounting.
     /// This is an upper-bound estimate that includes:
-    /// - 20 bytes base overhead (1 byte attributes + varint overhead for timestamp/offset/key-length/value-length/header-count)
+    /// - 36 bytes base overhead (worst-case varints for record length, timestamp delta,
+    ///   offset delta, key/value lengths, and header count, plus 1 byte attributes)
     /// - Key and value payload lengths
-    /// - Header sizes (10 bytes overhead per header + key/value lengths)
+    /// - Exact header sizes via <see cref="Header.CalculateSize"/>
     /// This must be internal so KafkaProducer can calculate size before reserving memory.
     /// </summary>
     /// <param name="keyLength">Length of the serialized key in bytes (0 if null)</param>
@@ -4644,7 +4663,10 @@ internal sealed class PartitionBatch
     /// </remarks>
     internal static int EstimateRecordSize(int keyLength, int valueLength, Header[]? headers, int headerCount)
     {
-        var size = 20; // Base overhead for varint lengths, timestamp delta, offset delta, etc.
+        // Upper bound for record wrapper/body metadata:
+        // record length (5) + attributes (1) + timestamp delta (10) + offset delta (5) +
+        // key length (5) + value length (5) + header count (5).
+        var size = 36;
         size += keyLength;
         size += valueLength;
 
@@ -4652,29 +4674,11 @@ internal sealed class PartitionBatch
         {
             for (var i = 0; i < headerCount; i++)
             {
-                var header = headers[i];
-                // OPTIMIZATION: For ASCII-only keys (99%+ of cases), string.Length == byte count.
-                // Only fall back to expensive UTF8.GetByteCount for non-ASCII keys.
-                var headerKeyByteCount = GetHeaderKeyByteCount(header.Key);
-                size += headerKeyByteCount + (header.IsValueNull ? 0 : header.Value.Length) + 10;
+                size += headers[i].CalculateSize();
             }
         }
 
         return size;
-    }
-
-    /// <summary>
-    /// Fast path for header key byte count. ASCII keys (the common case) use string length directly.
-    /// Uses SIMD-optimized Ascii.IsValid for efficient detection.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int GetHeaderKeyByteCount(string key)
-    {
-        // SIMD-optimized ASCII check: if all chars are ASCII, byte count == char count
-        // This is much faster than UTF8.GetByteCount for the common ASCII case
-        return System.Text.Ascii.IsValid(key)
-            ? key.Length
-            : System.Text.Encoding.UTF8.GetByteCount(key);
     }
 }
 
@@ -4697,76 +4701,37 @@ internal sealed class ReadyBatchPool(int maxPoolSize = BatchArena.DefaultPoolSiz
 }
 
 /// <summary>
-/// Reuse queue for the 4 working arrays that PartitionBatch rents from ArrayPool.
-/// When ReadyBatch finishes cleanup, it pushes the container arrays here instead of returning
-/// them to ArrayPool. PartitionBatch.PrepareForPooling() dequeues from here first, falling back
-/// to ArrayPool on miss. This eliminates ~4 ArrayPool Rent/Return pairs per batch cycle.
-/// Uses a single <see cref="LockFreeStack{T}"/> to keep all four arrays atomically together.
-/// One <see cref="ReusableArrays"/> wrapper is allocated per batch cycle (~32 bytes, amortized
-/// over ~1000 messages per batch).
+/// Reuse queue for the completion sources array that PartitionBatch rents from ArrayPool.
+/// When ReadyBatch finishes cleanup, it pushes the array here instead of returning it to
+/// ArrayPool. PartitionBatch.PrepareForPooling() dequeues from here first, falling back
+/// to ArrayPool on miss. This eliminates an ArrayPool Rent/Return pair per batch cycle.
 /// </summary>
 internal sealed class BatchArrayReuseQueue
 {
-    private readonly LockFreeStack<ReusableArrays> _queue;
+    private readonly LockFreeStack<PooledValueTaskSource<RecordMetadata>[]> _queue;
 
     public BatchArrayReuseQueue(int maxSize = 128)
     {
-        _queue = new LockFreeStack<ReusableArrays>(maxSize);
+        _queue = new LockFreeStack<PooledValueTaskSource<RecordMetadata>[]>(maxSize);
     }
 
     /// <summary>
-    /// Pushes all four arrays as an atomic unit for reuse. If the queue is full,
-    /// all arrays are returned to the global ArrayPools instead.
+    /// Pushes the array for reuse. If the queue is full, the array is returned
+    /// to the dedicated ArrayPool instead.
     /// </summary>
-    public void EnqueueOrReturn(
-        Record[] records,
-        PooledValueTaskSource<RecordMetadata>[] completionSources,
-        byte[][] pooledDataArrays,
-        Header[][] pooledHeaderArrays)
+    public void EnqueueOrReturn(PooledValueTaskSource<RecordMetadata>[] completionSources)
     {
-        if (_queue.Count >= _queue.Capacity)
+        if (!_queue.TryPush(completionSources))
         {
-            ProducerContainerPools.Records.Return(records, clearArray: false);
             ProducerContainerPools.CompletionSources.Return(completionSources, clearArray: false);
-            ProducerContainerPools.DataArrayRefs.Return(pooledDataArrays, clearArray: false);
-            ProducerContainerPools.HeaderArrayRefs.Return(pooledHeaderArrays, clearArray: false);
-            return;
-        }
-
-        var wrapper = new ReusableArrays(records, completionSources, pooledDataArrays, pooledHeaderArrays);
-
-        if (!_queue.TryPush(wrapper))
-        {
-            ProducerContainerPools.Records.Return(records, clearArray: false);
-            ProducerContainerPools.CompletionSources.Return(completionSources, clearArray: false);
-            ProducerContainerPools.DataArrayRefs.Return(pooledDataArrays, clearArray: false);
-            ProducerContainerPools.HeaderArrayRefs.Return(pooledHeaderArrays, clearArray: false);
         }
     }
 
     /// <summary>
-    /// Tries to pop a complete set of reusable arrays. All four arrays are always
-    /// returned together (atomic by construction via the wrapper).
+    /// Tries to pop a reusable completion sources array.
     /// </summary>
-    public bool TryDequeue([NotNullWhen(true)] out ReusableArrays? arrays)
-        => _queue.TryPop(out arrays);
-}
-
-/// <summary>
-/// Wrapper that keeps four batch arrays atomically together in
-/// <see cref="BatchArrayReuseQueue"/>. One allocation per batch (~32 bytes)
-/// is acceptable — amortized over ~1000 messages per batch.
-/// </summary>
-internal sealed class ReusableArrays(
-    Record[] records,
-    PooledValueTaskSource<RecordMetadata>[] completionSources,
-    byte[][] dataArrays,
-    Header[][] headerArrays)
-{
-    public Record[] Records { get; } = records;
-    public PooledValueTaskSource<RecordMetadata>[] CompletionSources { get; } = completionSources;
-    public byte[][] DataArrays { get; } = dataArrays;
-    public Header[][] HeaderArrays { get; } = headerArrays;
+    public bool TryDequeue([NotNullWhen(true)] out PooledValueTaskSource<RecordMetadata>[]? completionSources)
+        => _queue.TryPop(out completionSources);
 }
 
 /// <summary>
@@ -4795,9 +4760,14 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
     public int CompletionSourcesCount => _completionSourcesCount;
 
     /// <summary>
-    /// Estimated size of all data in this batch (for buffer memory tracking).
+    /// Uncompressed encoded record bytes reserved against BufferMemory.
     /// </summary>
     public int DataSize { get; private set; }
+
+    /// <summary>
+    /// Full encoded record batch size used for MaxRequestSize drain accounting.
+    /// </summary>
+    public int EncodedSize { get; private set; }
 
     /// <summary>
     /// Gets a ValueTask that completes when this batch is done (either sent successfully or failed).
@@ -4811,15 +4781,10 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
     // Working arrays from accumulator (pooled) - mutable for pooling
     private PooledValueTaskSource<RecordMetadata>[]? _completionSourcesArray;
     private int _completionSourcesCount;
-    private byte[][]? _pooledDataArrays;
-    private int _pooledDataArraysCount;
-    private Header[][]? _pooledHeaderArrays;
-    private int _pooledHeaderArraysCount;
-    private Record[]? _pooledRecordsArray; // Pooled records array from RecordBatch
 
     // Reuse queue for returning working arrays back to PartitionBatch without ArrayPool round-trip
     private BatchArrayReuseQueue? _arrayReuseQueue;
-    private BatchArena? _arena; // Arena for zero-copy serialization data
+    private BatchArena? _arena; // Arena holding the batch's encoded record bytes
 
     // Callbacks for Send(message, callback) - inline invocation without ThreadPool
     private Action<RecordMetadata, Exception?>?[]? _callbacks;
@@ -4870,6 +4835,8 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
     /// Only called during epoch bump recovery — not in the hot path.
     /// </summary>
     internal void RewriteRecordBatch(RecordBatch newRecordBatch) => _recordBatch = newRecordBatch;
+
+    internal void SetEncodedSize(int encodedSize) => EncodedSize = encodedSize;
 
     /// <summary>
     /// Whether the batch's records have been pre-serialized (and compressed, when
@@ -4993,12 +4960,7 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
         RecordBatch recordBatch,
         PooledValueTaskSource<RecordMetadata>[]? completionSourcesArray,
         int completionSourcesCount,
-        byte[][]? pooledDataArrays,
-        int pooledDataArraysCount,
-        Header[][]? pooledHeaderArrays,
-        int pooledHeaderArraysCount,
         int dataSize,
-        Record[]? pooledRecordsArray = null,
         BatchArena? arena = null,
         Action<RecordMetadata, Exception?>?[]? callbacks = null,
         int callbackCount = 0,
@@ -5021,12 +4983,8 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
         _recordBatch = recordBatch;
         _completionSourcesArray = completionSourcesArray;
         _completionSourcesCount = completionSourcesCount;
-        _pooledDataArrays = pooledDataArrays;
-        _pooledDataArraysCount = pooledDataArraysCount;
-        _pooledHeaderArrays = pooledHeaderArrays;
-        _pooledHeaderArraysCount = pooledHeaderArraysCount;
         DataSize = dataSize;
-        _pooledRecordsArray = pooledRecordsArray;
+        EncodedSize = dataSize;
         _arena = arena;
         _callbacks = callbacks;
         _callbackCount = callbackCount;
@@ -5068,12 +5026,8 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
         _recordBatch = null!;
         _completionSourcesArray = null;
         _completionSourcesCount = 0;
-        _pooledDataArrays = null;
-        _pooledDataArraysCount = 0;
-        _pooledHeaderArrays = null;
-        _pooledHeaderArraysCount = 0;
         DataSize = 0;
-        _pooledRecordsArray = null;
+        EncodedSize = 0;
         _arena = null;
         _callbacks = null;
         _callbackCount = 0;
@@ -5315,57 +5269,24 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
         if (Interlocked.Exchange(ref _cleanedUp, 1) != 0)
             return;
 
-        // Return pooled byte arrays (key/value data) - only for non-arena path.
-        // Uses ProducerDataPool (not ArrayPool<byte>.Shared) to match the rent path
-        // and prevent cross-thread TLS accumulation in multi-broker scenarios.
-        // Null check defensive against partially constructed batches.
-        if (_pooledDataArrays is not null)
-        {
-            for (var i = 0; i < _pooledDataArraysCount; i++)
-            {
-                ProducerDataPool.BytePool.Return(_pooledDataArrays[i], clearArray: false);
-            }
-        }
-
-        // Return pooled header arrays (large header counts)
-        // Uses dedicated pool to prevent TLS accumulation from cross-thread return.
-        // clearArray: false - header data is not sensitive
-        if (_pooledHeaderArrays is not null)
-        {
-            for (var i = 0; i < _pooledHeaderArraysCount; i++)
-            {
-                ProducerContainerPools.Headers.Return(_pooledHeaderArrays[i], clearArray: false);
-            }
-        }
-
-        // Return the working (container) arrays: either to the reuse queue for fast recycling
+        // Return the working (container) array: either to the reuse queue for fast recycling
         // back to PartitionBatch, or to ArrayPool as fallback.
-        // Note: PooledValueTaskSource instances auto-return to their pool when awaited.
-        if (_arrayReuseQueue is not null
-            && _pooledRecordsArray is not null
-            && _completionSourcesArray is not null
-            && _pooledDataArrays is not null
-            && _pooledHeaderArrays is not null)
+        // Safety: clearArray: false is intentional. Array slots past the used count may contain
+        // stale PooledValueTaskSource references, but these are never accessed because counters
+        // reset to 0 on reuse. PooledValueTaskSource instances auto-return to their pool via
+        // GetResult(), so stale references don't prevent pool recycling.
+        if (_completionSourcesArray is not null)
         {
-            // Enqueue all 4 working arrays for reuse by PartitionBatch.PrepareForPooling().
-            // Safety: clearArray: false is intentional. Array slots past _recordCount may contain stale
-            // PooledValueTaskSource references, but these are never accessed because counters reset to 0
-            // on reuse. PooledValueTaskSource instances auto-return to their pool via GetResult(),
-            // so stale references don't prevent pool recycling. This matches ArrayPool behavior.
-            _arrayReuseQueue.EnqueueOrReturn(_pooledRecordsArray, _completionSourcesArray, _pooledDataArrays, _pooledHeaderArrays);
-        }
-        else
-        {
-            // Fallback: return individually to dedicated pools (not ArrayPool<T>.Shared)
-            // to prevent TLS accumulation from cross-thread return on BrokerSender threads
-            if (_completionSourcesArray is not null)
+            if (_arrayReuseQueue is not null)
+            {
+                _arrayReuseQueue.EnqueueOrReturn(_completionSourcesArray);
+            }
+            else
+            {
+                // Fallback: return to the dedicated pool (not ArrayPool<T>.Shared) to prevent
+                // TLS accumulation from cross-thread return on BrokerSender threads
                 ProducerContainerPools.CompletionSources.Return(_completionSourcesArray, clearArray: false);
-            if (_pooledDataArrays is not null)
-                ProducerContainerPools.DataArrayRefs.Return(_pooledDataArrays, clearArray: false);
-            if (_pooledHeaderArrays is not null)
-                ProducerContainerPools.HeaderArrayRefs.Return(_pooledHeaderArrays, clearArray: false);
-            if (_pooledRecordsArray is not null)
-                ProducerContainerPools.Records.Return(_pooledRecordsArray, clearArray: false);
+            }
         }
 
         // Return arena to pool for reuse (arena-based path)
@@ -5387,68 +5308,8 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
         if (_recordBatch is not null)
         {
             _recordBatch.ReturnPreCompressedBuffer();
+            _recordBatch.DisposeRecordList();
             _recordBatch.ReturnToPool();
         }
-    }
-}
-
-/// <summary>
-/// Wrapper around a pooled Record array that implements IReadOnlyList.
-/// Used to present only the valid portion of a pooled array without copying.
-/// </summary>
-internal readonly struct RecordListWrapper : IReadOnlyList<Record>
-{
-    private readonly Record[] _array;
-    private readonly int _count;
-
-    public RecordListWrapper(Record[] array, int count)
-    {
-        _array = array;
-        _count = count;
-    }
-
-    public Record this[int index]
-    {
-        get
-        {
-            if (index < 0 || index >= _count)
-                throw new ArgumentOutOfRangeException(nameof(index));
-            return _array[index];
-        }
-    }
-
-    public int Count => _count;
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public ReadOnlySpan<Record> AsSpan() => _array.AsSpan(0, _count);
-
-    public Enumerator GetEnumerator() => new(_array, _count);
-
-    IEnumerator<Record> IEnumerable<Record>.GetEnumerator() => GetEnumerator();
-
-    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
-
-    public struct Enumerator : IEnumerator<Record>
-    {
-        private readonly Record[] _array;
-        private readonly int _count;
-        private int _index;
-
-        public Enumerator(Record[] array, int count)
-        {
-            _array = array;
-            _count = count;
-            _index = -1;
-        }
-
-        public Record Current => _array[_index];
-
-        object System.Collections.IEnumerator.Current => Current;
-
-        public bool MoveNext() => ++_index < _count;
-
-        public void Reset() => _index = -1;
-
-        public void Dispose() { }
     }
 }
