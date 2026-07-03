@@ -110,6 +110,37 @@ public class PendingFetchDataTests
     }
 
     [Test]
+    public async Task MoveNext_CachesCurrentPartitionLeaderEpoch()
+    {
+        var batch = new RecordBatch
+        {
+            BaseOffset = 0,
+            PartitionLeaderEpoch = 12,
+            Records =
+            [
+                new Record
+                {
+                    Key = ReadOnlyMemory<byte>.Empty,
+                    Value = ReadOnlyMemory<byte>.Empty,
+                    IsKeyNull = true,
+                    IsValueNull = true
+                }
+            ]
+        };
+
+        using var pending = PendingFetchData.Create("topic", partitionIndex: 0, batches: [batch]);
+        pending.EagerParseAll();
+
+        var moved = pending.MoveNext();
+
+        await Assert.That(moved).IsTrue();
+        await Assert.That(pending.CurrentPartitionLeaderEpoch).IsEqualTo(12);
+
+        pending.TrackConsumed(0, 0);
+        await Assert.That(pending.LastYieldedLeaderEpoch).IsEqualTo(12);
+    }
+
+    [Test]
     public async Task RatchetPoolSize_IncreasesMaxPoolSize()
     {
         var before = PendingFetchData.MaxPoolSizeValue;

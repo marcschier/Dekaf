@@ -296,6 +296,36 @@ public sealed partial class ConsumerCoordinator : IAsyncDisposable
         IEnumerable<TopicPartitionOffset> offsets,
         CancellationToken cancellationToken)
     {
+        await CommitOffsetsCoreAsync(
+            offsets,
+            static offset => offset.Topic,
+            static offset => offset.Partition,
+            static offset => offset.Offset,
+            static _ => -1,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async ValueTask CommitOffsetsAsync(
+        IEnumerable<TopicPartitionOffsetAndLeaderEpoch> offsets,
+        CancellationToken cancellationToken)
+    {
+        await CommitOffsetsCoreAsync(
+            offsets,
+            static offset => offset.Topic,
+            static offset => offset.Partition,
+            static offset => offset.Offset,
+            static offset => offset.CommittedLeaderEpoch,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask CommitOffsetsCoreAsync<TOffset>(
+        IEnumerable<TOffset> offsets,
+        Func<TOffset, string> getTopic,
+        Func<TOffset, int> getPartition,
+        Func<TOffset, long> getOffset,
+        Func<TOffset, int> getLeaderEpoch,
+        CancellationToken cancellationToken)
+    {
         if (string.IsNullOrEmpty(_options.GroupId))
             return;
 
@@ -320,15 +350,17 @@ public sealed partial class ConsumerCoordinator : IAsyncDisposable
 
                 foreach (var offset in offsets)
                 {
-                    if (!_commitTopicGroups.TryGetValue(offset.Topic, out var partitions))
+                    var topic = getTopic(offset);
+                    if (!_commitTopicGroups.TryGetValue(topic, out var partitions))
                     {
                         partitions = [];
-                        _commitTopicGroups[offset.Topic] = partitions;
+                        _commitTopicGroups[topic] = partitions;
                     }
                     partitions.Add(new OffsetCommitRequestPartition
                     {
-                        PartitionIndex = offset.Partition,
-                        CommittedOffset = offset.Offset
+                        PartitionIndex = getPartition(offset),
+                        CommittedOffset = getOffset(offset),
+                        CommittedLeaderEpoch = getLeaderEpoch(offset)
                     });
                 }
 

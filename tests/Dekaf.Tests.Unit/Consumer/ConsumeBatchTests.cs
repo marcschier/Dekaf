@@ -67,6 +67,22 @@ public class ConsumeBatchTests
     }
 
     [Test]
+    public async Task ConsumeBatch_Records_HaveBatchLeaderEpoch()
+    {
+        using var pending = CreatePendingFetchData("test-topic", partitionIndex: 0, baseOffset: 42, messageCount: 1, leaderEpoch: 7);
+        var batch = new ConsumeBatch<string, string>(pending, Serializers.String, Serializers.String);
+
+        ConsumeResult<string, string>? result = null;
+        foreach (var item in batch)
+        {
+            result = item;
+        }
+
+        await Assert.That(result).IsNotNull();
+        await Assert.That(result!.Value.LeaderEpoch).IsEqualTo(7);
+    }
+
+    [Test]
     public async Task ConsumeBatch_EmptyBatch_YieldsNoRecords()
     {
         using var pending = PendingFetchData.Create("test-topic", 0, Array.Empty<RecordBatch>());
@@ -117,7 +133,12 @@ public class ConsumeBatchTests
     /// <summary>
     /// Creates a PendingFetchData with a single RecordBatch containing the specified number of records.
     /// </summary>
-    private static PendingFetchData CreatePendingFetchData(string topic, int partitionIndex, long baseOffset, int messageCount)
+    private static PendingFetchData CreatePendingFetchData(
+        string topic,
+        int partitionIndex,
+        long baseOffset,
+        int messageCount,
+        int leaderEpoch = -1)
     {
         var records = new Record[messageCount];
         for (var i = 0; i < messageCount; i++)
@@ -142,6 +163,7 @@ public class ConsumeBatchTests
         {
             BaseOffset = baseOffset,
             BaseTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            PartitionLeaderEpoch = leaderEpoch,
             Records = records,
         };
 
