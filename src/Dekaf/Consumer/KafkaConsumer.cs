@@ -73,6 +73,7 @@ internal sealed class PendingFetchData : IDisposable
     private int _recordIndex = -1;
     private int _disposed;
     private int _headerGeneration;
+    private bool _eagerParsed;
 
     public string Topic { get; private set; } = null!;
     public int PartitionIndex { get; private set; }
@@ -248,6 +249,9 @@ internal sealed class PendingFetchData : IDisposable
     /// </summary>
     public void EagerParseAll()
     {
+        if (_eagerParsed)
+            return;
+
         for (var i = 0; i < _batches.Count; i++)
         {
             if (_batches[i].Records is Protocol.Records.LazyRecordList lazyList)
@@ -255,6 +259,7 @@ internal sealed class PendingFetchData : IDisposable
                 lazyList.EnsureAllParsed();
             }
         }
+        _eagerParsed = true;
     }
 
     /// <summary>
@@ -413,6 +418,7 @@ internal sealed class PendingFetchData : IDisposable
         _currentRecordsArray = null;
         _currentRecords = null;
         _currentRecordsCount = 0;
+        _eagerParsed = false;
         unchecked
         {
             _headerGeneration++;
@@ -2283,10 +2289,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         {
             try
             {
-                await foreach (var result in ConsumeAsync(timeoutCts.Token).ConfigureAwait(false))
-                {
-                    return result;
-                }
+                return await ConsumeOneCoreAsync(timeoutCts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
             {
@@ -2300,10 +2303,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
 
         try
         {
-            await foreach (var result in ConsumeAsync(linkedCts.Token).ConfigureAwait(false))
-            {
-                return result;
-            }
+            return await ConsumeOneCoreAsync(linkedCts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
@@ -2312,6 +2312,212 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         }
 
         return null;
+    }
+
+    private async ValueTask<ConsumeResult<TKey, TValue>?> ConsumeOneCoreAsync(CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _consumerDisposed) != 0)
+            throw new ObjectDisposedException(nameof(KafkaConsumer<TKey, TValue>));
+
+        ThrowIfNotInitialized();
+
+        if (_options.OffsetCommitMode == OffsetCommitMode.Auto && _coordinator is not null)
+        {
+            await StartAutoCommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        var prefetchEnabled = _options.QueuedMinMessages > 1;
+        _prefetchEnabled = prefetchEnabled;
+        if (prefetchEnabled)
+        {
+            StartPrefetch(cancellationToken);
+        }
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            await EnsureAssignmentAsync(cancellationToken).ConfigureAwait(false);
+
+            if (_assignmentSnapshot.Count == 0)
+            {
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            if (_pendingFetches.Count == 0)
+            {
+                if (!await FillPendingFetchesForSingleConsumeAsync(prefetchEnabled, cancellationToken)
+                    .ConfigureAwait(false))
+                {
+                    return null;
+                }
+            }
+
+            if (TryConsumeOneFromPendingFetches(out var result))
+                return result;
+
+            if (_pendingEofEvents.TryDequeue(out var eofEvent))
+            {
+                return ConsumeResult<TKey, TValue>.CreatePartitionEof(
+                    eofEvent.Partition.Topic,
+                    eofEvent.Partition.Partition,
+                    eofEvent.Offset);
+            }
+        }
+
+        return null;
+    }
+
+    private async ValueTask<bool> FillPendingFetchesForSingleConsumeAsync(bool prefetchEnabled, CancellationToken cancellationToken)
+    {
+        if (!prefetchEnabled)
+        {
+            await FetchRecordsAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
+        if (_prefetchBuffer.TryRead(out var prefetched))
+        {
+            _pendingFetches.Enqueue(prefetched);
+            TrackPrefetchedBytes(prefetched, release: true);
+            DrainPrefetchBuffer();
+            return true;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        try
+        {
+            if (_prefetchBuffer.WaitToRead(_options.FetchMaxWaitMs, cancellationToken))
+            {
+                if (_prefetchBuffer.TryRead(out var fetched))
+                {
+                    _pendingFetches.Enqueue(fetched);
+                    TrackPrefetchedBytes(fetched, release: true);
+                    DrainPrefetchBuffer();
+                }
+                else
+                {
+                    System.Diagnostics.Debug.Fail("WaitToRead signalled data available but TryRead returned false");
+                }
+            }
+            else if (_prefetchBuffer.IsCompleted)
+            {
+                return false;
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Prefetch was not ready before FetchMaxWaitMs. The caller loop will check EOF and retry.
+        }
+
+        return true;
+    }
+
+    private bool TryConsumeOneFromPendingFetches(out ConsumeResult<TKey, TValue> result)
+    {
+        result = default!;
+
+        var metricsEnabled = Diagnostics.DekafMetrics.MessagesReceived.Enabled
+                             || Diagnostics.DekafMetrics.BytesReceived.Enabled;
+        var hasTraceListeners = Diagnostics.DekafDiagnostics.Source.HasListeners();
+        var hasInterceptors = _interceptors is not null;
+        var rawTrackingEnabled = _rawRecordTrackingEnabled;
+
+        while (_pendingFetches.Count > 0)
+        {
+            var pending = _pendingFetches.Peek();
+            long? batchProcessingStarted = _adaptiveFetchSizer is not null
+                ? System.Diagnostics.Stopwatch.GetTimestamp() : null;
+
+            pending.EagerParseAll();
+
+            System.Diagnostics.Activity? activity = null;
+            try
+            {
+                while (true)
+                {
+                    try
+                    {
+                        if (!pending.MoveNext())
+                            break;
+
+                        var record = pending.CurrentRecord;
+                        var offset = pending.CurrentBaseOffset + record.OffsetDelta;
+                        var timestampMs = pending.CurrentBaseTimestamp + record.TimestampDelta;
+                        var timestampType = pending.CurrentTimestampType;
+                        var messageBytes = (record.IsKeyNull ? 0 : record.Key.Length) +
+                                           (record.IsValueNull ? 0 : record.Value.Length);
+
+                        if (hasTraceListeners)
+                        {
+                            var headers = LazyConsumeHeaders.Create(
+                                record.Headers,
+                                record.HeaderCount,
+                                pending,
+                                pending.HeaderGeneration);
+                            activity = StartConsumeActivity(pending, headers, offset, messageBytes);
+                        }
+
+                        result = new ConsumeResult<TKey, TValue>(
+                            topic: pending.Topic,
+                            partition: pending.PartitionIndex,
+                            offset: offset,
+                            keyData: record.Key,
+                            isKeyNull: record.IsKeyNull,
+                            valueData: record.Value,
+                            isValueNull: record.IsValueNull,
+                            pooledHeaders: record.Headers,
+                            pooledHeaderCount: record.HeaderCount,
+                            headerOwner: pending,
+                            timestampMs: timestampMs,
+                            timestampType: timestampType,
+                            leaderEpoch: null,
+                            keyDeserializer: _keyDeserializer,
+                            valueDeserializer: _valueDeserializer);
+
+                        pending.TrackConsumed(offset, messageBytes);
+
+                        if (hasInterceptors)
+                            result = ApplyOnConsumeInterceptors(result);
+
+                        if (rawTrackingEnabled)
+                        {
+                            _currentRawKey = record.IsKeyNull ? ReadOnlyMemory<byte>.Empty : record.Key;
+                            _currentRawValue = record.IsValueNull ? ReadOnlyMemory<byte>.Empty : record.Value;
+                        }
+
+                        return true;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex) when (ex is InsufficientDataException or ArgumentOutOfRangeException or MalformedProtocolDataException)
+                    {
+                        LogRecordParsingError(ex, pending.Topic, pending.PartitionIndex);
+                        break;
+                    }
+                }
+            }
+            finally
+            {
+                activity?.Dispose();
+                FlushConsumedPositions(pending);
+
+                if (metricsEnabled && pending.MessageCount > 0)
+                    EmitFetchMetrics(pending);
+            }
+
+            if (batchProcessingStarted.HasValue)
+            {
+                var processingDuration = System.Diagnostics.Stopwatch.GetElapsedTime(batchProcessingStarted.Value);
+                _adaptiveFetchSizer!.ReportProcessingComplete(processingDuration);
+            }
+
+            _pendingFetches.Dequeue().Dispose();
+        }
+
+        return false;
     }
 
     public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
