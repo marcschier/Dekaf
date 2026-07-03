@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Reflection;
 using Dekaf.Consumer;
 using Dekaf.Protocol.Records;
@@ -250,6 +251,123 @@ public class MpscFetchBufferTests
         await Assert.That(act).Throws<OperationCanceledException>();
     }
 
+    [Test]
+    public async Task WaitToReadAsync_EmptyBuffer_ReturnsWithoutBlockingCaller()
+    {
+        var buffer = new MpscFetchBuffer(4);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        var elapsed = Stopwatch.StartNew();
+        var waitTask = buffer.WaitToReadAsync(30_000, cts.Token).AsTask();
+        elapsed.Stop();
+
+        await Assert.That(elapsed.Elapsed).IsLessThan(TimeSpan.FromSeconds(1));
+        await Assert.That(waitTask.IsCompleted).IsFalse();
+
+        await cts.CancelAsync();
+        await Assert.That(async () => await waitTask).Throws<OperationCanceledException>();
+    }
+
+    [Test]
+    public async Task WaitToReadAsync_Timeout_ReturnsFalseAndClearsWaiterState()
+    {
+        var buffer = new MpscFetchBuffer(4);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        var timedOut = await buffer.WaitToReadAsync(25, cts.Token).AsTask().WaitAsync(cts.Token);
+
+        await Assert.That(timedOut).IsFalse();
+        await Assert.That(GetConsumerWaiting(buffer)).IsEqualTo(0);
+        await Assert.That(GetDataAvailableWaiter(buffer)).IsNull();
+
+        var waitTask = buffer.WaitToReadAsync(30_000, cts.Token).AsTask();
+        await Assert.That(waitTask.IsCompleted).IsFalse();
+
+        buffer.Complete();
+
+        await Assert.That(await waitTask.WaitAsync(cts.Token)).IsFalse();
+        await Assert.That(GetConsumerWaiting(buffer)).IsEqualTo(0);
+        await Assert.That(GetDataAvailableWaiter(buffer)).IsNull();
+    }
+
+    [Test]
+    public async Task WaitToReadAsync_AlreadyCompletedWithError_ThrowsError()
+    {
+        var buffer = new MpscFetchBuffer(4);
+        var expectedException = new InvalidOperationException("test error");
+        buffer.Complete(expectedException);
+
+        await Assert.That(async () => await buffer.WaitToReadAsync(1000, CancellationToken.None))
+            .Throws<InvalidOperationException>()
+            .WithMessage("test error");
+    }
+
+    [Test]
+    public async Task WaitToReadAsync_CompletedWithErrorWhileWaiting_ThrowsError()
+    {
+        var buffer = new MpscFetchBuffer(4);
+        var expectedException = new InvalidOperationException("test error");
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        var waitTask = buffer.WaitToReadAsync(30_000, cts.Token).AsTask();
+        await Assert.That(waitTask.IsCompleted).IsFalse();
+
+        buffer.Complete(expectedException);
+
+        await Assert.That(async () => await waitTask.WaitAsync(cts.Token))
+            .Throws<InvalidOperationException>()
+            .WithMessage("test error");
+        await Assert.That(GetConsumerWaiting(buffer)).IsEqualTo(0);
+        await Assert.That(GetDataAvailableWaiter(buffer)).IsNull();
+    }
+
+    [Test]
+    public async Task WaitToReadAsync_DataArrivesAfterWait_ReturnsTrue()
+    {
+        var buffer = new MpscFetchBuffer(4);
+        var item = CreateDummy();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        var waitTask = buffer.WaitToReadAsync(30_000, cts.Token).AsTask();
+        await Assert.That(waitTask.IsCompleted).IsFalse();
+
+        await Assert.That(buffer.TryWrite(item)).IsTrue();
+
+        await Assert.That(await waitTask).IsTrue();
+        await Assert.That(buffer.TryRead(out var result)).IsTrue();
+        await Assert.That(result).IsEqualTo(item);
+
+        item.Dispose();
+    }
+
+    [Test]
+    public async Task WaitToReadAsync_ManyIdleBuffers_CompleteUnblocksAll()
+    {
+        const int BufferCount = 32;
+        var buffers = Enumerable.Range(0, BufferCount)
+            .Select(_ => new MpscFetchBuffer(4))
+            .ToArray();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        var elapsed = Stopwatch.StartNew();
+        var waitTasks = buffers
+            .Select(buffer => buffer.WaitToReadAsync(30_000, cts.Token).AsTask())
+            .ToArray();
+        elapsed.Stop();
+
+        await Assert.That(elapsed.Elapsed).IsLessThan(TimeSpan.FromSeconds(1));
+        await Assert.That(waitTasks.All(task => !task.IsCompleted)).IsTrue();
+
+        foreach (var buffer in buffers)
+        {
+            buffer.Complete();
+        }
+
+        var results = await Task.WhenAll(waitTasks).WaitAsync(cts.Token);
+
+        await Assert.That(results.All(result => !result)).IsTrue();
+    }
+
     #endregion
 
     #region Completion
@@ -445,5 +563,21 @@ public class MpscFetchBufferTests
             BindingFlags.NonPublic | BindingFlags.Instance)!;
         var semaphore = (SemaphoreSlim)field.GetValue(buffer)!;
         return semaphore.CurrentCount;
+    }
+
+    private static int GetConsumerWaiting(MpscFetchBuffer buffer)
+    {
+        var field = typeof(MpscFetchBuffer).GetField(
+            "_consumerWaiting",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (int)field.GetValue(buffer)!;
+    }
+
+    private static TaskCompletionSource<bool>? GetDataAvailableWaiter(MpscFetchBuffer buffer)
+    {
+        var field = typeof(MpscFetchBuffer).GetField(
+            "_dataAvailableWaiter",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (TaskCompletionSource<bool>?)field.GetValue(buffer);
     }
 }
