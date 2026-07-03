@@ -2220,6 +2220,250 @@ public sealed class AdminClient : IAdminClient
         }, cancellationToken).ConfigureAwait(false);
     }
 
+    public async ValueTask<IReadOnlyList<ClientQuotaDescription>> DescribeClientQuotasAsync(
+        IEnumerable<ClientQuotaFilterComponent> components,
+        DescribeClientQuotasOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var opts = options ?? new DescribeClientQuotasOptions();
+        var componentList = components
+            .Select(c => new DescribeClientQuotasComponent
+            {
+                EntityType = c.EntityType,
+                MatchType = (sbyte)c.MatchType,
+                Match = c.Match
+            })
+            .ToList();
+
+        return await WithRetryAsync<IReadOnlyList<ClientQuotaDescription>>(async () =>
+        {
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new DescribeClientQuotasRequest
+            {
+                Components = componentList,
+                Strict = opts.Strict
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.DescribeClientQuotas,
+                DescribeClientQuotasRequest.LowestSupportedVersion,
+                DescribeClientQuotasRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<DescribeClientQuotasRequest, DescribeClientQuotasResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response.ErrorCode != Protocol.ErrorCode.None)
+            {
+                throw new KafkaException(response.ErrorCode,
+                    $"DescribeClientQuotas failed: {response.ErrorMessage ?? response.ErrorCode.ToString()}");
+            }
+
+            return response.Entries.Select(e => new ClientQuotaDescription
+            {
+                Entity = e.Entity.Select(ToClientQuotaEntityComponent).ToList(),
+                Values = e.Values.ToDictionary(v => v.Key, v => v.Value)
+            }).ToList();
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<IReadOnlyList<AlterClientQuotaResult>> AlterClientQuotasAsync(
+        IEnumerable<ClientQuotaAlteration> alterations,
+        AlterClientQuotasOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var opts = options ?? new AlterClientQuotasOptions();
+        var entries = alterations.Select(a => new AlterClientQuotasEntry
+        {
+            Entity = a.Entity.Select(e => new AlterClientQuotasEntity
+            {
+                EntityType = e.EntityType,
+                EntityName = e.EntityName
+            }).ToList(),
+            Ops = a.Ops.Select(o => new AlterClientQuotasOp
+            {
+                Key = o.Key,
+                Value = o.Value,
+                Remove = o.Remove
+            }).ToList()
+        }).ToList();
+
+        return await WithRetryAsync<IReadOnlyList<AlterClientQuotaResult>>(async () =>
+        {
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new AlterClientQuotasRequest
+            {
+                Entries = entries,
+                ValidateOnly = opts.ValidateOnly
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.AlterClientQuotas,
+                AlterClientQuotasRequest.LowestSupportedVersion,
+                AlterClientQuotasRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<AlterClientQuotasRequest, AlterClientQuotasResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            return response.Entries.Select(e => new AlterClientQuotaResult
+            {
+                ErrorCode = e.ErrorCode,
+                ErrorMessage = e.ErrorMessage,
+                Entity = e.Entity.Select(ToClientQuotaEntityComponent).ToList()
+            }).ToList();
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<IReadOnlyDictionary<string, UpdateFeatureResultInfo>> UpdateFeaturesAsync(
+        IEnumerable<FeatureUpdate> featureUpdates,
+        UpdateFeaturesOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var opts = options ?? new UpdateFeaturesOptions();
+        var updates = featureUpdates.Select(f => new UpdateFeaturesFeatureUpdate
+        {
+            Feature = f.Feature,
+            MaxVersionLevel = f.MaxVersionLevel,
+            UpgradeType = (sbyte)f.UpgradeType
+        }).ToList();
+
+        return await WithRetryAsync<IReadOnlyDictionary<string, UpdateFeatureResultInfo>>(async () =>
+        {
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new UpdateFeaturesRequest
+            {
+                TimeoutMs = opts.TimeoutMs,
+                FeatureUpdates = updates,
+                ValidateOnly = opts.ValidateOnly
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.UpdateFeatures,
+                UpdateFeaturesRequest.LowestSupportedVersion,
+                UpdateFeaturesRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<UpdateFeaturesRequest, UpdateFeaturesResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response.ErrorCode != Protocol.ErrorCode.None)
+            {
+                throw new KafkaException(response.ErrorCode,
+                    $"UpdateFeatures failed: {response.ErrorMessage ?? response.ErrorCode.ToString()}");
+            }
+
+            return response.Results.ToDictionary(r => r.Feature, r => new UpdateFeatureResultInfo
+            {
+                Feature = r.Feature,
+                ErrorCode = r.ErrorCode,
+                ErrorMessage = r.ErrorMessage
+            });
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<IReadOnlyList<LogDirDescription>> DescribeLogDirsAsync(
+        IEnumerable<TopicPartition>? partitions = null,
+        DescribeLogDirsOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        _ = options;
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        IReadOnlyList<DescribeLogDirsTopic>? topics = null;
+        if (partitions is not null)
+        {
+            var partitionList = partitions.ToList();
+            if (partitionList.Count > 0)
+            {
+                topics = partitionList
+                    .GroupBy(p => p.Topic)
+                    .Select(g => new DescribeLogDirsTopic
+                    {
+                        Topic = g.Key,
+                        Partitions = g.Select(p => p.Partition).ToList()
+                    })
+                    .ToList();
+            }
+        }
+
+        return await WithRetryAsync<IReadOnlyList<LogDirDescription>>(async () =>
+        {
+            // DescribeLogDirs should fan out to all brokers because log dirs are broker-local.
+            // Use the controller until per-broker integration coverage is available.
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new DescribeLogDirsRequest
+            {
+                Topics = topics
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.DescribeLogDirs,
+                DescribeLogDirsRequest.LowestSupportedVersion,
+                DescribeLogDirsRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<DescribeLogDirsRequest, DescribeLogDirsResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response.ErrorCode != Protocol.ErrorCode.None)
+            {
+                throw new KafkaException(response.ErrorCode, $"DescribeLogDirs failed: {response.ErrorCode}");
+            }
+
+            return response.Results.Select(r => new LogDirDescription
+            {
+                ErrorCode = r.ErrorCode,
+                LogDir = r.LogDir,
+                Topics = r.Topics.Select(t => new LogDirTopicDescription
+                {
+                    Name = t.Name,
+                    Partitions = t.Partitions.Select(p => new LogDirPartitionDescription
+                    {
+                        PartitionIndex = p.PartitionIndex,
+                        PartitionSize = p.PartitionSize,
+                        OffsetLag = p.OffsetLag,
+                        IsFutureKey = p.IsFutureKey
+                    }).ToList()
+                }).ToList(),
+                TotalBytes = r.TotalBytes,
+                UsableBytes = r.UsableBytes
+            }).ToList();
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static ClientQuotaEntityComponent ToClientQuotaEntityComponent(DescribeClientQuotasEntity entity)
+    {
+        return new ClientQuotaEntityComponent
+        {
+            EntityType = entity.EntityType,
+            EntityName = entity.EntityName
+        };
+    }
+
+    private static ClientQuotaEntityComponent ToClientQuotaEntityComponent(AlterClientQuotasResponseEntity entity)
+    {
+        return new ClientQuotaEntityComponent
+        {
+            EntityType = entity.EntityType,
+            EntityName = entity.EntityName
+        };
+    }
+
     public async ValueTask<IReadOnlyDictionary<string, ShareGroupDescription>> DescribeShareGroupsAsync(
         IEnumerable<string> groupIds,
         CancellationToken cancellationToken = default)

@@ -283,6 +283,38 @@ public interface IAdminClient : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Describes client quota entities matching the supplied filter components.
+    /// </summary>
+    ValueTask<IReadOnlyList<ClientQuotaDescription>> DescribeClientQuotasAsync(
+        IEnumerable<ClientQuotaFilterComponent> components,
+        DescribeClientQuotasOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Alters client quota values for one or more quota entities.
+    /// </summary>
+    ValueTask<IReadOnlyList<AlterClientQuotaResult>> AlterClientQuotasAsync(
+        IEnumerable<ClientQuotaAlteration> alterations,
+        AlterClientQuotasOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Updates finalized feature levels.
+    /// </summary>
+    ValueTask<IReadOnlyDictionary<string, UpdateFeatureResultInfo>> UpdateFeaturesAsync(
+        IEnumerable<FeatureUpdate> featureUpdates,
+        UpdateFeaturesOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Describes broker log directories for the supplied topic partitions, or all partitions when null.
+    /// </summary>
+    ValueTask<IReadOnlyList<LogDirDescription>> DescribeLogDirsAsync(
+        IEnumerable<TopicPartition>? partitions = null,
+        DescribeLogDirsOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Describes share groups.
     /// </summary>
     ValueTask<IReadOnlyDictionary<string, ShareGroupDescription>> DescribeShareGroupsAsync(
@@ -725,6 +757,165 @@ public sealed class OngoingPartitionReassignmentInfo
     /// The replicas being removed as part of this reassignment.
     /// </summary>
     public required IReadOnlyList<int> RemovingReplicas { get; init; }
+}
+
+/// <summary>
+/// How a client quota entity filter component should match.
+/// </summary>
+public enum ClientQuotaMatchType : sbyte
+{
+    ExactName = 0,
+    DefaultName = 1,
+    AnySpecifiedName = 2
+}
+
+/// <summary>
+/// A client quota entity filter component.
+/// </summary>
+public sealed class ClientQuotaFilterComponent
+{
+    public required string EntityType { get; init; }
+    public ClientQuotaMatchType MatchType { get; init; }
+    public string? Match { get; init; }
+}
+
+/// <summary>
+/// Options for DescribeClientQuotas.
+/// </summary>
+public sealed class DescribeClientQuotasOptions
+{
+    public bool Strict { get; init; }
+}
+
+/// <summary>
+/// A client quota entity component.
+/// </summary>
+public sealed class ClientQuotaEntityComponent
+{
+    public required string EntityType { get; init; }
+    public string? EntityName { get; init; }
+}
+
+/// <summary>
+/// Describes quota values for a client quota entity.
+/// </summary>
+public sealed class ClientQuotaDescription
+{
+    public required IReadOnlyList<ClientQuotaEntityComponent> Entity { get; init; }
+    public required IReadOnlyDictionary<string, double> Values { get; init; }
+}
+
+/// <summary>
+/// A quota operation to apply to a client quota entity.
+/// </summary>
+public sealed class ClientQuotaOperation
+{
+    public required string Key { get; init; }
+    public double Value { get; init; }
+    public bool Remove { get; init; }
+}
+
+/// <summary>
+/// A set of quota operations for a client quota entity.
+/// </summary>
+public sealed class ClientQuotaAlteration
+{
+    public required IReadOnlyList<ClientQuotaEntityComponent> Entity { get; init; }
+    public required IReadOnlyList<ClientQuotaOperation> Ops { get; init; }
+}
+
+/// <summary>
+/// Options for AlterClientQuotas.
+/// </summary>
+public sealed class AlterClientQuotasOptions
+{
+    public bool ValidateOnly { get; init; }
+}
+
+/// <summary>
+/// Result for a client quota alteration.
+/// </summary>
+public sealed class AlterClientQuotaResult
+{
+    public Protocol.ErrorCode ErrorCode { get; init; }
+    public string? ErrorMessage { get; init; }
+    public required IReadOnlyList<ClientQuotaEntityComponent> Entity { get; init; }
+}
+
+/// <summary>
+/// Type of finalized feature update to perform.
+/// </summary>
+public enum FeatureUpgradeType : sbyte
+{
+    UpgradeOnly = 1,
+    SafeDowngrade = 2,
+    UnsafeDowngrade = 3
+}
+
+/// <summary>
+/// A finalized feature level update.
+/// </summary>
+public sealed class FeatureUpdate
+{
+    public required string Feature { get; init; }
+    public short MaxVersionLevel { get; init; }
+    public FeatureUpgradeType UpgradeType { get; init; } = FeatureUpgradeType.UpgradeOnly;
+}
+
+/// <summary>
+/// Options for UpdateFeatures.
+/// </summary>
+public sealed class UpdateFeaturesOptions
+{
+    public int TimeoutMs { get; init; } = 60000;
+    public bool ValidateOnly { get; init; }
+}
+
+/// <summary>
+/// Result for a finalized feature update.
+/// </summary>
+public sealed class UpdateFeatureResultInfo
+{
+    public required string Feature { get; init; }
+    public Protocol.ErrorCode ErrorCode { get; init; }
+    public string? ErrorMessage { get; init; }
+}
+
+/// <summary>
+/// Options for DescribeLogDirs.
+/// </summary>
+public sealed class DescribeLogDirsOptions;
+
+/// <summary>
+/// Description of a broker log directory.
+/// </summary>
+public sealed class LogDirDescription
+{
+    public Protocol.ErrorCode ErrorCode { get; init; }
+    public required string LogDir { get; init; }
+    public required IReadOnlyList<LogDirTopicDescription> Topics { get; init; }
+    public long TotalBytes { get; init; }
+    public long UsableBytes { get; init; }
+}
+
+/// <summary>
+/// Topic data stored in a broker log directory.
+/// </summary>
+public sealed class LogDirTopicDescription
+{
+    public required string Name { get; init; }
+    public required IReadOnlyList<LogDirPartitionDescription> Partitions { get; init; }
+}
+
+/// <summary>
+/// Partition data stored in a broker log directory.
+/// </summary>
+public sealed class LogDirPartitionDescription
+{
+    public int PartitionIndex { get; init; }
+    public long PartitionSize { get; init; }
+    public long OffsetLag { get; init; }
+    public bool IsFutureKey { get; init; }
 }
 
 /// <summary>
