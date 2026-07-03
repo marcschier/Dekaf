@@ -258,6 +258,37 @@ public interface IAdminClient : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Creates a delegation token.
+    /// </summary>
+    ValueTask<DelegationTokenInfo> CreateDelegationTokenAsync(
+        CreateDelegationTokenOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Renews a delegation token and returns its new expiry timestamp in milliseconds.
+    /// </summary>
+    ValueTask<long> RenewDelegationTokenAsync(
+        byte[] hmac,
+        RenewDelegationTokenOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Expires a delegation token and returns its expiry timestamp in milliseconds.
+    /// </summary>
+    ValueTask<long> ExpireDelegationTokenAsync(
+        byte[] hmac,
+        ExpireDelegationTokenOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Describes delegation tokens for the supplied owners, or all tokens when owners is null.
+    /// </summary>
+    ValueTask<IReadOnlyList<DelegationTokenInfo>> DescribeDelegationTokenAsync(
+        IEnumerable<DelegationTokenPrincipal>? owners = null,
+        DescribeDelegationTokenOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Reassigns partition replicas across brokers (KIP-455). A null replica list for a
     /// partition cancels an ongoing reassignment for that partition.
     /// </summary>
@@ -688,6 +719,71 @@ public sealed class ElectLeadersResultInfo
     /// Error message, if any.
     /// </summary>
     public string? ErrorMessage { get; init; }
+}
+
+/// <summary>
+/// Kafka principal used by delegation token admin APIs.
+/// </summary>
+public sealed class DelegationTokenPrincipal
+{
+    public required string PrincipalType { get; init; }
+
+    public required string PrincipalName { get; init; }
+}
+
+/// <summary>
+/// Options for CreateDelegationToken.
+/// </summary>
+public sealed class CreateDelegationTokenOptions
+{
+    public DelegationTokenPrincipal? Owner { get; init; }
+
+    public IReadOnlyList<DelegationTokenPrincipal> Renewers { get; init; } = [];
+
+    public long MaxLifetimeMs { get; init; } = -1;
+}
+
+/// <summary>
+/// Options for RenewDelegationToken.
+/// </summary>
+public sealed class RenewDelegationTokenOptions
+{
+    public long RenewPeriodMs { get; init; } = -1;
+}
+
+/// <summary>
+/// Options for ExpireDelegationToken.
+/// </summary>
+public sealed class ExpireDelegationTokenOptions
+{
+    public long ExpiryTimePeriodMs { get; init; } = -1;
+}
+
+/// <summary>
+/// Options for DescribeDelegationToken.
+/// </summary>
+public sealed class DescribeDelegationTokenOptions;
+
+/// <summary>
+/// Delegation token metadata.
+/// </summary>
+public sealed class DelegationTokenInfo
+{
+    public required DelegationTokenPrincipal Owner { get; init; }
+
+    public required DelegationTokenPrincipal TokenRequester { get; init; }
+
+    public long IssueTimestampMs { get; init; }
+
+    public long ExpiryTimestampMs { get; init; }
+
+    public long MaxTimestampMs { get; init; }
+
+    public required string TokenId { get; init; }
+
+    public required byte[] Hmac { get; init; }
+
+    public required IReadOnlyList<DelegationTokenPrincipal> Renewers { get; init; }
 }
 
 /// <summary>

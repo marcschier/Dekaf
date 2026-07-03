@@ -1916,6 +1916,226 @@ public sealed class AdminClient : IAdminClient
         }, cancellationToken).ConfigureAwait(false);
     }
 
+    public async ValueTask<DelegationTokenInfo> CreateDelegationTokenAsync(
+        CreateDelegationTokenOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var opts = options ?? new CreateDelegationTokenOptions();
+        var renewers = opts.Renewers.Select(ToDelegationTokenPrincipalData).ToList();
+
+        return await WithRetryAsync(async () =>
+        {
+            // Delegation-token requests may target any broker; use the controller connection.
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new CreateDelegationTokenRequest
+            {
+                OwnerPrincipalType = opts.Owner?.PrincipalType,
+                OwnerPrincipalName = opts.Owner?.PrincipalName,
+                Renewers = renewers,
+                MaxLifetimeMs = opts.MaxLifetimeMs
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.CreateDelegationToken,
+                CreateDelegationTokenRequest.LowestSupportedVersion,
+                CreateDelegationTokenRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<CreateDelegationTokenRequest, CreateDelegationTokenResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response.ErrorCode != Protocol.ErrorCode.None)
+            {
+                throw KafkaException.FromErrorCode(response.ErrorCode,
+                    $"CreateDelegationToken failed: {response.ErrorCode}");
+            }
+
+            return ToDelegationTokenInfo(response);
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<long> RenewDelegationTokenAsync(
+        byte[] hmac,
+        RenewDelegationTokenOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(hmac);
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var opts = options ?? new RenewDelegationTokenOptions();
+        var hmacCopy = hmac.ToArray();
+
+        return await WithRetryAsync(async () =>
+        {
+            // Delegation-token requests may target any broker; use the controller connection.
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new RenewDelegationTokenRequest
+            {
+                Hmac = hmacCopy,
+                RenewPeriodMs = opts.RenewPeriodMs
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.RenewDelegationToken,
+                RenewDelegationTokenRequest.LowestSupportedVersion,
+                RenewDelegationTokenRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<RenewDelegationTokenRequest, RenewDelegationTokenResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response.ErrorCode != Protocol.ErrorCode.None)
+            {
+                throw KafkaException.FromErrorCode(response.ErrorCode,
+                    $"RenewDelegationToken failed: {response.ErrorCode}");
+            }
+
+            return response.ExpiryTimestampMs;
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<long> ExpireDelegationTokenAsync(
+        byte[] hmac,
+        ExpireDelegationTokenOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(hmac);
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var opts = options ?? new ExpireDelegationTokenOptions();
+        var hmacCopy = hmac.ToArray();
+
+        return await WithRetryAsync(async () =>
+        {
+            // Delegation-token requests may target any broker; use the controller connection.
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new ExpireDelegationTokenRequest
+            {
+                Hmac = hmacCopy,
+                ExpiryTimePeriodMs = opts.ExpiryTimePeriodMs
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.ExpireDelegationToken,
+                ExpireDelegationTokenRequest.LowestSupportedVersion,
+                ExpireDelegationTokenRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<ExpireDelegationTokenRequest, ExpireDelegationTokenResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response.ErrorCode != Protocol.ErrorCode.None)
+            {
+                throw KafkaException.FromErrorCode(response.ErrorCode,
+                    $"ExpireDelegationToken failed: {response.ErrorCode}");
+            }
+
+            return response.ExpiryTimestampMs;
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<IReadOnlyList<DelegationTokenInfo>> DescribeDelegationTokenAsync(
+        IEnumerable<DelegationTokenPrincipal>? owners = null,
+        DescribeDelegationTokenOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        _ = options;
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var ownerList = owners?.Select(ToDelegationTokenPrincipalData).ToList();
+
+        return await WithRetryAsync<IReadOnlyList<DelegationTokenInfo>>(async () =>
+        {
+            // Delegation-token requests may target any broker; use the controller connection.
+            var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
+
+            var request = new DescribeDelegationTokenRequest
+            {
+                Owners = ownerList
+            };
+
+            var apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                Protocol.ApiKey.DescribeDelegationToken,
+                DescribeDelegationTokenRequest.LowestSupportedVersion,
+                DescribeDelegationTokenRequest.HighestSupportedVersion);
+
+            var response = await controller.SendAsync<DescribeDelegationTokenRequest, DescribeDelegationTokenResponse>(
+                request,
+                apiVersion,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response.ErrorCode != Protocol.ErrorCode.None)
+            {
+                throw KafkaException.FromErrorCode(response.ErrorCode,
+                    $"DescribeDelegationToken failed: {response.ErrorCode}");
+            }
+
+            return response.Tokens.Select(ToDelegationTokenInfo).ToList();
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static DelegationTokenPrincipalData ToDelegationTokenPrincipalData(DelegationTokenPrincipal principal)
+    {
+        return new DelegationTokenPrincipalData
+        {
+            PrincipalType = principal.PrincipalType,
+            PrincipalName = principal.PrincipalName
+        };
+    }
+
+    private static DelegationTokenPrincipal ToDelegationTokenPrincipal(string principalType, string principalName)
+    {
+        return new DelegationTokenPrincipal
+        {
+            PrincipalType = principalType,
+            PrincipalName = principalName
+        };
+    }
+
+    private static DelegationTokenInfo ToDelegationTokenInfo(CreateDelegationTokenResponse response)
+    {
+        return new DelegationTokenInfo
+        {
+            Owner = ToDelegationTokenPrincipal(response.PrincipalType, response.PrincipalName),
+            TokenRequester = ToDelegationTokenPrincipal(
+                response.TokenRequesterPrincipalType,
+                response.TokenRequesterPrincipalName),
+            IssueTimestampMs = response.IssueTimestampMs,
+            ExpiryTimestampMs = response.ExpiryTimestampMs,
+            MaxTimestampMs = response.MaxTimestampMs,
+            TokenId = response.TokenId,
+            Hmac = response.Hmac,
+            Renewers = []
+        };
+    }
+
+    private static DelegationTokenInfo ToDelegationTokenInfo(DescribedDelegationToken token)
+    {
+        return new DelegationTokenInfo
+        {
+            Owner = ToDelegationTokenPrincipal(token.PrincipalType, token.PrincipalName),
+            TokenRequester = ToDelegationTokenPrincipal(
+                token.TokenRequesterPrincipalType,
+                token.TokenRequesterPrincipalName),
+            IssueTimestampMs = token.IssueTimestampMs,
+            ExpiryTimestampMs = token.ExpiryTimestampMs,
+            MaxTimestampMs = token.MaxTimestampMs,
+            TokenId = token.TokenId,
+            Hmac = token.Hmac,
+            Renewers = token.Renewers
+                .Select(r => ToDelegationTokenPrincipal(r.PrincipalType, r.PrincipalName))
+                .ToList()
+        };
+    }
+
     public async ValueTask<IReadOnlyDictionary<string, TransactionDescription>> DescribeTransactionsAsync(
         IEnumerable<string> transactionalIds,
         DescribeTransactionsOptions? options = null,
