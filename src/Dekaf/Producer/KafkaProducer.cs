@@ -1293,49 +1293,68 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
             throw NoUsablePartitionsException(message.Topic, topicInfo);
         }
 
-        // Serialize key and value to pooled memory (returned to pool when batch completes)
-        var keyIsNull = message.Key is null;
-        var key = keyIsNull ? PooledMemory.Null : SerializeKeyToPooled(message.Key!, message.Topic, message.Headers);
-        var valueIsNull = message.Value is null;
-        var value = valueIsNull ? PooledMemory.Null : SerializeValueToPooled(message.Value!, message.Topic, message.Headers);
-
-        // Determine partition
-        var partition = ResolvePartition(
-            message.Topic,
-            message.Partition,
-            key.Span,
-            keyIsNull,
-            topicInfo.PartitionCount);
-        var batchCompletionPartitionCount = message.Partition is null && keyIsNull
-            ? topicInfo.PartitionCount
-            : 0;
-
-        // Get timestamp
-        var timestamp = message.Timestamp ?? DateTimeOffset.UtcNow;
-        var timestampMs = timestamp.ToUnixTimeMilliseconds();
-
-        // Convert headers with minimal allocations
+        var key = PooledMemory.Null;
+        var value = PooledMemory.Null;
         Header[]? pooledHeaderArray = null;
-        var headerCount = 0;
-        if (message.Headers is not null && message.Headers.Count > 0)
+        var ownershipTransferred = false;
+        try
         {
-            RentAndFillHeaders(message.Headers, out pooledHeaderArray, out headerCount);
-        }
+            // Serialize key and value to pooled memory (returned to pool when batch completes)
+            var keyIsNull = message.Key is null;
+            key = keyIsNull ? PooledMemory.Null : SerializeKeyToPooled(message.Key!, message.Topic, message.Headers);
+            var valueIsNull = message.Value is null;
+            value = valueIsNull ? PooledMemory.Null : SerializeValueToPooled(message.Value!, message.Topic, message.Headers);
 
-        // Enqueue to per-partition-affine worker instead of calling AppendAsync inline.
-        // The worker will call AppendAsync and set the completion source on success/failure.
-        _accumulator.EnqueueAppend(
-            message.Topic,
-            partition,
-            timestampMs,
-            key,
-            value,
-            pooledHeaderArray,
-            headerCount,
-            completion,
-            cancellationToken,
-            partitionCount: batchCompletionPartitionCount,
-            cachePartitionCount: topicInfo.PartitionCount);
+            // Determine partition
+            var partition = ResolvePartition(
+                message.Topic,
+                message.Partition,
+                key.Span,
+                keyIsNull,
+                topicInfo.PartitionCount);
+            var batchCompletionPartitionCount = message.Partition is null && keyIsNull
+                ? topicInfo.PartitionCount
+                : 0;
+
+            // Get timestamp
+            var timestamp = message.Timestamp ?? DateTimeOffset.UtcNow;
+            var timestampMs = timestamp.ToUnixTimeMilliseconds();
+
+            // Convert headers with minimal allocations
+            var headerCount = 0;
+            if (message.Headers is not null && message.Headers.Count > 0)
+            {
+                RentAndFillHeaders(message.Headers, out pooledHeaderArray, out headerCount);
+            }
+
+            // Enqueue to per-partition-affine worker instead of calling AppendAsync inline.
+            // The worker will call AppendAsync and set the completion source on success/failure.
+            _accumulator.EnqueueAppend(
+                message.Topic,
+                partition,
+                timestampMs,
+                key,
+                value,
+                pooledHeaderArray,
+                headerCount,
+                completion,
+                cancellationToken,
+                partitionCount: batchCompletionPartitionCount,
+                cachePartitionCount: topicInfo.PartitionCount);
+
+            ownershipTransferred = true;
+        }
+        catch
+        {
+            if (!ownershipTransferred)
+            {
+                key.Return();
+                value.Return();
+                RecordAccumulator.ReturnPooledHeaders(pooledHeaderArray);
+            }
+
+            throw;
+        }
     }
 
     public ValueTask<RecordMetadata> ProduceAsync(

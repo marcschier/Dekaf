@@ -187,6 +187,88 @@ public class KafkaProducerFastPathTests
         await Assert.That(GetPartitionDequeCount(producer.RecordAccumulator)).IsEqualTo(0);
     }
 
+    [Test]
+    public async Task ProduceInternalAsync_InvalidExplicitPartition_FaultsBeforeAccumulatorAppend()
+    {
+        var options = new ProducerOptions
+        {
+            BootstrapServers = ["localhost:9092"],
+            ClientId = "test-producer",
+            BufferMemory = ulong.MaxValue,
+            BatchSize = 4096,
+            LingerMs = 10,
+            RequestTimeoutMs = 500,
+            DeliveryTimeoutMs = 1000,
+            CloseTimeoutMs = 1000
+        };
+
+        await using var producer = new KafkaProducer<string, string>(
+            options,
+            Serializers.String,
+            Serializers.String);
+        await StopProducerBackgroundLoopsAsync(producer);
+        SeedProducerMetadata(producer);
+        SetInstanceField(producer, "_initialized", true);
+        await using var pool = new ValueTaskSourcePool<RecordMetadata>();
+        var completion = pool.Rent();
+
+        var exception = await CaptureProduceExceptionAsync(() => InvokeProduceInternalAsync(
+            producer,
+            new ProducerMessage<string, string>
+            {
+                Topic = Topic,
+                Key = "key",
+                Value = "value",
+                Partition = -1
+            },
+            completion));
+
+        await Assert.That(exception.Topic).IsEqualTo(Topic);
+        await Assert.That(exception.Partition).IsEqualTo(-1);
+        await Assert.That(GetPartitionDequeCount(producer.RecordAccumulator)).IsEqualTo(0);
+    }
+
+    [Test]
+    public async Task ProduceInternalAsync_InvalidPartitionerResult_FaultsBeforeAccumulatorAppend()
+    {
+        var options = new ProducerOptions
+        {
+            BootstrapServers = ["localhost:9092"],
+            ClientId = "test-producer",
+            BufferMemory = ulong.MaxValue,
+            BatchSize = 4096,
+            LingerMs = 10,
+            RequestTimeoutMs = 500,
+            DeliveryTimeoutMs = 1000,
+            CloseTimeoutMs = 1000,
+            CustomPartitioner = new FixedPartitioner(int.MaxValue)
+        };
+
+        await using var producer = new KafkaProducer<string, string>(
+            options,
+            Serializers.String,
+            Serializers.String);
+        await StopProducerBackgroundLoopsAsync(producer);
+        SeedProducerMetadata(producer);
+        SetInstanceField(producer, "_initialized", true);
+        await using var pool = new ValueTaskSourcePool<RecordMetadata>();
+        var completion = pool.Rent();
+
+        var exception = await CaptureProduceExceptionAsync(() => InvokeProduceInternalAsync(
+            producer,
+            new ProducerMessage<string, string>
+            {
+                Topic = Topic,
+                Key = "key",
+                Value = "value"
+            },
+            completion));
+
+        await Assert.That(exception.Topic).IsEqualTo(Topic);
+        await Assert.That(exception.Partition).IsEqualTo(int.MaxValue);
+        await Assert.That(GetPartitionDequeCount(producer.RecordAccumulator)).IsEqualTo(0);
+    }
+
     private static TopicInfo CreateTopicInfo() => new()
     {
         Name = Topic,
@@ -264,6 +346,29 @@ public class KafkaProducerFastPathTests
         }
     }
 
+    private static ValueTask InvokeProduceInternalAsync(
+        KafkaProducer<string, string> producer,
+        ProducerMessage<string, string> message,
+        PooledValueTaskSource<RecordMetadata> completion)
+    {
+        var method = typeof(KafkaProducer<string, string>).GetMethod(
+            "ProduceInternalAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance,
+            binder: null,
+            [typeof(ProducerMessage<string, string>), typeof(PooledValueTaskSource<RecordMetadata>), typeof(CancellationToken)],
+            modifiers: null);
+
+        try
+        {
+            return (ValueTask)method!.Invoke(producer, [message, completion, CancellationToken.None])!;
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is not null)
+        {
+            ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+            throw;
+        }
+    }
+
     private static ReadyBatch CompleteCurrentBatch(RecordAccumulator accumulator, TopicPartition topicPartition)
     {
         var deques = GetInstanceField<object>(accumulator, "_partitionDeques");
@@ -300,6 +405,20 @@ public class KafkaProducerFastPathTests
         try
         {
             _ = await action().ConfigureAwait(false);
+        }
+        catch (ProduceException ex)
+        {
+            return ex;
+        }
+
+        throw new InvalidOperationException("Expected ProduceException was not thrown.");
+    }
+
+    private static async Task<ProduceException> CaptureProduceExceptionAsync(Func<ValueTask> action)
+    {
+        try
+        {
+            await action().ConfigureAwait(false);
         }
         catch (ProduceException ex)
         {
