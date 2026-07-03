@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Reflection;
 using Dekaf.Producer;
 using Dekaf.Protocol.Records;
 using Dekaf.Tests.Unit;
@@ -49,6 +50,43 @@ public class AppendWorkerAffinityTests
     private static int GetDequeCount(object deques)
     {
         return (int)deques.GetType().GetProperty("Count")!.GetValue(deques)!;
+    }
+
+    [Test]
+    public async Task GetOrCreateDeque_RoundRobinPartitions_CachesPerTopicArray()
+    {
+        var options = CreateTestOptions();
+        var accumulator = new RecordAccumulator(options);
+
+        var cacheField = typeof(RecordAccumulator).GetField(
+            "t_cache",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        cacheField.SetValue(null, null);
+
+        var getOrCreateDeque = typeof(RecordAccumulator).GetMethod(
+            "GetOrCreateDeque",
+            BindingFlags.NonPublic | BindingFlags.Instance,
+            binder: null,
+            [typeof(string), typeof(int), typeof(int)],
+            modifiers: null)
+            ?? throw new InvalidOperationException("GetOrCreateDeque overload not found.");
+
+        var first = getOrCreateDeque.Invoke(accumulator, ["test-topic", 0, 4]);
+        var second = getOrCreateDeque.Invoke(accumulator, ["test-topic", 1, 4]);
+        var firstAgain = getOrCreateDeque.Invoke(accumulator, ["test-topic", 0, 4]);
+
+        var cache = cacheField.GetValue(null)
+            ?? throw new InvalidOperationException("Accumulator thread cache not initialized.");
+        var cachedTopic = (string?)cache.GetType().GetField("CachedTopic")!.GetValue(cache);
+        var cachedDeques = (Array?)cache.GetType().GetField("CachedTopicDeques")!.GetValue(cache);
+
+        await Assert.That(firstAgain).IsSameReferenceAs(first);
+        await Assert.That(cachedTopic).IsEqualTo("test-topic");
+        await Assert.That(cachedDeques).IsNotNull();
+        await Assert.That(cachedDeques!.GetValue(0)).IsSameReferenceAs(first);
+        await Assert.That(cachedDeques.GetValue(1)).IsSameReferenceAs(second);
+
+        await accumulator.DisposeAsync();
     }
 
     [Test]

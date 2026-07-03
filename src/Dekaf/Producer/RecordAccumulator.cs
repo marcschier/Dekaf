@@ -1863,9 +1863,8 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
 
     // Single thread-local cache consolidating all per-thread deque lookup state.
     // Reduces 3 separate [ThreadStatic] lookups to 1.
-    // Per-thread one-slot cache for GetOrCreateDeque to avoid ConcurrentDictionary hash+lookup
-    // on every message. The cache stores (accumulator instance, TopicPartition, PartitionDeque).
-    // Hit rate is high in partition-affine append workers and single-partition scenarios.
+    // Per-thread topic cache for GetOrCreateDeque to avoid ConcurrentDictionary hash+lookup
+    // when a thread rotates through partitions of the same topic.
     // Note: holds a strong reference to the accumulator until the thread reuses the cache slot.
     // This is acceptable because producers are typically singleton-lifetime objects.
     // IMPORTANT: This cache is only valid because _partitionDeques never removes entries.
@@ -1880,40 +1879,85 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
     private sealed class AccumulatorThreadCache
     {
         public RecordAccumulator? CachedAccumulator;
-        public TopicPartition CachedTopicPartition;
-        public PartitionDeque? CachedDeque;
+        public string? CachedTopic;
+        public PartitionDeque?[]? CachedTopicDeques;
     }
 
     /// <summary>
     /// Gets or creates the PartitionDeque for a topic-partition pair.
-    /// Uses a per-thread one-slot cache to avoid ConcurrentDictionary lookup when the
-    /// same thread repeatedly accesses the same partition (common in append workers).
+    /// Uses a per-thread topic cache to avoid ConcurrentDictionary lookup when the
+    /// same thread rotates through partitions of one topic.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private PartitionDeque GetOrCreateDeque(string topic, int partition)
+    private PartitionDeque GetOrCreateDeque(string topic, int partition, int partitionCount)
+    {
+        var cache = t_cache ??= new AccumulatorThreadCache();
+        var cachedTopic = cache.CachedTopic;
+        var cachedDeques = cache.CachedTopicDeques;
+
+        if (cache.CachedAccumulator == this &&
+            Volatile.Read(ref _disposed) == 0 &&
+            TopicMatches(cachedTopic, topic) &&
+            cachedDeques is not null &&
+            (uint)partition < (uint)cachedDeques.Length &&
+            cachedDeques[partition] is { } cached)
+        {
+            return cached;
+        }
+
+        return GetOrCreateDequeSlow(topic, partition, partitionCount, cache);
+    }
+
+    private PartitionDeque GetOrCreateDeque(string topic, int partition) =>
+        GetOrCreateDeque(topic, partition, partition + 1);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private PartitionDeque GetOrCreateDequeSlow(
+        string topic,
+        int partition,
+        int partitionCount,
+        AccumulatorThreadCache cache)
     {
         var tp = new TopicPartition(topic, partition);
-
-        // Fast path: check thread-local cache (skip if disposed to avoid serving stale data)
-        var cache = t_cache ??= new AccumulatorThreadCache();
-        if (cache.CachedAccumulator == this && Volatile.Read(ref _disposed) == 0 && cache.CachedTopicPartition == tp && cache.CachedDeque is { } cached)
-            return cached;
-
-        return GetOrCreateDequeSlow(tp, cache);
+        var deque = _partitionDeques.GetOrAdd(tp, static _ => new PartitionDeque());
+        var deques = GetOrCreateCachedDequeArray(topic, partition, partitionCount, cache);
+        deques[partition] = deque;
+        return deque;
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private PartitionDeque GetOrCreateDequeSlow(TopicPartition tp, AccumulatorThreadCache cache)
+    private PartitionDeque?[] GetOrCreateCachedDequeArray(
+        string topic,
+        int partition,
+        int partitionCount,
+        AccumulatorThreadCache cache)
     {
-        var deque = _partitionDeques.GetOrAdd(tp, static _ => new PartitionDeque());
+        var cachedTopic = cache.CachedTopic;
+        var capacity = Math.Max(partition + 1, partitionCount);
 
-        // Update thread-local cache
+        if (cache.CachedAccumulator == this &&
+            TopicMatches(cachedTopic, topic) &&
+            cache.CachedTopicDeques is { } existing)
+        {
+            if (existing.Length >= capacity)
+                return existing;
+
+            Array.Resize(ref existing, capacity);
+            cache.CachedTopicDeques = existing;
+            return existing;
+        }
+
+        var deques = new PartitionDeque?[capacity];
         cache.CachedAccumulator = this;
-        cache.CachedTopicPartition = tp;
-        cache.CachedDeque = deque;
-
-        return deque;
+        cache.CachedTopic = topic;
+        cache.CachedTopicDeques = deques;
+        return deques;
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TopicMatches(string? cachedTopic, string topic) =>
+        ReferenceEquals(cachedTopic, topic) ||
+        string.Equals(cachedTopic, topic, StringComparison.Ordinal);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void TrackCurrentBatchForLinger(PartitionDeque pd, TopicPartition topicPartition, PartitionBatch batch)
@@ -2015,7 +2059,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         int partitionCount)
     {
         var topicPartition = new TopicPartition(topic, partition);
-        var pd = GetOrCreateDeque(topic, partition);
+        var pd = GetOrCreateDeque(topic, partition, partitionCount);
         ReadyBatch? sealedBatchToEnqueue = null;
         PartitionBatch? rentedBatch = null;
         var ownsRotation = false;
@@ -2328,7 +2372,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         bool returnHeadersOnFailure)
     {
         var topicPartition = new TopicPartition(topic, partition);
-        var pd = GetOrCreateDeque(topic, partition);
+        var pd = GetOrCreateDeque(topic, partition, partitionCount);
         ReadyBatch? sealedBatchToEnqueue = null;
         PartitionBatch? rentedBatch = null;
         var ownsRotation = false;
