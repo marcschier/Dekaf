@@ -621,6 +621,8 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
     private readonly ConcurrentDictionary<TopicPartition, long> _fetchPositions = new(); // Fetch position (what to fetch next)
     private readonly ConcurrentDictionary<TopicPartition, long> _committed = new();
     private readonly ConcurrentDictionary<TopicPartition, WatermarkOffsets> _watermarks = new(); // Cached watermark offsets from fetch responses
+    private readonly ConcurrentDictionary<TopicPartition, int> _preferredReadReplicas = new();
+    private readonly ConcurrentDictionary<TopicPartition, int> _validatedLeaderEpochs = new();
 
 
     // Partition EOF tracking
@@ -671,6 +673,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
     private CancellationTokenSource? _autoCommitCts;
     private Task? _autoCommitTask;
     private int _fetchApiVersion = -1;
+    private int _offsetForLeaderEpochApiVersion = -1;
     private readonly ConsumerConnectionScaler? _connectionScaler;
     private readonly AdaptiveFetchSizer? _adaptiveFetchSizer;
 
@@ -2015,6 +2018,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
             request.MinBytes = _options.FetchMinBytes;
             request.MaxBytes = _adaptiveFetchSizer?.CurrentFetchMaxBytes ?? _options.FetchMaxBytes;
             request.IsolationLevel = _options.IsolationLevel;
+            request.RackId = _options.ClientRack ?? string.Empty;
             request.Topics = fetchSessionBuild?.Topics ?? topicData;
             request.ForgottenTopicsData = fetchSessionBuild?.ForgottenTopicsData;
             request.SessionId = fetchSessionBuild?.SessionId ?? 0;
@@ -2080,9 +2084,13 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
 
                         // Update watermark cache from fetch response (even on errors, watermarks may be valid)
                         UpdateWatermarksFromFetchResponse(topic, partitionResponse);
+                        UpdatePreferredReadReplica(tp, partitionResponse.PreferredReadReplica);
+                        if (HandleDivergingEpoch(tp, partitionResponse.DivergingEpoch))
+                            continue;
 
                         if (partitionResponse.ErrorCode != ErrorCode.None)
                         {
+                            ClearPreferredReadReplicaOnFetchError(tp, brokerId);
                             if (partitionResponse.ErrorCode == ErrorCode.OffsetOutOfRange)
                             {
                                 // CRITICAL: Reset fetch position based on auto.offset.reset policy
@@ -2107,7 +2115,12 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                                 await HandleNotLeaderOrFollowerAsync(
                                     topic,
                                     partitionResponse,
-                                    response.NodeEndpoints).ConfigureAwait(false);
+                                    response.NodeEndpoints,
+                                    cancellationToken).ConfigureAwait(false);
+                            }
+                            else if (partitionResponse.ErrorCode is ErrorCode.FencedLeaderEpoch or ErrorCode.UnknownLeaderEpoch)
+                            {
+                                ScheduleLeaderRefresh(topic);
                             }
                             else
                             {
@@ -2279,6 +2292,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         else
         {
             _positionLeaderEpochs.TryRemove(partition, out _);
+            _validatedLeaderEpochs.TryRemove(partition, out _);
         }
 
         if (dirty)
@@ -2868,6 +2882,8 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
             _committed.TryRemove(partition, out _);
             _highWatermarks.TryRemove(partition, out _);
             _watermarks.TryRemove(partition, out _);
+            _preferredReadReplicas.TryRemove(partition, out _);
+            _validatedLeaderEpochs.TryRemove(partition, out _);
             _eofEmitted.TryRemove(partition, out _);
             hadPaused |= _paused.TryRemove(partition, out _);
         }
@@ -3738,6 +3754,48 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         }
     }
 
+
+    internal static int SelectFetchBrokerId(
+        TopicPartition partition,
+        BrokerNode leader,
+        ClusterMetadata metadata,
+        ConcurrentDictionary<TopicPartition, int> preferredReadReplicas)
+    {
+        if (preferredReadReplicas.TryGetValue(partition, out var preferredReplicaId)
+            && preferredReplicaId >= 0
+            && metadata.GetBroker(preferredReplicaId) is not null)
+        {
+            return preferredReplicaId;
+        }
+
+        return leader.NodeId;
+    }
+
+    private void UpdatePreferredReadReplica(TopicPartition partition, int preferredReadReplica)
+    {
+        if (preferredReadReplica < 0)
+            return;
+
+        if (_preferredReadReplicas.TryGetValue(partition, out var currentReplica)
+            && currentReplica == preferredReadReplica)
+        {
+            return;
+        }
+
+        _preferredReadReplicas[partition] = preferredReadReplica;
+        InvalidatePartitionCache();
+    }
+
+    private void ClearPreferredReadReplicaOnFetchError(TopicPartition partition, int brokerId)
+    {
+        if (_preferredReadReplicas.TryGetValue(partition, out var preferredReplicaId)
+            && preferredReplicaId == brokerId
+            && _preferredReadReplicas.TryRemove(partition, out _))
+        {
+            InvalidatePartitionCache();
+        }
+    }
+
     private async ValueTask<Dictionary<int, List<TopicPartition>>> GroupPartitionsByBrokerAsync(CancellationToken cancellationToken)
     {
         // Check cache and capture version to detect concurrent invalidation
@@ -3771,7 +3829,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
 
         // Build the cache outside the lock - allocate once per assignment change
         // Resolve all partition leaders in parallel for maximum throughput
-        var leaderTasks = ArrayPool<Task<(TopicPartition Partition, BrokerNode? Leader)>>.Shared.Rent(assignmentCount);
+        var leaderTasks = ArrayPool<Task<(TopicPartition Partition, int BrokerId)>>.Shared.Rent(assignmentCount);
         try
         {
             for (var i = 0; i < assignmentCount; i++)
@@ -3779,7 +3837,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                 leaderTasks[i] = ResolvePartitionLeaderAsync(assignmentArray[i], cancellationToken);
             }
 
-            await Task.WhenAll(new ReadOnlySpan<Task<(TopicPartition Partition, BrokerNode? Leader)>>(leaderTasks, 0, assignmentCount)).ConfigureAwait(false);
+            await Task.WhenAll(new ReadOnlySpan<Task<(TopicPartition Partition, int BrokerId)>>(leaderTasks, 0, assignmentCount)).ConfigureAwait(false);
         }
         finally
         {
@@ -3790,21 +3848,21 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         var result = new Dictionary<int, List<TopicPartition>>();
         for (var i = 0; i < assignmentCount; i++)
         {
-            var (partition, leader) = leaderTasks[i].Result;
-            if (leader is null)
+            var (partition, brokerId) = leaderTasks[i].Result;
+            if (brokerId < 0)
                 continue;
 
-            if (!result.TryGetValue(leader.NodeId, out var list))
+            if (!result.TryGetValue(brokerId, out var list))
             {
                 list = [];
-                result[leader.NodeId] = list;
+                result[brokerId] = list;
             }
 
             list.Add(partition);
         }
 
         // Return pooled array after extracting results
-        ArrayPool<Task<(TopicPartition Partition, BrokerNode? Leader)>>.Shared.Return(leaderTasks, clearArray: true);
+        ArrayPool<Task<(TopicPartition Partition, int BrokerId)>>.Shared.Return(leaderTasks, clearArray: true);
 
         // Cache the result - will be reused until assignment/paused changes.
         // Don't cache empty results: an empty dictionary means partition leaders
@@ -3822,13 +3880,16 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         }
     }
 
-    private async Task<(TopicPartition Partition, BrokerNode? Leader)> ResolvePartitionLeaderAsync(
+    private async Task<(TopicPartition Partition, int BrokerId)> ResolvePartitionLeaderAsync(
         TopicPartition partition,
         CancellationToken cancellationToken)
     {
         var leader = await _metadataManager.GetPartitionLeaderAsync(
             partition.Topic, partition.Partition, cancellationToken).ConfigureAwait(false);
-        return (partition, leader);
+        if (leader is null)
+            return (partition, -1);
+
+        return (partition, SelectFetchBrokerId(partition, leader, _metadataManager.Metadata, _preferredReadReplicas));
     }
 
     private async ValueTask<List<PendingFetchData>?> FetchFromBrokerAsync(int brokerId, List<TopicPartition> partitions, CancellationToken cancellationToken)
@@ -3925,15 +3986,24 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
 
                     // Update watermark cache from fetch response (even on errors, watermarks may be valid)
                     UpdateWatermarksFromFetchResponse(topic, partitionResponse);
+                    UpdatePreferredReadReplica(tp, partitionResponse.PreferredReadReplica);
+                    if (HandleDivergingEpoch(tp, partitionResponse.DivergingEpoch))
+                        continue;
 
                     if (partitionResponse.ErrorCode != ErrorCode.None)
                     {
+                        ClearPreferredReadReplicaOnFetchError(tp, brokerId);
                         if (partitionResponse.ErrorCode == ErrorCode.NotLeaderOrFollower)
                         {
                             await HandleNotLeaderOrFollowerAsync(
                                 topic,
                                 partitionResponse,
-                                response.NodeEndpoints).ConfigureAwait(false);
+                                response.NodeEndpoints,
+                                cancellationToken).ConfigureAwait(false);
+                        }
+                        else if (partitionResponse.ErrorCode is ErrorCode.FencedLeaderEpoch or ErrorCode.UnknownLeaderEpoch)
+                        {
+                            ScheduleLeaderRefresh(topic);
                         }
                         else
                         {
@@ -4137,10 +4207,11 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         }
     }
 
-    private ValueTask HandleNotLeaderOrFollowerAsync(
+    private async ValueTask HandleNotLeaderOrFollowerAsync(
         string topic,
         FetchResponsePartition partitionResponse,
-        IReadOnlyList<NodeEndpoint> nodeEndpoints)
+        IReadOnlyList<NodeEndpoint> nodeEndpoints,
+        CancellationToken cancellationToken = default)
     {
         var currentLeader = partitionResponse.CurrentLeader;
         var endpoint = currentLeader is null
@@ -4155,13 +4226,214 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                 currentLeader.LeaderEpoch,
                 endpoint);
 
+        var tp = new TopicPartition(topic, partitionResponse.PartitionIndex);
+        _preferredReadReplicas.TryRemove(tp, out _);
         InvalidatePartitionCache();
         LogNotLeaderOrFollower(topic, partitionResponse.PartitionIndex);
 
-        if (!updated)
+        if (updated && currentLeader is not null)
+        {
+            await ValidateTruncationForLeaderEpochAsync(
+                tp,
+                currentLeader.LeaderId,
+                currentLeader.LeaderEpoch,
+                cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
             ScheduleLeaderRefresh(topic);
+        }
+    }
 
-        return ValueTask.CompletedTask;
+
+    internal static long? ComputeTruncationResetOffset(long currentPosition, long epochEndOffset)
+    {
+        return epochEndOffset >= 0 && currentPosition > epochEndOffset
+            ? epochEndOffset
+            : null;
+    }
+
+    private bool HandleDivergingEpoch(TopicPartition partition, EpochEndOffset? divergingEpoch)
+    {
+        if (divergingEpoch is null)
+            return false;
+
+        var currentPosition = _fetchPositions.GetValueOrDefault(partition, 0);
+        var resetOffset = ComputeTruncationResetOffset(currentPosition, divergingEpoch.EndOffset);
+        if (!resetOffset.HasValue)
+            return false;
+
+        ResetFetchPositionAfterTruncation(partition, currentPosition, resetOffset.Value);
+        return true;
+    }
+
+    private async ValueTask ValidateTruncationAfterMetadataRefreshAsync(string topic, CancellationToken cancellationToken)
+    {
+        foreach (var entry in _positionLeaderEpochs)
+        {
+            var partition = entry.Key;
+            if (!string.Equals(partition.Topic, topic, StringComparison.Ordinal))
+                continue;
+
+            var partitionInfo = _metadataManager.Metadata.GetPartitionInfo(partition.Topic, partition.Partition);
+            if (partitionInfo is null || partitionInfo.LeaderEpoch < 0 || partitionInfo.LeaderId < 0)
+                continue;
+
+            if (partitionInfo.LeaderEpoch <= entry.Value.CommittedLeaderEpoch)
+                continue;
+
+            await ValidateTruncationForLeaderEpochAsync(
+                partition,
+                partitionInfo.LeaderId,
+                partitionInfo.LeaderEpoch,
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async ValueTask ValidateTruncationForLeaderEpochAsync(
+        TopicPartition partition,
+        int leaderId,
+        int currentLeaderEpoch,
+        CancellationToken cancellationToken)
+    {
+        if (leaderId < 0 || currentLeaderEpoch < 0)
+            return;
+
+        if (!_positionLeaderEpochs.TryGetValue(partition, out var tracked)
+            || tracked.CommittedLeaderEpoch < 0
+            || currentLeaderEpoch <= tracked.CommittedLeaderEpoch)
+        {
+            return;
+        }
+
+        if (_validatedLeaderEpochs.TryGetValue(partition, out var validatedEpoch)
+            && validatedEpoch >= currentLeaderEpoch)
+        {
+            return;
+        }
+
+        var response = await QueryOffsetForLeaderEpochAsync(
+            partition,
+            leaderId,
+            currentLeaderEpoch,
+            tracked.CommittedLeaderEpoch,
+            cancellationToken).ConfigureAwait(false);
+
+        if (response is null)
+            return;
+
+        if (response.ErrorCode is ErrorCode.FencedLeaderEpoch or ErrorCode.UnknownLeaderEpoch)
+        {
+            await _metadataManager.RefreshMetadataAsync(
+                [partition.Topic],
+                forceRefresh: true,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            _preferredReadReplicas.Clear();
+            InvalidatePartitionCache();
+
+            var refreshedInfo = _metadataManager.Metadata.GetPartitionInfo(partition.Topic, partition.Partition);
+            if (refreshedInfo is null || refreshedInfo.LeaderId < 0 || refreshedInfo.LeaderEpoch < 0)
+                return;
+
+            response = await QueryOffsetForLeaderEpochAsync(
+                partition,
+                refreshedInfo.LeaderId,
+                refreshedInfo.LeaderEpoch,
+                tracked.CommittedLeaderEpoch,
+                cancellationToken).ConfigureAwait(false);
+
+            if (response is null || response.ErrorCode != ErrorCode.None)
+                return;
+
+            currentLeaderEpoch = refreshedInfo.LeaderEpoch;
+        }
+        else if (response.ErrorCode != ErrorCode.None)
+        {
+            return;
+        }
+
+        var currentPosition = _fetchPositions.GetValueOrDefault(partition, tracked.Offset);
+        var resetOffset = ComputeTruncationResetOffset(currentPosition, response.EndOffset);
+        if (resetOffset.HasValue)
+            ResetFetchPositionAfterTruncation(partition, currentPosition, resetOffset.Value);
+
+        _validatedLeaderEpochs[partition] = currentLeaderEpoch;
+    }
+
+    private async ValueTask<OffsetForLeaderEpochEndOffset?> QueryOffsetForLeaderEpochAsync(
+        TopicPartition partition,
+        int leaderId,
+        int currentLeaderEpoch,
+        int leaderEpoch,
+        CancellationToken cancellationToken)
+    {
+        var connection = await _connectionPool.GetConnectionByIndexAsync(leaderId, 0, cancellationToken)
+            .ConfigureAwait(false);
+
+        var apiVersion = _offsetForLeaderEpochApiVersion;
+        if (apiVersion < 0)
+        {
+            apiVersion = _metadataManager.GetNegotiatedApiVersion(
+                ApiKey.OffsetForLeaderEpoch,
+                OffsetForLeaderEpochRequest.LowestSupportedVersion,
+                OffsetForLeaderEpochRequest.HighestSupportedVersion);
+            Interlocked.CompareExchange(ref _offsetForLeaderEpochApiVersion, apiVersion, -1);
+            apiVersion = _offsetForLeaderEpochApiVersion;
+        }
+
+        var request = new OffsetForLeaderEpochRequest
+        {
+            Topics =
+            [
+                new OffsetForLeaderTopic
+                {
+                    Topic = partition.Topic,
+                    Partitions =
+                    [
+                        new OffsetForLeaderPartition
+                        {
+                            Partition = partition.Partition,
+                            CurrentLeaderEpoch = currentLeaderEpoch,
+                            LeaderEpoch = leaderEpoch
+                        }
+                    ]
+                }
+            ]
+        };
+
+        var response = await connection.SendAsync<OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse>(
+            request,
+            (short)apiVersion,
+            cancellationToken).ConfigureAwait(false);
+
+        foreach (var topic in response.Topics)
+        {
+            if (!string.Equals(topic.Topic, partition.Topic, StringComparison.Ordinal))
+                continue;
+
+            foreach (var endOffset in topic.Partitions)
+            {
+                if (endOffset.Partition == partition.Partition)
+                    return endOffset;
+            }
+        }
+
+        return null;
+    }
+
+    private void ResetFetchPositionAfterTruncation(TopicPartition partition, long currentPosition, long resetOffset)
+    {
+        _fetchPositions[partition] = resetOffset;
+        SetPosition(partition, resetOffset, dirty: false);
+        _validatedLeaderEpochs.TryRemove(partition, out _);
+        ClearFetchBufferForPartition(partition);
+        LogLogTruncationReset(partition.Topic, partition.Partition, currentPosition, resetOffset);
+    }
+
+    private void ClearFetchBufferForPartition(TopicPartition partition)
+    {
+        var partitions = new HashSet<TopicPartition> { partition };
+        ClearFetchBufferForPartitions(partitions);
     }
 
     private void ScheduleLeaderRefresh(string topic)
@@ -4205,6 +4477,9 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         {
             await _metadataManager.RefreshMetadataAsync([topic], forceRefresh: true, cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
+            _preferredReadReplicas.Clear();
+            InvalidatePartitionCache();
+            await ValidateTruncationAfterMetadataRefreshAsync(topic, cancellationToken).ConfigureAwait(false);
         }
         catch
         {
@@ -4367,11 +4642,12 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
 
             foreach (var (template, tp) in cachedPartitions)
             {
+                var partitionInfo = clusterMetadata?.GetPartitionInfo(tp.Topic, tp.Partition);
                 partitionList.Add(new FetchRequestPartition
                 {
                     Partition = template.Partition,
                     FetchOffset = fetchPositions.GetValueOrDefault(tp, 0),
-                    CurrentLeaderEpoch = template.CurrentLeaderEpoch,
+                    CurrentLeaderEpoch = partitionInfo?.LeaderEpoch ?? template.CurrentLeaderEpoch,
                     LastFetchedEpoch = template.LastFetchedEpoch,
                     LogStartOffset = template.LogStartOffset,
                     PartitionMaxBytes = adaptivePartitionMaxBytes ?? template.PartitionMaxBytes
@@ -4983,6 +5259,9 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "ListOffsets error for {Topic}-{Partition}: {Error}")]
     private partial void LogListOffsetsError(string topic, int partition, ErrorCode error);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "Log truncation detected for {Topic}-{Partition}: current position {CurrentPosition} reset to {ResetOffset}")]
+    private partial void LogLogTruncationReset(string topic, int partition, long currentPosition, long resetOffset);
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "Prefetch paused: memory limit reached ({CurrentBytes}/{MaxBytes} bytes)")]
     private partial void LogPrefetchMemoryLimitPaused(long currentBytes, long maxBytes);
