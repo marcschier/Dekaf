@@ -124,9 +124,9 @@ Need to send a bunch of messages? `ProduceAllAsync` handles the tricky `ValueTas
 ```csharp
 var messages = new[]
 {
-    ProducerMessage<string, string>.Create("orders", "order-1", orderJson1),
-    ProducerMessage<string, string>.Create("orders", "order-2", orderJson2),
-    ProducerMessage<string, string>.Create("orders", "order-3", orderJson3),
+    new ProducerMessage<string, string> { Topic = "orders", Key = "order-1", Value = orderJson1 },
+    new ProducerMessage<string, string> { Topic = "orders", Key = "order-2", Value = orderJson2 },
+    new ProducerMessage<string, string> { Topic = "orders", Key = "order-3", Value = orderJson3 },
 };
 
 var results = await producer.ProduceAllAsync(messages);

@@ -165,7 +165,7 @@ public sealed class ConvenienceApiTests(KafkaTestContainer kafka) : KafkaIntegra
     }
 
     [Test]
-    public async Task ProducerMessage_Create_TopicAndValueOnly()
+    public async Task ProducerMessage_Init_TopicAndValueOnly()
     {
         // Simplest message creation - no key
         var topic = await KafkaContainer.CreateTestTopicAsync();
@@ -175,7 +175,7 @@ public sealed class ConvenienceApiTests(KafkaTestContainer kafka) : KafkaIntegra
             .WithLoggerFactory(GlobalTestSetup.GetLoggerFactory())
             .BuildAsync();
 
-        var message = ProducerMessage<string, string>.Create(topic, "keyless-value");
+        var message = new ProducerMessage<string, string> { Topic = topic, Value = "keyless-value" };
         var metadata = await producer.ProduceAsync(message, CancellationToken.None);
 
         await Assert.That(metadata.Topic).IsEqualTo(topic);
@@ -197,7 +197,7 @@ public sealed class ConvenienceApiTests(KafkaTestContainer kafka) : KafkaIntegra
     }
 
     [Test]
-    public async Task ProducerMessage_Create_WithKeyAndValue()
+    public async Task ProducerMessage_Init_WithKeyAndValue()
     {
         var topic = await KafkaContainer.CreateTestTopicAsync();
 
@@ -206,7 +206,7 @@ public sealed class ConvenienceApiTests(KafkaTestContainer kafka) : KafkaIntegra
             .WithLoggerFactory(GlobalTestSetup.GetLoggerFactory())
             .BuildAsync();
 
-        var message = ProducerMessage<string, string>.Create(topic, "my-key", "my-value");
+        var message = new ProducerMessage<string, string> { Topic = topic, Key = "my-key", Value = "my-value" };
         var metadata = await producer.ProduceAsync(message, CancellationToken.None);
 
         await Assert.That(metadata.Topic).IsEqualTo(topic);
@@ -228,7 +228,7 @@ public sealed class ConvenienceApiTests(KafkaTestContainer kafka) : KafkaIntegra
     }
 
     [Test]
-    public async Task ProducerMessage_Create_WithHeaders()
+    public async Task ProducerMessage_Init_WithHeaders()
     {
         var topic = await KafkaContainer.CreateTestTopicAsync();
 
@@ -238,7 +238,13 @@ public sealed class ConvenienceApiTests(KafkaTestContainer kafka) : KafkaIntegra
             .BuildAsync();
 
         var headers = new Headers { { "source", "test" } };
-        var message = ProducerMessage<string, string>.Create(topic, "key", "value", headers);
+        var message = new ProducerMessage<string, string>
+        {
+            Topic = topic,
+            Key = "key",
+            Value = "value",
+            Headers = headers
+        };
         await producer.FireAsync(message);
 
         await producer.FlushWithTimeoutAsync();
