@@ -70,6 +70,29 @@ public interface IAdminClient : IAsyncDisposable
     ValueTask<IReadOnlyDictionary<string, GroupDescription>> DescribeConsumerGroupsAsync(IEnumerable<string> groupIds, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Describes transactions for transactional IDs.
+    /// </summary>
+    ValueTask<IReadOnlyDictionary<string, TransactionDescription>> DescribeTransactionsAsync(
+        IEnumerable<string> transactionalIds,
+        DescribeTransactionsOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Lists transactions across the cluster.
+    /// </summary>
+    ValueTask<IReadOnlyList<TransactionListing>> ListTransactionsAsync(
+        ListTransactionsOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Describes active producers for topic partitions.
+    /// </summary>
+    ValueTask<IReadOnlyDictionary<TopicPartition, ProducerDescription>> DescribeProducersAsync(
+        IEnumerable<TopicPartition> partitions,
+        DescribeProducersOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Lists consumer groups.
     /// </summary>
     ValueTask<IReadOnlyList<GroupListing>> ListConsumerGroupsAsync(ListConsumerGroupsOptions? options = null, CancellationToken cancellationToken = default);
@@ -702,4 +725,79 @@ public sealed class OngoingPartitionReassignmentInfo
     /// The replicas being removed as part of this reassignment.
     /// </summary>
     public required IReadOnlyList<int> RemovingReplicas { get; init; }
+}
+
+/// <summary>
+/// Options for DescribeTransactions.
+/// </summary>
+public sealed class DescribeTransactionsOptions;
+
+/// <summary>
+/// Options for ListTransactions.
+/// </summary>
+public sealed class ListTransactionsOptions
+{
+    /// <summary>
+    /// Transaction state filters, or empty for all states.
+    /// </summary>
+    public IReadOnlyList<string> StateFilters { get; init; } = [];
+
+    /// <summary>
+    /// Producer ID filters, or empty for all producers.
+    /// </summary>
+    public IReadOnlyList<long> ProducerIdFilters { get; init; } = [];
+}
+
+/// <summary>
+/// Options for DescribeProducers.
+/// </summary>
+public sealed class DescribeProducersOptions;
+
+/// <summary>
+/// Detailed transaction description.
+/// </summary>
+public sealed class TransactionDescription
+{
+    public required string TransactionalId { get; init; }
+    public Protocol.ErrorCode ErrorCode { get; init; }
+    public required string TransactionState { get; init; }
+    public int TransactionTimeoutMs { get; init; }
+    public long TransactionStartTimeMs { get; init; }
+    public long ProducerId { get; init; }
+    public short ProducerEpoch { get; init; }
+    public required IReadOnlyList<TopicPartition> TopicPartitions { get; init; }
+}
+
+/// <summary>
+/// Summary of a listed transaction.
+/// </summary>
+public sealed class TransactionListing
+{
+    public required string TransactionalId { get; init; }
+    public long ProducerId { get; init; }
+    public required string TransactionState { get; init; }
+}
+
+/// <summary>
+/// Active producer description for a topic partition.
+/// </summary>
+public sealed class ProducerDescription
+{
+    public required TopicPartition TopicPartition { get; init; }
+    public Protocol.ErrorCode ErrorCode { get; init; }
+    public string? ErrorMessage { get; init; }
+    public required IReadOnlyList<ActiveProducerDescription> ActiveProducers { get; init; }
+}
+
+/// <summary>
+/// Active producer information.
+/// </summary>
+public sealed class ActiveProducerDescription
+{
+    public long ProducerId { get; init; }
+    public int ProducerEpoch { get; init; }
+    public int LastSequence { get; init; }
+    public long LastTimestamp { get; init; }
+    public int CoordinatorEpoch { get; init; }
+    public long CurrentTxnStartOffset { get; init; }
 }
