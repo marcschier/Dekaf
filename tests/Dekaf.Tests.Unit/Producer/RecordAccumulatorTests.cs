@@ -187,6 +187,55 @@ public class RecordAccumulatorTests
     }
 
     [Test]
+    public async Task AppendFromSpansAsync_FirstRecordLargerThanBatchSize_UsesExpandedArena()
+    {
+        const int batchSize = 128;
+        var options = new ProducerOptions
+        {
+            BootstrapServers = new[] { "localhost:9092" },
+            ClientId = "test-producer",
+            BufferMemory = ulong.MaxValue,
+            BatchSize = batchSize,
+            LingerMs = 10_000
+        };
+
+        await using var accumulator = new RecordAccumulator(options);
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var valueText = new string('x', batchSize * 3);
+        var value = Encoding.UTF8.GetBytes(valueText);
+
+        var appended = await accumulator.AppendFromSpansAsync(
+            "test-topic",
+            partition: 0,
+            timestamp,
+            ReadOnlySpan<byte>.Empty,
+            keyIsNull: true,
+            value,
+            valueIsNull: false,
+            headers: null,
+            headerCount: 0,
+            callback: null,
+            CancellationToken.None,
+            partitionCount: 1);
+
+        await Assert.That(appended).IsTrue();
+
+        var readyBatch = CompleteCurrentBatch(accumulator, new TopicPartition("test-topic", 0));
+        await Assert.That(readyBatch.RecordBatch.HasPreEncodedRecords).IsTrue();
+        await Assert.That(readyBatch.DataSize).IsGreaterThan(batchSize);
+
+        var writer = new ArrayBufferWriter<byte>();
+        readyBatch.RecordBatch.Write(writer);
+        var reader = new KafkaProtocolReader(writer.WrittenMemory);
+        using var parsed = RecordBatch.Read(ref reader);
+
+        await Assert.That(parsed.Records.Count).IsEqualTo(1);
+        await Assert.That(Encoding.UTF8.GetString(parsed.Records[0].Value.Span)).IsEqualTo(valueText);
+
+        readyBatch.CompleteSend(baseOffset: 0, DateTimeOffset.FromUnixTimeMilliseconds(timestamp));
+    }
+
+    [Test]
     public async Task AppendFromSpansAsync_WithCallback_PreservesCallbackAfterRotation()
     {
         var options = new ProducerOptions

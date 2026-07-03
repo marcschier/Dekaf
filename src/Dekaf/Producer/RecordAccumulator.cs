@@ -4371,6 +4371,11 @@ internal sealed class PartitionBatch
             return new RecordAppendResult(false);
         }
 
+        if (recordIndex == 0)
+        {
+            EnsureArenaCanFitFirstRecord(encodedRecordSize);
+        }
+
         // Grow arrays if needed (rare - only happens if batch fills beyond initial capacity)
         if (_recordCount >= _records.Length)
         {
@@ -4439,6 +4444,23 @@ internal sealed class PartitionBatch
         _estimatedSize += encodedRecordSize;
 
         return new RecordAppendResult(Success: true, ActualSizeAdded: encodedRecordSize);
+    }
+
+    private void EnsureArenaCanFitFirstRecord(int encodedRecordSize)
+    {
+        var arena = _arena;
+        if (arena is not null && encodedRecordSize <= arena.RemainingCapacity)
+        {
+            return;
+        }
+
+        var capacity = Math.Max(GetEffectiveArenaCapacity(_options), encodedRecordSize);
+        if (arena is not null)
+        {
+            BatchArena.ReturnToPool(arena);
+        }
+
+        _arena = BatchArena.RentOrCreate(capacity);
     }
 
     [SkipLocalsInit]
