@@ -52,24 +52,47 @@ public class AppendWorkerAffinityTests
         return (int)deques.GetType().GetProperty("Count")!.GetValue(deques)!;
     }
 
+    private static FieldInfo GetThreadCacheField() =>
+        typeof(RecordAccumulator).GetField(
+            "t_cache",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+    private static MethodInfo GetOrCreateDequeMethod() =>
+        typeof(RecordAccumulator).GetMethod(
+            "GetOrCreateDeque",
+            BindingFlags.NonPublic | BindingFlags.Instance,
+            binder: null,
+            [typeof(string), typeof(int), typeof(int)],
+            modifiers: null)
+        ?? throw new InvalidOperationException("GetOrCreateDeque overload not found.");
+
+    private static object GetThreadCache() =>
+        GetThreadCacheField().GetValue(null)
+        ?? throw new InvalidOperationException("Accumulator thread cache not initialized.");
+
+    private static Array GetCachedTopicDeques()
+    {
+        var cache = GetThreadCache();
+        return (Array?)cache.GetType().GetField("CachedTopicDeques")!.GetValue(cache)
+            ?? throw new InvalidOperationException("Cached topic deque array not initialized.");
+    }
+
+    private static string? GetCachedTopic()
+    {
+        var cache = GetThreadCache();
+        return (string?)cache.GetType().GetField("CachedTopic")!.GetValue(cache);
+    }
+
     [Test]
     public async Task GetOrCreateDeque_RoundRobinPartitions_CachesPerTopicArray()
     {
         var options = CreateTestOptions();
         var accumulator = new RecordAccumulator(options);
 
-        var cacheField = typeof(RecordAccumulator).GetField(
-            "t_cache",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var cacheField = GetThreadCacheField();
         cacheField.SetValue(null, null);
 
-        var getOrCreateDeque = typeof(RecordAccumulator).GetMethod(
-            "GetOrCreateDeque",
-            BindingFlags.NonPublic | BindingFlags.Instance,
-            binder: null,
-            [typeof(string), typeof(int), typeof(int)],
-            modifiers: null)
-            ?? throw new InvalidOperationException("GetOrCreateDeque overload not found.");
+        var getOrCreateDeque = GetOrCreateDequeMethod();
 
         var first = getOrCreateDeque.Invoke(accumulator, ["test-topic", 0, 4]);
         var second = getOrCreateDeque.Invoke(accumulator, ["test-topic", 1, 4]);
@@ -85,6 +108,48 @@ public class AppendWorkerAffinityTests
         await Assert.That(cachedDeques).IsNotNull();
         await Assert.That(cachedDeques!.GetValue(0)).IsSameReferenceAs(first);
         await Assert.That(cachedDeques.GetValue(1)).IsSameReferenceAs(second);
+
+        await accumulator.DisposeAsync();
+    }
+
+    [Test]
+    public async Task GetOrCreateDeque_PartitionBeyondCachedArray_GrowsTopicArray()
+    {
+        var accumulator = new RecordAccumulator(CreateTestOptions());
+        GetThreadCacheField().SetValue(null, null);
+        var getOrCreateDeque = GetOrCreateDequeMethod();
+
+        var first = getOrCreateDeque.Invoke(accumulator, ["test-topic", 0, 1]);
+        var firstArray = GetCachedTopicDeques();
+
+        var fourth = getOrCreateDeque.Invoke(accumulator, ["test-topic", 3, 1]);
+        var grownArray = GetCachedTopicDeques();
+
+        await Assert.That(grownArray.Length).IsGreaterThanOrEqualTo(4);
+        await Assert.That(grownArray).IsNotSameReferenceAs(firstArray);
+        await Assert.That(grownArray.GetValue(0)).IsSameReferenceAs(first);
+        await Assert.That(grownArray.GetValue(3)).IsSameReferenceAs(fourth);
+
+        await accumulator.DisposeAsync();
+    }
+
+    [Test]
+    public async Task GetOrCreateDeque_WhenTopicChanges_ReplacesCachedTopicArray()
+    {
+        var accumulator = new RecordAccumulator(CreateTestOptions());
+        GetThreadCacheField().SetValue(null, null);
+        var getOrCreateDeque = GetOrCreateDequeMethod();
+
+        var firstTopicDeque = getOrCreateDeque.Invoke(accumulator, ["topic-a", 0, 4]);
+        var firstArray = GetCachedTopicDeques();
+
+        var secondTopicDeque = getOrCreateDeque.Invoke(accumulator, ["topic-b", 0, 4]);
+        var secondArray = GetCachedTopicDeques();
+
+        await Assert.That(GetCachedTopic()).IsEqualTo("topic-b");
+        await Assert.That(secondArray).IsNotSameReferenceAs(firstArray);
+        await Assert.That(secondArray.GetValue(0)).IsSameReferenceAs(secondTopicDeque);
+        await Assert.That(secondTopicDeque).IsNotSameReferenceAs(firstTopicDeque);
 
         await accumulator.DisposeAsync();
     }
