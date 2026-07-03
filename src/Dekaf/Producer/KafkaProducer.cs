@@ -2016,6 +2016,8 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
                 list.Add(new TxnOffsetCommitRequestPartition
                 {
                     PartitionIndex = offset.Partition,
+                    // TODO(KIP-320): expose leader epoch on transactional offset inputs so
+                    // TxnOffsetCommit can populate CommittedLeaderEpoch when available.
                     CommittedOffset = offset.Offset
                 });
             }
@@ -3908,4 +3910,3 @@ internal ref struct PooledBufferWriter : IBufferWriter<byte>
         ProducerDataPool.BytePool.Return(oldBuffer, clearArray: false);
     }
 }
-

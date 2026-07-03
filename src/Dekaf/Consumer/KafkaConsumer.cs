@@ -109,6 +109,7 @@ internal sealed class PendingFetchData : IDisposable
     /// consumer poll loop thread. Each instance handles one partition's fetch response.
     /// </remarks>
     public long LastYieldedOffset { get; private set; } = -1;
+    public int LastYieldedLeaderEpoch { get; private set; } = -1;
 
     /// <summary>
     /// Tracks total bytes consumed in this pending fetch.
@@ -221,6 +222,7 @@ internal sealed class PendingFetchData : IDisposable
     /// </summary>
     internal long CurrentBaseOffset { get; private set; }
     internal long CurrentBaseTimestamp { get; private set; }
+    internal int CurrentPartitionLeaderEpoch { get; private set; } = -1;
     /// <summary>
     /// Cached timestamp type for the current batch.
     /// Computed once per batch transition instead of per-message.
@@ -235,6 +237,7 @@ internal sealed class PendingFetchData : IDisposable
     public void TrackConsumed(long offset, int messageBytes)
     {
         LastYieldedOffset = offset;
+        LastYieldedLeaderEpoch = CurrentPartitionLeaderEpoch;
         TotalBytesConsumed += messageBytes;
         MessageCount++;
     }
@@ -299,6 +302,7 @@ internal sealed class PendingFetchData : IDisposable
 
         CurrentBaseOffset = batch.BaseOffset;
         CurrentBaseTimestamp = batch.BaseTimestamp;
+        CurrentPartitionLeaderEpoch = batch.PartitionLeaderEpoch;
         var attrs = batch.Attributes;
         CurrentTimestampType = (attrs & RecordBatchAttributes.TimestampTypeLogAppendTime) != 0
             ? TimestampType.LogAppendTime
@@ -445,8 +449,10 @@ internal sealed class PendingFetchData : IDisposable
         }
         CurrentBaseOffset = 0;
         CurrentBaseTimestamp = 0;
+        CurrentPartitionLeaderEpoch = -1;
         CurrentTimestampType = default;
         LastYieldedOffset = -1;
+        LastYieldedLeaderEpoch = -1;
         TotalBytesConsumed = 0;
         MessageCount = 0;
         _emittedMessageCount = 0;
@@ -611,6 +617,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
     //   Adding locks would defeat the purpose of lock-free consumption.
     private readonly ConcurrentDictionary<TopicPartition, long> _positions = new();      // Consumed position (what app has seen)
     private readonly ConcurrentDictionary<TopicPartition, long> _dirtyPositions = new(); // Positions changed since last successful commit
+    private readonly ConcurrentDictionary<TopicPartition, TopicPartitionOffsetAndLeaderEpoch> _positionLeaderEpochs = new();
     private readonly ConcurrentDictionary<TopicPartition, long> _fetchPositions = new(); // Fetch position (what to fetch next)
     private readonly ConcurrentDictionary<TopicPartition, long> _committed = new();
     private readonly ConcurrentDictionary<TopicPartition, WatermarkOffsets> _watermarks = new(); // Cached watermark offsets from fetch responses
@@ -1305,6 +1312,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                             // Use batch-level cached timestamp type (computed once per batch
                             // transition in CacheCurrentBatchState, not per message)
                             var timestampType = pending.CurrentTimestampType;
+                            var partitionLeaderEpoch = pending.CurrentPartitionLeaderEpoch;
 
                             var messageBytes = (record.IsKeyNull ? 0 : record.Key.Length) +
                                                (record.IsValueNull ? 0 : record.Value.Length);
@@ -1339,7 +1347,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                                 headerOwner: pending,
                                 timestampMs: timestampMs,
                                 timestampType: timestampType,
-                                leaderEpoch: null,
+                                leaderEpoch: partitionLeaderEpoch >= 0 ? partitionLeaderEpoch : null,
                                 keyDeserializer: _keyDeserializer,
                                 valueDeserializer: _valueDeserializer);
 
@@ -2192,10 +2200,10 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
     /// </summary>
     private void FlushConsumedPositions(PendingFetchData pending)
     {
-        if (!TryGetConsumedPosition(pending, out var tp, out var nextOffset))
+        if (!TryGetConsumedPosition(pending, out var tp, out var nextOffset, out var leaderEpoch))
             return;
 
-        SetPosition(tp, nextOffset, dirty: true);
+        SetConsumedPosition(tp, nextOffset, dirty: true, leaderEpoch);
 
         if (!_prefetchEnabled)
         {
@@ -2209,8 +2217,8 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
             return;
 
         var pending = _pendingFetches.Peek();
-        if (TryGetConsumedPosition(pending, out var tp, out var nextOffset))
-            SetPosition(tp, nextOffset, dirty: true);
+        if (TryGetConsumedPosition(pending, out var tp, out var nextOffset, out var leaderEpoch))
+            SetConsumedPosition(tp, nextOffset, dirty: true, leaderEpoch);
     }
 
     private bool TryGetActiveConsumedPosition(TopicPartition partition, out long position)
@@ -2222,7 +2230,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         }
 
         var pending = _pendingFetches.Peek();
-        if (!TryGetConsumedPosition(pending, out var tp, out position) || !tp.Equals(partition))
+        if (!TryGetConsumedPosition(pending, out var tp, out position, out _) || !tp.Equals(partition))
         {
             position = 0;
             return false;
@@ -2231,23 +2239,48 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         return true;
     }
 
-    private static bool TryGetConsumedPosition(PendingFetchData pending, out TopicPartition partition, out long nextOffset)
+    private static bool TryGetConsumedPosition(PendingFetchData pending, out TopicPartition partition, out long nextOffset, out int leaderEpoch)
     {
         if (pending.LastYieldedOffset < 0)
         {
             partition = default;
             nextOffset = 0;
+            leaderEpoch = -1;
             return false;
         }
 
         partition = pending.TopicPartition;
         nextOffset = pending.LastYieldedOffset + 1;
+        leaderEpoch = pending.LastYieldedLeaderEpoch;
         return true;
     }
 
     private void SetPosition(TopicPartition partition, long position, bool dirty)
     {
+        UpdatePosition(partition, position, dirty, leaderEpoch: -1);
+    }
+
+    private void SetConsumedPosition(TopicPartition partition, long position, bool dirty, int leaderEpoch)
+    {
+        UpdatePosition(partition, position, dirty, leaderEpoch);
+    }
+
+    private void UpdatePosition(TopicPartition partition, long position, bool dirty, int leaderEpoch)
+    {
         _positions[partition] = position;
+        if (leaderEpoch >= 0)
+        {
+            _positionLeaderEpochs[partition] = new TopicPartitionOffsetAndLeaderEpoch(
+                partition.Topic,
+                partition.Partition,
+                position,
+                leaderEpoch);
+        }
+        else
+        {
+            _positionLeaderEpochs.TryRemove(partition, out _);
+        }
+
         if (dirty)
             _dirtyPositions[partition] = position;
         else
@@ -2263,6 +2296,13 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
     {
         _committed[partition] = committedOffset;
         ClearDirtyPositionIfCommitted(partition, committedOffset);
+    }
+
+    private TopicPartitionOffsetAndLeaderEpoch GetOffsetAndLeaderEpoch(TopicPartition partition, long offset)
+    {
+        return _positionLeaderEpochs.TryGetValue(partition, out var tracked) && tracked.Offset == offset
+            ? tracked
+            : new TopicPartitionOffsetAndLeaderEpoch(partition.Topic, partition.Partition, offset, -1);
     }
 
     private void UpdateFetchPositionsFromPrefetch(PendingFetchData pending)
@@ -2543,6 +2583,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                         var offset = pending.CurrentBaseOffset + record.OffsetDelta;
                         var timestampMs = pending.CurrentBaseTimestamp + record.TimestampDelta;
                         var timestampType = pending.CurrentTimestampType;
+                        var partitionLeaderEpoch = pending.CurrentPartitionLeaderEpoch;
                         var messageBytes = (record.IsKeyNull ? 0 : record.Key.Length) +
                                            (record.IsValueNull ? 0 : record.Value.Length);
 
@@ -2569,7 +2610,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                             headerOwner: pending,
                             timestampMs: timestampMs,
                             timestampType: timestampType,
-                            leaderEpoch: null,
+                            leaderEpoch: partitionLeaderEpoch >= 0 ? partitionLeaderEpoch : null,
                             keyDeserializer: _keyDeserializer,
                             valueDeserializer: _valueDeserializer);
 
@@ -2626,7 +2667,8 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         if (_coordinator is null)
             return;
 
-        TopicPartitionOffset[]? offsetsArray = null;
+        TopicPartitionOffsetAndLeaderEpoch[]? offsetsArray = null;
+        TopicPartitionOffset[]? interceptorOffsetsArray = null;
         int offsetCount;
 
         {
@@ -2640,17 +2682,20 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
             LogCommitStarted(offsetCount);
 
             // Rent array from pool to avoid List allocation
-            offsetsArray = ArrayPool<TopicPartitionOffset>.Shared.Rent(offsetCount);
+            offsetsArray = ArrayPool<TopicPartitionOffsetAndLeaderEpoch>.Shared.Rent(offsetCount);
+            interceptorOffsetsArray = ArrayPool<TopicPartitionOffset>.Shared.Rent(offsetCount);
             try
             {
                 int index = 0;
                 foreach (var kvp in dirtyPositionsSnapshot)
                 {
-                    offsetsArray[index++] = new TopicPartitionOffset(kvp.Key.Topic, kvp.Key.Partition, kvp.Value);
+                    offsetsArray[index] = GetOffsetAndLeaderEpoch(kvp.Key, kvp.Value);
+                    interceptorOffsetsArray[index] = new TopicPartitionOffset(kvp.Key.Topic, kvp.Key.Partition, kvp.Value);
+                    index++;
                 }
 
                 // Create array segment to pass only the used portion
-                var offsets = new ArraySegment<TopicPartitionOffset>(offsetsArray, 0, offsetCount);
+                var offsets = new ArraySegment<TopicPartitionOffsetAndLeaderEpoch>(offsetsArray, 0, offsetCount);
 
                 await _coordinator.CommitOffsetsAsync(offsets, cancellationToken).ConfigureAwait(false);
 
@@ -2662,11 +2707,12 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                 }
 
                 // Invoke OnCommit interceptors - wrap array as ArraySegment to avoid Span→Array copy
-                InvokeOnCommitInterceptors(new ArraySegment<TopicPartitionOffset>(offsetsArray, 0, offsetCount));
+                InvokeOnCommitInterceptors(new ArraySegment<TopicPartitionOffset>(interceptorOffsetsArray, 0, offsetCount));
             }
             finally
             {
-                ArrayPool<TopicPartitionOffset>.Shared.Return(offsetsArray);
+                ArrayPool<TopicPartitionOffsetAndLeaderEpoch>.Shared.Return(offsetsArray);
+                ArrayPool<TopicPartitionOffset>.Shared.Return(interceptorOffsetsArray);
             }
         }
     }
@@ -2678,8 +2724,16 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
 
         // Materialize to list to allow iteration for both commit tracking and interceptors
         var offsetsList = offsets as IReadOnlyList<TopicPartitionOffset> ?? offsets.ToArray();
+        var offsetsWithLeaderEpochs = new TopicPartitionOffsetAndLeaderEpoch[offsetsList.Count];
+        for (var i = 0; i < offsetsList.Count; i++)
+        {
+            var offset = offsetsList[i];
+            offsetsWithLeaderEpochs[i] = GetOffsetAndLeaderEpoch(
+                new TopicPartition(offset.Topic, offset.Partition),
+                offset.Offset);
+        }
 
-        await _coordinator.CommitOffsetsAsync(offsetsList, cancellationToken).ConfigureAwait(false);
+        await _coordinator.CommitOffsetsAsync(offsetsWithLeaderEpochs, cancellationToken).ConfigureAwait(false);
 
         foreach (var offset in offsetsList)
         {
@@ -2809,6 +2863,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         {
             _positions.TryRemove(partition, out _);
             _dirtyPositions.TryRemove(partition, out _);
+            _positionLeaderEpochs.TryRemove(partition, out _);
             _fetchPositions.TryRemove(partition, out _);
             _committed.TryRemove(partition, out _);
             _highWatermarks.TryRemove(partition, out _);

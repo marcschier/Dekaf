@@ -108,6 +108,7 @@ namespace Dekaf.Consumer
                 long timestampMs = pending.CurrentBaseTimestamp + record.TimestampDelta;
 
                 TimestampType timestampType = pending.CurrentTimestampType;
+                int partitionLeaderEpoch = pending.CurrentPartitionLeaderEpoch;
 
                 int messageBytes = (record.IsKeyNull ? 0 : record.Key.Length) +
                                    (record.IsValueNull ? 0 : record.Value.Length);
@@ -125,7 +126,7 @@ namespace Dekaf.Consumer
                     headerOwner: pending,
                     timestampMs: timestampMs,
                     timestampType: timestampType,
-                    leaderEpoch: null,
+                    leaderEpoch: partitionLeaderEpoch >= 0 ? partitionLeaderEpoch : null,
                     keyDeserializer: _batch._keyDeserializer,
                     valueDeserializer: _batch._valueDeserializer);
 

@@ -50,6 +50,28 @@ public class ConsumeResultTests
     }
 
     [Test]
+    public async Task ConsumeResult_WithLeaderEpoch_ExposesLeaderEpoch()
+    {
+        var result = new ConsumeResult<string, string>(
+            topic: "test-topic",
+            partition: 0,
+            offset: 100,
+            keyData: default,
+            isKeyNull: true,
+            valueData: default,
+            isValueNull: true,
+            headers: null,
+            timestampMs: 0,
+            timestampType: TimestampType.NotAvailable,
+            leaderEpoch: 9,
+            keyDeserializer: null,
+            valueDeserializer: null);
+
+        await Assert.That(result.LeaderEpoch).IsEqualTo(9);
+    }
+
+
+    [Test]
     public async Task CreatePartitionEof_CreatesEofResult()
     {
         var result = ConsumeResult<string, string>.CreatePartitionEof("test-topic", 2, 500);
