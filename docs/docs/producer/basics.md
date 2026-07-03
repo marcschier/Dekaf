@@ -62,13 +62,6 @@ var message = new ProducerMessage<string, string>
 await producer.ProduceAsync(message);
 ```
 
-Or use the factory method:
-
-```csharp
-var message = ProducerMessage<string, string>.Create("my-topic", "key", "value");
-await producer.ProduceAsync(message);
-```
-
 ## Delivery Guarantees (Acks)
 
 The `Acks` setting controls when the broker considers a message "delivered":
