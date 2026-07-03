@@ -649,6 +649,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
     // Cached metric tags per topic to avoid per-message TagList allocation
     // Plain Dictionary is safe: only accessed from the single ConsumeAsync loop thread
     private readonly Dictionary<string, System.Diagnostics.TagList> _metricTagsCache = [];
+    private readonly ConcurrentDictionary<int, TagList> _fetchDurationMetricTagsCache = new();
 
     private const long EarliestOffsetTimestamp = -2;
     private const long LatestOffsetTimestamp = -1;
@@ -1959,10 +1960,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                 ConsumerFetchPools.ReturnFetchRequestTopics(topicData);
             }
 
-            // Record fetch round-trip duration (~3ns no-op when no listener)
-            Diagnostics.DekafMetrics.FetchDuration.Record(
-                System.Diagnostics.Stopwatch.GetElapsedTime(fetchStarted).TotalSeconds,
-                new System.Diagnostics.TagList { { Diagnostics.DekafDiagnostics.MessagingKafkaBrokerId, brokerId } });
+            RecordFetchDuration(fetchStarted, brokerId);
 
             // Take ownership of pooled memory from the response (if zero-copy was used)
             var memoryOwner = response.PooledMemoryOwner;
@@ -2428,6 +2426,21 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         Diagnostics.DekafMetrics.MessagesReceived.Add(fetch.MessageCount, metricTags);
         Diagnostics.DekafMetrics.BytesReceived.Add(fetch.TotalBytesConsumed, metricTags);
     }
+
+    private void RecordFetchDuration(long fetchStarted, int brokerId)
+    {
+        if (!Diagnostics.DekafMetrics.FetchDuration.Enabled)
+            return;
+
+        Diagnostics.DekafMetrics.FetchDuration.Record(
+            Stopwatch.GetElapsedTime(fetchStarted).TotalSeconds,
+            GetFetchDurationMetricTags(brokerId));
+    }
+
+    private TagList GetFetchDurationMetricTags(int brokerId) =>
+        _fetchDurationMetricTagsCache.GetOrAdd(
+            brokerId,
+            static id => new TagList { { Diagnostics.DekafDiagnostics.MessagingKafkaBrokerId, id } });
 
     public void Seek(TopicPartitionOffset offset)
     {
@@ -3450,10 +3463,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
             ConsumerFetchPools.ReturnFetchRequestTopics(topicData);
         }
 
-        // Record fetch round-trip duration (~3ns no-op when no listener)
-        Diagnostics.DekafMetrics.FetchDuration.Record(
-            System.Diagnostics.Stopwatch.GetElapsedTime(fetchStarted).TotalSeconds,
-            new System.Diagnostics.TagList { { Diagnostics.DekafDiagnostics.MessagingKafkaBrokerId, brokerId } });
+        RecordFetchDuration(fetchStarted, brokerId);
 
         // Take ownership of pooled memory from the response (if zero-copy was used)
         var memoryOwner = response.PooledMemoryOwner;
