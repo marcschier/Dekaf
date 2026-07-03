@@ -1,3 +1,4 @@
+using System.Reflection;
 using Dekaf.Errors;
 using Dekaf.Metadata;
 using Dekaf.Networking;
@@ -296,4 +297,59 @@ public class MetadataManagerTests
         await Assert.That(metadataRequests).IsEqualTo(1);
     }
 
+    [Test]
+    public async Task InitializeAsync_DisposeDuringRefresh_DoesNotThrowFromDisposedLocks()
+    {
+        var pool = Substitute.For<IConnectionPool>();
+        var connection = Substitute.For<IKafkaConnection>();
+        var refreshStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRefresh = new TaskCompletionSource<MetadataResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        pool.GetConnectionAsync("localhost", 9092, Arg.Any<CancellationToken>())
+            .Returns(new ValueTask<IKafkaConnection>(connection));
+
+        connection.SendAsync<MetadataRequest, MetadataResponse>(
+                Arg.Any<MetadataRequest>(),
+                Arg.Any<short>(),
+                Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                refreshStarted.TrySetResult();
+                return new ValueTask<MetadataResponse>(releaseRefresh.Task);
+            });
+
+        var manager = new MetadataManager(
+            pool,
+            ["localhost:9092"],
+            new MetadataOptions { EnableBackgroundRefresh = false });
+        SetMetadataApiVersion(manager);
+
+        var initializeTask = manager.InitializeAsync().AsTask();
+        await refreshStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var disposeTask = manager.DisposeAsync().AsTask();
+        releaseRefresh.SetResult(CreateMetadataResponse((1, "broker1", 9092)));
+
+        Exception? initializeException = null;
+        try
+        {
+            await initializeTask.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        catch (Exception ex)
+        {
+            initializeException = ex;
+        }
+
+        await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.That(initializeException).IsNull();
+    }
+
+    private static void SetMetadataApiVersion(MetadataManager metadataManager)
+    {
+        var field = typeof(MetadataManager)
+            .GetField("_metadataApiVersion", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException("_metadataApiVersion field not found");
+
+        field.SetValue(metadataManager, MetadataRequest.HighestSupportedVersion);
+    }
 }

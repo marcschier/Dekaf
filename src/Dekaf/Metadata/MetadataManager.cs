@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Runtime.CompilerServices;
 using Dekaf.Errors;
+using Dekaf.Internal;
 using Dekaf.Networking;
 using Dekaf.Protocol;
 using Dekaf.Protocol.Messages;
@@ -225,7 +226,8 @@ public sealed partial class MetadataManager : IAsyncDisposable
         if (Volatile.Read(ref _disposed) != 0)
             throw new ObjectDisposedException(nameof(MetadataManager));
 
-        await _initializeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await SemaphoreHelper.AcquireOrThrowDisposedAsync(_initializeLock, nameof(MetadataManager), cancellationToken)
+            .ConfigureAwait(false);
         try
         {
             if (_initialized)
@@ -257,7 +259,7 @@ public sealed partial class MetadataManager : IAsyncDisposable
         }
         finally
         {
-            _initializeLock.Release();
+            SemaphoreHelper.ReleaseSafely(_initializeLock);
         }
     }
 
@@ -502,7 +504,8 @@ public sealed partial class MetadataManager : IAsyncDisposable
             throw new ObjectDisposedException(nameof(MetadataManager));
 
         LogMetadataRefreshRequested();
-        await _refreshLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await SemaphoreHelper.AcquireOrThrowDisposedAsync(_refreshLock, nameof(MetadataManager), cancellationToken)
+            .ConfigureAwait(false);
         try
         {
             // Re-check cache after acquiring lock — another thread may have refreshed
@@ -519,7 +522,7 @@ public sealed partial class MetadataManager : IAsyncDisposable
         }
         finally
         {
-            _refreshLock.Release();
+            SemaphoreHelper.ReleaseSafely(_refreshLock);
         }
     }
 
