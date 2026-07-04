@@ -376,11 +376,19 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
         if (_options.UseTls || _options.TlsConfig is not null)
         {
+#if NETSTANDARD2_0
+            var sslStream = CreateLegacySslStream(networkStream);
+#else
             var sslStream = new SslStream(networkStream, leaveInnerStreamOpen: false);
             var sslOptions = BuildSslClientAuthenticationOptions();
+#endif
             try
             {
+#if NETSTANDARD2_0
+                await AuthenticateLegacyAsClientAsync(sslStream, cancellationToken).ConfigureAwait(false);
+#else
                 await sslStream.AuthenticateAsClientAsync(sslOptions, cancellationToken).ConfigureAwait(false);
+#endif
             }
             catch (System.Security.Authentication.AuthenticationException ex)
             {
@@ -1523,6 +1531,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
         ReleasePendingRequestSlots(releasedSlots);
     }
 
+#if !NETSTANDARD2_0
     private SslClientAuthenticationOptions BuildSslClientAuthenticationOptions()
     {
         var tlsConfig = _options.TlsConfig;
@@ -1575,6 +1584,53 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
         return options;
     }
+#else
+    private SslStream CreateLegacySslStream(Stream innerStream)
+    {
+        var tlsConfig = _options.TlsConfig;
+        RemoteCertificateValidationCallback? callback = _options.RemoteCertificateValidationCallback;
+
+        if (tlsConfig is not null && !tlsConfig.ValidateServerCertificate)
+        {
+#pragma warning disable CA5359 // Do not disable certificate validation
+            callback = (_, _, _, _) => true;
+#pragma warning restore CA5359
+        }
+        else if (callback is null && HasCustomCaCertificate(tlsConfig))
+        {
+            var caCertificates = LoadCaCertificatesWithOwnership(tlsConfig!);
+            callback = (_, certificate, chain, sslPolicyErrors) =>
+                ValidateServerCertificate(certificate, chain, sslPolicyErrors, caCertificates);
+        }
+
+        return callback is null
+            ? new SslStream(innerStream, leaveInnerStreamOpen: false)
+            : new SslStream(innerStream, leaveInnerStreamOpen: false, (sender, cert, chain, errors) => callback(sender, cert, chain, errors));
+    }
+
+    private async Task AuthenticateLegacyAsClientAsync(SslStream sslStream, CancellationToken cancellationToken)
+    {
+        var tlsConfig = _options.TlsConfig;
+        var targetHost = tlsConfig?.TargetHost ?? _host;
+        var protocols = tlsConfig?.EnabledSslProtocols ?? System.Security.Authentication.SslProtocols.None;
+        var checkRevocation = tlsConfig?.CheckCertificateRevocation ?? false;
+
+        var clientCertificates = new X509CertificateCollection();
+        if (tlsConfig is not null)
+        {
+            var clientCert = LoadClientCertificateWithOwnership(tlsConfig);
+            if (clientCert is not null)
+            {
+                clientCertificates.Add(clientCert);
+            }
+        }
+
+        // The legacy AuthenticateAsClientAsync overload has no CancellationToken parameter.
+        cancellationToken.ThrowIfCancellationRequested();
+        await sslStream.AuthenticateAsClientAsync(targetHost, clientCertificates, protocols, checkRevocation)
+            .ConfigureAwait(false);
+    }
+#endif
 
     private void ConfigureTcpKeepAlive(Socket socket)
     {

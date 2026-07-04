@@ -155,12 +155,14 @@ internal sealed class BufferWriterStream : Stream
         _writer.Advance(count);
     }
 
+#if !NETSTANDARD2_0
     public override void Write(ReadOnlySpan<byte> buffer)
     {
         var span = _writer.GetSpan(buffer.Length);
         buffer.CopyTo(span);
         _writer.Advance(buffer.Length);
     }
+#endif
 }
 
 /// <summary>
