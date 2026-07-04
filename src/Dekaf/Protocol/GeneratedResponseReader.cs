@@ -3,6 +3,8 @@
 // Regenerate after adding or removing a *Response.cs message type.
 // </auto-generated>
 #if !NET7_0_OR_GREATER
+using Dekaf.Protocol.Messages;
+
 namespace Dekaf.Protocol;
 
 /// <summary>
