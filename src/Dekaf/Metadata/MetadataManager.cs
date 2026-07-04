@@ -666,7 +666,7 @@ public sealed partial class MetadataManager : IAsyncDisposable
     /// </summary>
     internal async ValueTask<bool> TryRebootstrapAsync(IEnumerable<string>? topics, CancellationToken cancellationToken)
     {
-        var now = Environment.TickCount64;
+        var now = BclCompat.TickCount64;
 
         // Atomically set the timestamp only if it hasn't been set yet (compare-and-set from 0)
         if (Interlocked.CompareExchange(ref _allBrokersUnavailableSince, now, 0) == 0)
@@ -787,7 +787,7 @@ public sealed partial class MetadataManager : IAsyncDisposable
                 // Apply a per-host timeout to prevent DNS hangs from blocking rebootstrap
                 using var dnsCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 dnsCts.CancelAfter(TimeSpan.FromSeconds(5));
-                var addresses = await Dns.GetHostAddressesAsync(host, dnsCts.Token).ConfigureAwait(false);
+                var addresses = await BclCompat.GetHostAddressesAsync(host, dnsCts.Token).ConfigureAwait(false);
                 foreach (var address in addresses)
                 {
                     var endpoint = (address.ToString(), port);

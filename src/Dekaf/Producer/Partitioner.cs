@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using Dekaf.Internal;
 
 namespace Dekaf.Producer;
 
@@ -64,7 +65,7 @@ public sealed class StickyPartitioner : IPartitioner, IBatchCompletionAwareParti
             // Cold path: topic not yet seen, compute and add a partition.
             // Use uint to avoid overflow to negative values.
             // GetOrAdd handles the race condition - if another thread added first, we use their value.
-            var newPartition = (int)(Interlocked.Increment(ref _counter) % (uint)partitionCount);
+            var newPartition = (int)(BclCompat.InterlockedIncrement(ref _counter) % (uint)partitionCount);
             return _stickyPartitions.GetOrAdd(topic, newPartition);
         }
 
@@ -80,8 +81,8 @@ public sealed class StickyPartitioner : IPartitioner, IBatchCompletionAwareParti
         // Use uint to avoid overflow to negative values.
         _stickyPartitions.AddOrUpdate(
             topic,
-            _ => (int)(Interlocked.Increment(ref _counter) % (uint)partitionCount),
-            (_, _) => (int)(Interlocked.Increment(ref _counter) % (uint)partitionCount));
+            _ => (int)(BclCompat.InterlockedIncrement(ref _counter) % (uint)partitionCount),
+            (_, _) => (int)(BclCompat.InterlockedIncrement(ref _counter) % (uint)partitionCount));
     }
 }
 

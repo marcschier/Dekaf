@@ -133,8 +133,8 @@ internal sealed class PooledReusableBufferWriter : IBufferWriter<byte>, IDisposa
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void Grow(int sizeHint)
     {
-        var doubled = Math.Min((long)_buffer.Length * 2, Array.MaxLength);
-        var required = Math.Min((long)_written + sizeHint, Array.MaxLength);
+        var doubled = Math.Min((long)_buffer.Length * 2, BclCompat.MaxArrayLength);
+        var required = Math.Min((long)_written + sizeHint, BclCompat.MaxArrayLength);
         var newSize = (int)Math.Max(doubled, required);
 
         if (newSize <= _buffer.Length)
@@ -254,8 +254,8 @@ internal sealed class DetachableBufferWriter : IBufferWriter<byte>, IDisposable
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void Grow(int sizeHint)
     {
-        var doubled = Math.Min((long)_buffer.Length * 2, Array.MaxLength);
-        var required = Math.Min((long)_written + sizeHint, Array.MaxLength);
+        var doubled = Math.Min((long)_buffer.Length * 2, BclCompat.MaxArrayLength);
+        var required = Math.Min((long)_written + sizeHint, BclCompat.MaxArrayLength);
         var newSize = (int)Math.Max(doubled, required);
 
         if (newSize <= _buffer.Length)

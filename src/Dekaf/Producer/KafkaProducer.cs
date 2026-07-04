@@ -930,7 +930,7 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         // Check if cache is for this metadata manager, topic, and still valid
         // Use signed comparison to handle TickCount64 wraparound (every ~292 million years)
         var cache = GetOrCreateCache();
-        var currentTicks = Environment.TickCount64;
+        var currentTicks = BclCompat.TickCount64;
         if (cache.CachedMetadataManager == _metadataManager &&
             cache.CachedTopicName == topic &&
             cache.CachedTopicInfo is not null &&
@@ -957,7 +957,7 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         cache.CachedTopicInfo = topicInfo;
         // Cache valid for ~1 second (1000 ticks) - enough for high-throughput bursts
         // while still detecting stale metadata reasonably quickly
-        cache.CachedTopicValidUntilTicks = Environment.TickCount64 + 1000;
+        cache.CachedTopicValidUntilTicks = BclCompat.TickCount64 + 1000;
     }
 
     /// <summary>
@@ -3061,10 +3061,10 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
     {
         var cache = GetOrCreateCache();
 
-        // Use Environment.TickCount64 (cheap counter) to determine if we need to refresh.
+        // Use BclCompat.TickCount64 (cheap counter) to determine if we need to refresh.
         // TickCount64 increments every ~15.6ms on Windows, ~1ms on Linux, but checking
         // the difference is still much cheaper than calling DateTimeOffset.UtcNow.
-        var currentTicks = Environment.TickCount64;
+        var currentTicks = BclCompat.TickCount64;
 
         // Refresh if more than ~1ms has passed (or on first call when CachedTimestampTicks is 0)
         if (currentTicks - cache.CachedTimestampTicks > 1 || cache.CachedTimestampTicks == 0)
@@ -3883,7 +3883,7 @@ internal struct PooledBufferWriter : IBufferWriter<byte>
     private void Grow(int sizeHint)
     {
         // Calculate new size: at least double, but ensure it fits the requested size
-        // Use checked arithmetic to detect overflow and cap at Array.MaxLength
+        // Use checked arithmetic to detect overflow and cap at BclCompat.MaxArrayLength
         var currentLength = _buffer!.Length;
         int newSize;
         try
@@ -3895,12 +3895,12 @@ internal struct PooledBufferWriter : IBufferWriter<byte>
         catch (OverflowException)
         {
             // On overflow, use the maximum array size
-            newSize = Array.MaxLength;
+            newSize = BclCompat.MaxArrayLength;
         }
 
         // Ensure we don't exceed the maximum array size
-        if (newSize > Array.MaxLength)
-            newSize = Array.MaxLength;
+        if (newSize > BclCompat.MaxArrayLength)
+            newSize = BclCompat.MaxArrayLength;
 
         // If we can't grow anymore and current capacity isn't enough, throw
         if (newSize <= currentLength)

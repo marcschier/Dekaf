@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Dekaf;
+using Dekaf.Internal;
 using Dekaf.Metadata;
 using Dekaf.Networking;
 using Dekaf.Producer;
@@ -1183,7 +1184,7 @@ public sealed class AdminClient : IAdminClient
                     break;
 
                 case UserScramCredentialUpsertion upsertion:
-                    var salt = upsertion.Salt ?? RandomNumberGenerator.GetBytes(32);
+                    var salt = upsertion.Salt ?? BclCompat.RandomBytes(32);
                     var saltedPassword = ComputeSaltedPassword(
                         upsertion.Password,
                         salt,
@@ -1242,7 +1243,7 @@ public sealed class AdminClient : IAdminClient
 
         var hashSize = mechanism == ScramMechanism.ScramSha256 ? 32 : 64;
 
-        return Rfc2898DeriveBytes.Pbkdf2(
+        return BclCompat.Pbkdf2(
             Encoding.UTF8.GetBytes(password),
             salt,
             iterations,

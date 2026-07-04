@@ -2243,7 +2243,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
             key.Return();
             value.Return();
             ReturnPooledHeaders(headers);
-            return ValueTask.FromException<bool>(new ObjectDisposedException(nameof(RecordAccumulator)));
+            return BclCompat.FromException<bool>(new ObjectDisposedException(nameof(RecordAccumulator)));
         }
 
         if (cancellationToken.IsCancellationRequested)
@@ -2251,7 +2251,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
             key.Return();
             value.Return();
             ReturnPooledHeaders(headers);
-            return ValueTask.FromException<bool>(new OperationCanceledException(cancellationToken));
+            return BclCompat.FromException<bool>(new OperationCanceledException(cancellationToken));
         }
 
         var (startTicks, deadline) = BeginReservationWait(recordSize);
@@ -2273,7 +2273,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                 // Caller gets a pre-built exception ValueTask, so nobody will call GetResult
                 // on this op. Manually return it to the pool to avoid leaking.
                 op.ReturnToPoolAfterTryFail();
-                return ValueTask.FromException<bool>(disposedException);
+                return BclCompat.FromException<bool>(disposedException);
             }
         }
 
@@ -2893,7 +2893,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         var currentBufferedBytes = Volatile.Read(ref _bufferedBytes);
         var currentMaxBufferMemory = (ulong)Volatile.Read(ref _maxBufferMemory);
         LogBufferMemoryWaiting(recordSize, currentBufferedBytes, currentMaxBufferMemory);
-        var currentTicks = Environment.TickCount64;
+        var currentTicks = BclCompat.TickCount64;
         var deadline = (long.MaxValue - currentTicks > _options.MaxBlockMs)
             ? currentTicks + _options.MaxBlockMs
             : long.MaxValue;
@@ -2923,7 +2923,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            var remainingMs = deadline - Environment.TickCount64;
+            var remainingMs = deadline - BclCompat.TickCount64;
             if (remainingMs <= 0)
                 ThrowBufferMemoryTimeout(recordSize, startTicks);
 
@@ -3002,7 +3002,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
     private void ThrowBufferMemoryTimeout(int recordSize, long startTicks)
     {
         var configured = TimeSpan.FromMilliseconds(_options.MaxBlockMs);
-        var elapsed = TimeSpan.FromMilliseconds(Environment.TickCount64 - startTicks);
+        var elapsed = TimeSpan.FromMilliseconds(BclCompat.TickCount64 - startTicks);
         throw new KafkaTimeoutException(
             TimeoutKind.MaxBlock,
             elapsed,
@@ -4128,7 +4128,7 @@ internal sealed class PartitionBatch
         // Minimum record wire overhead ~64 bytes (conservative for small messages)
         const int minRecordOverhead = 64;
         var estimated = (uint)Math.Max(batchSize / minRecordOverhead, 64);
-        return (int)Math.Min(BitOperations.RoundUpToPowerOf2(estimated), 16384);
+        return (int)Math.Min(BclCompat.RoundUpToPowerOf2(estimated), 16384);
     }
 
     /// <summary>
@@ -4715,7 +4715,7 @@ internal sealed class PartitionBatch
     {
         // SIMD-optimized ASCII check: if all chars are ASCII, byte count == char count
         // This is much faster than UTF8.GetByteCount for the common ASCII case
-        return System.Text.Ascii.IsValid(key)
+        return BclCompat.AsciiIsValid(key)
             ? key.Length
             : System.Text.Encoding.UTF8.GetByteCount(key);
     }

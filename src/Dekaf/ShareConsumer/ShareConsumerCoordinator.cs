@@ -27,7 +27,7 @@ internal sealed partial class ShareConsumerCoordinator : IAsyncDisposable
     private volatile int _memberEpoch;
     // Volatile ensures cross-thread visibility of the reference. Thread-safety relies on
     // all writes replacing the reference entirely (never in-place mutation).
-    private volatile HashSet<TopicPartition> _assignedPartitions = [];
+    private volatile DekafSet<TopicPartition> _assignedPartitions = [];
     private readonly SemaphoreSlim _lock = new(1, 1);
     private readonly object _heartbeatGuard = new();
     private CancellationTokenSource? _heartbeatCts;

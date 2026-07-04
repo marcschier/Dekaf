@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Text;
+using Dekaf.Internal;
 
 namespace Dekaf.Protocol;
 
@@ -94,7 +95,7 @@ public ref struct KafkaProtocolWriter
     public void WriteUuid(Guid value)
     {
         var span = _output.GetSpan(16);
-        value.TryWriteBytes(span, bigEndian: true, out _);
+        BclCompat.WriteGuidBigEndian(value, span);
         _output.Advance(16);
         _bytesWritten += 16;
     }

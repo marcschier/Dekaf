@@ -32,7 +32,7 @@ internal sealed class CancellationTokenSourcePool
 
     private bool Return(PooledCancellationTokenSource cts)
     {
-        if (Interlocked.Increment(ref _count) > _maxQueueSize || !cts.TryReset())
+        if (Interlocked.Increment(ref _count) > _maxQueueSize || !cts.TryResetCompat())
         {
             Interlocked.Decrement(ref _count);
             return false;

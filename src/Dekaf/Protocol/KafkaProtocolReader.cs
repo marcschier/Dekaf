@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Text;
+using Dekaf.Internal;
 
 namespace Dekaf.Protocol;
 
@@ -302,7 +303,7 @@ public ref struct KafkaProtocolReader
         {
             if (_position + 16 > _span.Length)
                 ThrowInsufficientData();
-            var result = new Guid(_span.Slice(_position, 16), bigEndian: true);
+            var result = BclCompat.ReadGuidBigEndian(_span.Slice(_position, 16));
             _position += 16;
             return result;
         }
@@ -314,7 +315,7 @@ public ref struct KafkaProtocolReader
     {
         if (_reader.UnreadSpan.Length >= 16)
         {
-            var result = new Guid(_reader.UnreadSpan[..16], bigEndian: true);
+            var result = BclCompat.ReadGuidBigEndian(_reader.UnreadSpan[..16]);
             _reader.Advance(16);
             return result;
         }
@@ -322,7 +323,7 @@ public ref struct KafkaProtocolReader
         if (!_reader.TryCopyTo(buffer))
             ThrowInsufficientData();
         _reader.Advance(16);
-        return new Guid(buffer, bigEndian: true);
+        return BclCompat.ReadGuidBigEndian(buffer);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -772,7 +773,11 @@ public ref struct KafkaProtocolReader
         if (_reader.UnreadSpan.Length >= count)
         {
             // Get the underlying memory from the current position
+#if NETSTANDARD
+            var sequence = _reader.Sequence.Slice(_reader.Position);
+#else
             var sequence = _reader.UnreadSequence;
+#endif
             var first = sequence.First;
             var result = first.Slice(0, count);
             _reader.Advance(count);
@@ -893,7 +898,11 @@ public ref struct KafkaProtocolReader
             return new ReadOnlySequence<byte>(_span.Slice(_position).ToArray());
         }
 
-        return _reader.UnreadSequence;
+#if NETSTANDARD
+            return _reader.Sequence.Slice(_reader.Position);
+#else
+            return _reader.UnreadSequence;
+#endif
     }
 
     /// <summary>

@@ -24,12 +24,13 @@
   </ItemGroup>
 
   <!-- Source-only polyfills for newer BCL/C# surface (throw-helper guards, span overloads,
-       Socket async, etc.) on the lower TFMs. Compiles to nothing on net8.0+ (not referenced),
-       so the modern fast paths are byte-for-byte unaffected. -->
-  <PropertyGroup Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1'">
+       Socket async, System.Threading.Lock, Base64Url, etc.) on the sub-net9 TFMs. net8.0 is
+       included because it still lacks several net9.0 APIs Dekaf uses. Compiles to nothing on
+       net9.0+ (not referenced), so the modern fast paths are byte-for-byte unaffected. -->
+  <PropertyGroup Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1' or '$(TargetFramework)' == 'net8.0'">
     <PolyArgumentExceptions>true</PolyArgumentExceptions>
   </PropertyGroup>
-  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1'">
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1' or '$(TargetFramework)' == 'net8.0'">
     <PackageReference Include="Polyfill" Version="10.11.2" PrivateAssets="all" />
   </ItemGroup>
 

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 #if !NET5_0_OR_GREATER
@@ -62,5 +63,30 @@ namespace Dekaf
             : base(collection, comparer)
         {
         }
+    }
+
+    /// <summary>
+    /// Collection helpers used to bridge BCL API gaps on the lower target frameworks while keeping
+    /// call sites uniform across all TFMs.
+    /// </summary>
+    internal static class DekafCollectionExtensions
+    {
+        /// <summary>
+        /// Materializes a sequence into a <see cref="DekafSet{T}"/> (which satisfies
+        /// <c>IReadOnlySet&lt;T&gt;</c> on every TFM, unlike <see cref="HashSet{T}"/> on netstandard).
+        /// </summary>
+        public static DekafSet<T> ToDekafSet<T>(this IEnumerable<T> source) => new DekafSet<T>(source);
+
+#if NETSTANDARD
+        /// <summary>
+        /// Polyfill for <c>ConcurrentDictionary.TryRemove(KeyValuePair)</c> (net5.0+): removes the
+        /// entry only if both key and value match.
+        /// </summary>
+        public static bool TryRemove<TKey, TValue>(
+            this ConcurrentDictionary<TKey, TValue> dictionary,
+            KeyValuePair<TKey, TValue> item)
+            where TKey : notnull
+            => ((ICollection<KeyValuePair<TKey, TValue>>)dictionary).Remove(item);
+#endif
     }
 }

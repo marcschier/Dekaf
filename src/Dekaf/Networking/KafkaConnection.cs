@@ -989,7 +989,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
                     // It returns false if the outer cancellationToken fired (via the registration),
                     // in which case ReadAsync will throw immediately and the while-condition
                     // will exit before the next iteration.
-                    if (timeoutCts.TryReset())
+                    if (timeoutCts.TryResetCompat())
                         timeoutCts.CancelAfter(_options.RequestTimeout);
 
                     // ReadResult state machine (System.IO.Pipelines):
@@ -1583,6 +1583,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
         TrySetSocketOption(socket, SocketOptionLevel.Socket, SocketOptionName.KeepAlive, 1);
 
+#if !NETSTANDARD
         var keepAliveTimeSeconds = ToPositiveSeconds(_options.TcpKeepAliveTime);
         if (keepAliveTimeSeconds > 0)
             TrySetSocketOption(socket, SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, keepAliveTimeSeconds);
@@ -1593,8 +1594,10 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
         if (_options.TcpKeepAliveRetryCount > 0)
             TrySetSocketOption(socket, SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, _options.TcpKeepAliveRetryCount);
+#endif
     }
 
+#if !NETSTANDARD
     private static int ToPositiveSeconds(TimeSpan value)
     {
         if (value <= TimeSpan.Zero)
@@ -1602,6 +1605,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
         return (int)Math.Min(Math.Ceiling(value.TotalSeconds), int.MaxValue);
     }
+#endif
 
     private static void TrySetSocketOption(Socket socket, SocketOptionLevel level, SocketOptionName name, int value)
     {
@@ -1672,8 +1676,13 @@ public sealed partial class KafkaConnection : IKafkaConnection
         }
         else
         {
+#if NETSTANDARD
+            throw new PlatformNotSupportedException(
+                "Loading CA certificates from a PEM file requires .NET 8.0 or later on this target framework.");
+#else
             // Assume PEM format - can contain multiple certificates
             collection.ImportFromPemFile(path);
+#endif
         }
 
         return collection;
@@ -1716,8 +1725,15 @@ public sealed partial class KafkaConnection : IKafkaConnection
                 }
 
                 cert = string.IsNullOrEmpty(tlsConfig.ClientKeyPassword)
+#if NETSTANDARD
+                    ? throw new PlatformNotSupportedException(
+                        "Loading client certificates from a PEM file requires .NET 8.0 or later on this target framework.")
+                    : throw new PlatformNotSupportedException(
+                        "Loading client certificates from a PEM file requires .NET 8.0 or later on this target framework.");
+#else
                     ? X509Certificate2.CreateFromPemFile(certPath, tlsConfig.ClientKeyPath)
                     : X509Certificate2.CreateFromEncryptedPemFile(certPath, tlsConfig.ClientKeyPassword, tlsConfig.ClientKeyPath);
+#endif
             }
 
             _loadedClientCertificate = cert;
@@ -1743,6 +1759,11 @@ public sealed partial class KafkaConnection : IKafkaConnection
         // If the only error is an untrusted root, validate against our custom CA
         if (sslPolicyErrors == SslPolicyErrors.RemoteCertificateChainErrors && chain is not null)
         {
+#if NETSTANDARD
+            // Custom-root-trust validation requires X509ChainPolicy.CustomTrustStore (net5.0+),
+            // which is unavailable here; fail closed rather than trust an unknown root.
+            _ = trustedCaCertificates;
+#else
             // Track if we created a new certificate to dispose it later
             X509Certificate2? ownedCert = null;
             try
@@ -1785,6 +1806,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
             {
                 ownedCert?.Dispose();
             }
+#endif
         }
 
         return false;

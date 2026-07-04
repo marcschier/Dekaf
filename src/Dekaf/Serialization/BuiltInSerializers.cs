@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
+using Dekaf.Internal;
 
 namespace Dekaf.Serialization;
 
@@ -218,13 +219,13 @@ internal sealed class GuidSerde : ISerde<Guid>
 #endif
     {
         var span = destination.GetSpan(16);
-        value.TryWriteBytes(span, bigEndian: true, out _);
+        BclCompat.WriteGuidBigEndian(value, span);
         destination.Advance(16);
     }
 
     public Guid Deserialize(ReadOnlyMemory<byte> data, SerializationContext context)
     {
-        return new Guid(data.Span, bigEndian: true);
+        return BclCompat.ReadGuidBigEndian(data.Span);
     }
 }
 

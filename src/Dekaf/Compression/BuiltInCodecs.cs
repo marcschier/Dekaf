@@ -67,7 +67,11 @@ public sealed class GzipCompressionCodec : ICompressionCodec
             0 => CompressionLevel.NoCompression,
             >= 1 and <= 3 => CompressionLevel.Fastest,
             >= 4 and <= 6 => CompressionLevel.Optimal,
+#if NETSTANDARD
+            _ => CompressionLevel.Optimal // CompressionLevel.SmallestSize is net6.0+.
+#else
             _ => CompressionLevel.SmallestSize
+#endif
         };
     }
 

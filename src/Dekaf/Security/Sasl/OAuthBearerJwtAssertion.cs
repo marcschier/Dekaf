@@ -169,6 +169,13 @@ internal static class OAuthBearerJwtAssertion
         if (key is not ECDsa ecdsa)
             throw new InvalidOperationException("Selected JWT-bearer signing algorithm requires an ECDSA private key");
 
+#if NETSTANDARD
+        _ = (ecdsa, signingInput, hashAlgorithm);
+        throw new PlatformNotSupportedException(
+            "JWT-bearer ECDSA signing (ES256/ES384/ES512) requires .NET 8.0 or later " +
+            "(IEEE-P1363 signature format is unavailable on this target framework).");
+#else
         return ecdsa.SignData(signingInput, hashAlgorithm, DSASignatureFormat.IeeeP1363FixedFieldConcatenation);
+#endif
     }
 }

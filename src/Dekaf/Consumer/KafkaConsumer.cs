@@ -3213,7 +3213,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
     {
         const long refreshIntervalTicks = 30 * TimeSpan.TicksPerSecond;
 
-        var now = Environment.TickCount64;
+        var now = BclCompat.TickCount64;
         var lastRefresh = Volatile.Read(ref _lastFilterRefreshTicks);
 
         // Rate-limit: skip if we refreshed recently (unless this is the first call)
@@ -3729,7 +3729,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
     /// </summary>
     private void PublishSubscriptionSnapshot()
     {
-        _subscriptionSnapshot = _subscription.Keys.ToHashSet();
+        _subscriptionSnapshot = _subscription.Keys.ToDekafSet();
     }
 
     /// <summary>
@@ -3738,7 +3738,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
     /// </summary>
     private void PublishPausedSnapshot()
     {
-        _pausedSnapshot = _paused.Keys.ToHashSet();
+        _pausedSnapshot = _paused.Keys.ToDekafSet();
     }
 
     /// <summary>

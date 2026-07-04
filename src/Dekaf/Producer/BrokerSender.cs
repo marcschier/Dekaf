@@ -973,7 +973,7 @@ internal sealed partial class BrokerSender : IAsyncDisposable
                             Array.Clear(coalescedBatches, 0, coalescedCount);
                             coalescedCount = 0;
 
-                            if (!sendTimeoutCts.TryReset())
+                            if (!sendTimeoutCts.TryResetCompat())
                             {
                                 sendTimeoutCts.Dispose();
                                 sendTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -2434,7 +2434,7 @@ internal sealed partial class BrokerSender : IAsyncDisposable
     /// </summary>
     private static void ResetBucketTimeout(ref CancellationTokenSource cts, CancellationToken shutdownToken)
     {
-        if (!cts.TryReset())
+        if (!cts.TryResetCompat())
         {
             cts.Dispose();
             cts = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken);
@@ -2910,7 +2910,7 @@ internal sealed partial class BrokerSender : IAsyncDisposable
             return 0;
         }
 
-        var now = Environment.TickCount64;
+        var now = BclCompat.TickCount64;
 
         // Cooldown applies to both scale-up and scale-down
         if (now - _lastScaleTimeTicks < ScaleCooldownMs)

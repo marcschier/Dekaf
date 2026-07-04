@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Numerics;
 using Dekaf.Serialization;
+using Dekaf.Internal;
 
 namespace Dekaf.Protocol.Records;
 
@@ -246,11 +247,11 @@ public readonly record struct Record
 
     internal static int VarUIntSize(uint value)
     {
-        return (BitOperations.Log2(value | 1u) / 7) + 1;
+        return (BclCompat.Log2(value | 1u) / 7) + 1;
     }
 
     internal static int VarULongSize(ulong value)
     {
-        return (BitOperations.Log2(value | 1ul) / 7) + 1;
+        return (BclCompat.Log2(value | 1ul) / 7) + 1;
     }
 }

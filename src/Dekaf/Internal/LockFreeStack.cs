@@ -175,7 +175,7 @@ internal sealed class LockFreeStack<T> where T : class
     {
         foreach (var stripe in _stripes)
         {
-            Array.Clear(stripe.Slots);
+            Array.Clear(stripe.Slots, 0, stripe.Slots.Length);
             Volatile.Write(ref stripe.Top, 0);
         }
     }

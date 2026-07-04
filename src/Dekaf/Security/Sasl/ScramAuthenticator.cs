@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using Dekaf.Errors;
+using Dekaf.Internal;
 
 namespace Dekaf.Security.Sasl;
 
@@ -130,7 +131,7 @@ public sealed class ScramAuthenticator : ISaslAuthenticator
         var salt = Convert.FromBase64String(saltBase64);
 
         // Compute salted password using PBKDF2
-        _saltedPassword = Rfc2898DeriveBytes.Pbkdf2(
+        _saltedPassword = BclCompat.Pbkdf2(
             Encoding.UTF8.GetBytes(_password),
             salt,
             iterations,
@@ -206,7 +207,7 @@ public sealed class ScramAuthenticator : ISaslAuthenticator
 
     private static string GenerateNonce()
     {
-        var bytes = RandomNumberGenerator.GetBytes(24);
+        var bytes = BclCompat.RandomBytes(24);
         return Convert.ToBase64String(bytes);
     }
 
@@ -224,16 +225,12 @@ public sealed class ScramAuthenticator : ISaslAuthenticator
 
     private byte[] Hmac(byte[] key, byte[] message)
     {
-        return _hashAlgorithm == HashAlgorithmName.SHA256
-            ? HMACSHA256.HashData(key, message)
-            : HMACSHA512.HashData(key, message);
+        return BclCompat.HmacHashData(_hashAlgorithm, key, message);
     }
 
     private byte[] Hash(byte[] data)
     {
-        return _hashAlgorithm == HashAlgorithmName.SHA256
-            ? SHA256.HashData(data)
-            : SHA512.HashData(data);
+        return BclCompat.ShaHashData(_hashAlgorithm, data);
     }
 
     private static byte[] Xor(byte[] a, byte[] b)

@@ -147,7 +147,7 @@ internal sealed class ClientMemoryBudget : IDekafMemoryBudget
         if (_explicitBudget.HasValue)
             return _explicitBudget.Value;
 
-        var available = (ulong)GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+        var available = (ulong)BclCompat.TotalAvailableMemoryBytes;
         if (available == 0)
             return FallbackBudgetBytes;
 
