@@ -2,6 +2,7 @@
   <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
 
   <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
     <!-- Allow underscores in benchmark method names -->
     <NoWarn>$(NoWarn);CA1707;CA1822</NoWarn>
   </PropertyGroup>

@@ -1876,7 +1876,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                 _adaptiveFetchSizer?.RecordFetchStart();
 
                 // ReadOnlySpan overload (.NET 9+) avoids internal array copy and ArraySegment boxing
-                await Task.WhenAll(new ReadOnlySpan<Task>(fetchTasks, 0, taskCount)).ConfigureAwait(false);
+                await TaskUtil.WhenAll(new ReadOnlySpan<Task>(fetchTasks, 0, taskCount)).ConfigureAwait(false);
 
                 _adaptiveFetchSizer?.RecordFetchEnd();
             }
@@ -3652,7 +3652,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                 _adaptiveFetchSizer?.RecordFetchStart();
 
                 // ReadOnlySpan overload: same zero-copy benefit as above
-                await Task.WhenAll(new ReadOnlySpan<Task<List<PendingFetchData>?>>(fetchTasks, 0, taskCount)).ConfigureAwait(false);
+                await TaskUtil.WhenAll(new ReadOnlySpan<Task<List<PendingFetchData>?>>(fetchTasks, 0, taskCount)).ConfigureAwait(false);
 
                 _adaptiveFetchSizer?.RecordFetchEnd();
 
@@ -3837,7 +3837,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
                 leaderTasks[i] = ResolvePartitionLeaderAsync(assignmentArray[i], cancellationToken);
             }
 
-            await Task.WhenAll(new ReadOnlySpan<Task<(TopicPartition Partition, int BrokerId)>>(leaderTasks, 0, assignmentCount)).ConfigureAwait(false);
+            await TaskUtil.WhenAll(new ReadOnlySpan<Task<(TopicPartition Partition, int BrokerId)>>(leaderTasks, 0, assignmentCount)).ConfigureAwait(false);
         }
         finally
         {

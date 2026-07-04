@@ -3642,7 +3642,11 @@ internal sealed class Transaction<TKey, TValue> : ITransaction<TKey, TValue>
 /// Used with thread-local buffers to avoid per-message ArrayPool rentals.
 /// After serialization, ToPooledMemory() copies data to a right-sized pooled buffer.
 /// </summary>
+#if NET9_0_OR_GREATER
 internal ref struct ReusableBufferWriter : IBufferWriter<byte>
+#else
+internal struct ReusableBufferWriter : IBufferWriter<byte>
+#endif
 {
     private byte[] _buffer;
     private int _written;
@@ -3765,7 +3769,11 @@ internal ref struct ReusableBufferWriter : IBufferWriter<byte>
 /// to the pool or use-after-disposal.
 /// </para>
 /// </remarks>
+#if NET9_0_OR_GREATER
 internal ref struct PooledBufferWriter : IBufferWriter<byte>
+#else
+internal struct PooledBufferWriter : IBufferWriter<byte>
+#endif
 {
     private byte[]? _buffer;
     private int _written;

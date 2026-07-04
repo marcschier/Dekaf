@@ -1,0 +1,26 @@
+<Project>
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <PropertyGroup>
+    <!-- Shippable library projects target the full ladder. -->
+    <TargetFrameworks>$(DekafLibraryTfms)</TargetFrameworks>
+  </PropertyGroup>
+
+  <!-- Shared, #if-gated polyfills linked into every library assembly (compile to nothing on the
+       frameworks that already provide the API). -->
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)../polyfills/*.cs"
+             Link="Polyfills/%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <!-- Conditional package references filling BCL gaps on the lower TFMs.
+       Span/Memory, ValueTask and IAsyncEnumerable flow transitively from
+       Microsoft.Extensions.Logging.Abstractions (which supports netstandard2.0). -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1' or '$(TargetFramework)' == 'net8.0'">
+    <PackageReference Include="System.IO.Pipelines" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1'">
+    <PackageReference Include="System.Threading.Channels" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>
