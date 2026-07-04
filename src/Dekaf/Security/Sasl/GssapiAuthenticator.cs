@@ -1,4 +1,6 @@
+#if NET7_0_OR_GREATER
 using System.Net.Security;
+#endif
 using Dekaf.Errors;
 
 namespace Dekaf.Security.Sasl;
@@ -23,7 +25,9 @@ public sealed class GssapiAuthenticator : ISaslAuthenticator, IDisposable
 {
     private readonly GssapiConfig _config;
     private readonly string _targetHost;
+#if NET7_0_OR_GREATER
     private NegotiateAuthentication? _auth;
+#endif
     private GssapiState _state = GssapiState.Initial;
     private bool _disposed;
 
@@ -66,6 +70,7 @@ public sealed class GssapiAuthenticator : ISaslAuthenticator, IDisposable
         // Format: serviceName/hostname[@realm]
         var spn = BuildSpn();
 
+#if NET7_0_OR_GREATER
         // Create the NegotiateAuthentication client
         // NegotiateAuthentication automatically uses GSSAPI on Unix and SSPI on Windows
         var clientOptions = new NegotiateAuthenticationClientOptions
@@ -101,11 +106,17 @@ public sealed class GssapiAuthenticator : ISaslAuthenticator, IDisposable
         }
 
         return outgoingBlob ?? [];
+#else
+        throw new PlatformNotSupportedException(
+            "SASL/GSSAPI (Kerberos) requires .NET 7.0 or later (System.Net.Security.NegotiateAuthentication); " +
+            $"it is not available on this target framework. SPN was '{spn}'.");
+#endif
     }
 
     /// <inheritdoc />
     public byte[]? EvaluateChallenge(byte[] challenge)
     {
+#if NET7_0_OR_GREATER
         if (_auth is null)
         {
             throw new InvalidOperationException("GetInitialResponse must be called before EvaluateChallenge");
@@ -131,6 +142,11 @@ public sealed class GssapiAuthenticator : ISaslAuthenticator, IDisposable
         }
 
         throw new AuthenticationException($"GSSAPI authentication failed: {statusCode}");
+#else
+        _ = challenge;
+        throw new PlatformNotSupportedException(
+            "SASL/GSSAPI (Kerberos) requires .NET 7.0 or later; it is not available on this target framework.");
+#endif
     }
 
     private string BuildSpn()
@@ -155,7 +171,9 @@ public sealed class GssapiAuthenticator : ISaslAuthenticator, IDisposable
             return;
         }
 
+#if NET7_0_OR_GREATER
         _auth?.Dispose();
+#endif
         _disposed = true;
     }
 }

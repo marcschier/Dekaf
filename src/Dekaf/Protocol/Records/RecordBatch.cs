@@ -2,8 +2,10 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+#if NET8_0_OR_GREATER
 using System.Runtime.Intrinsics.X86;
 using ArmCrc32 = System.Runtime.Intrinsics.Arm.Crc32;
+#endif
 using Dekaf.Compression;
 using Dekaf.Internal;
 using Dekaf.Producer;
@@ -1305,12 +1307,16 @@ internal static class Crc32C
 {
     private const int TableSize = 256;
     private const int SliceCount = 8;
+#if NET8_0_OR_GREATER
     private const int X86ParallelChunkSize = 512;
     private const int X86ParallelBlockSize = X86ParallelChunkSize * 3;
+#endif
 
     private static readonly uint[] Table = GenerateTable();
+#if NET8_0_OR_GREATER
     private static readonly uint[] X86ShiftChunk = CreateShiftOperator(X86ParallelChunkSize);
     private static readonly uint[] X86ShiftTwoChunks = CreateShiftOperator(X86ParallelChunkSize * 2);
+#endif
 
     private static uint[] GenerateTable()
     {
@@ -1345,6 +1351,7 @@ internal static class Crc32C
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static uint Compute(ReadOnlySpan<byte> data)
     {
+#if NET8_0_OR_GREATER
         if (Sse42.IsSupported)
         {
             return ComputeHardwareX86(data);
@@ -1354,10 +1361,12 @@ internal static class Crc32C
         {
             return ComputeHardwareArm(data);
         }
+#endif
 
         return ComputeSoftware(data);
     }
 
+#if NET8_0_OR_GREATER
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static uint ComputeHardwareX86(ReadOnlySpan<byte> data)
     {
@@ -1481,6 +1490,7 @@ internal static class Crc32C
 
         return crc ^ 0xFFFFFFFFu;
     }
+#endif
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     internal static uint ComputeSoftware(ReadOnlySpan<byte> data)
@@ -1515,6 +1525,7 @@ internal static class Crc32C
         return crc ^ 0xFFFFFFFFu;
     }
 
+#if NET8_0_OR_GREATER
     private static uint[] CreateShiftOperator(int byteCount)
     {
         var shift = new uint[32];
@@ -1622,4 +1633,5 @@ internal static class Crc32C
 
         return sum;
     }
+#endif
 }

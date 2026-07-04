@@ -14,6 +14,11 @@ using Dekaf.Protocol;
 using Dekaf.Protocol.Records;
 using Dekaf.Serialization;
 using Microsoft.Extensions.Logging;
+#if NET7_0_OR_GREATER
+using DekafSpinLock = System.Threading.SpinLock;
+#else
+using DekafSpinLock = Dekaf.Producer.SpinLockRef;
+#endif
 
 namespace Dekaf.Producer;
 
@@ -23,13 +28,21 @@ namespace Dekaf.Producer;
 /// </summary>
 internal ref struct SpinLockGuard
 {
-    private ref SpinLock _lock;
+#if NET7_0_OR_GREATER
+    private ref DekafSpinLock _lock;
+#else
+    private readonly DekafSpinLock _lock;
+#endif
     private bool _taken;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public SpinLockGuard(ref SpinLock spinLock)
+    public SpinLockGuard(ref DekafSpinLock spinLock)
     {
+#if NET7_0_OR_GREATER
         _lock = ref spinLock;
+#else
+        _lock = spinLock;
+#endif
         _taken = false;
         _lock.Enter(ref _taken);
     }
@@ -40,6 +53,35 @@ internal ref struct SpinLockGuard
         if (_taken) _lock.Exit();
     }
 }
+
+#if !NET7_0_OR_GREATER
+/// <summary>
+/// Reference-type spin lock used on target frameworks without ref-field support
+/// (netstandard2.0/2.1). Mirrors the subset of <see cref="System.Threading.SpinLock"/>
+/// that <see cref="SpinLockGuard"/> relies on, allocated once per partition.
+/// </summary>
+internal sealed class SpinLockRef
+{
+    private int _state;
+
+    public SpinLockRef(bool enableThreadOwnerTracking) => _ = enableThreadOwnerTracking;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Enter(ref bool lockTaken)
+    {
+        var spinner = new SpinWait();
+        while (Interlocked.CompareExchange(ref _state, 1, 0) != 0)
+        {
+            spinner.SpinOnce();
+        }
+
+        lockTaken = true;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Exit() => Volatile.Write(ref _state, 0);
+}
+#endif
 
 
 /// <summary>
@@ -967,7 +1009,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
 
         /// <summary>Per-partition lock for deque access (matches Java's synchronized(deque)).
         /// SpinLock avoids kernel transitions for the brief critical sections in append/drain paths.</summary>
-        public SpinLock Lock = new(enableThreadOwnerTracking: false);
+        public DekafSpinLock Lock = new(enableThreadOwnerTracking: false);
 
         /// <summary>Current unsealed batch accepting new records. Null if no active batch.</summary>
         public PartitionBatch? CurrentBatch;

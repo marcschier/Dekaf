@@ -488,8 +488,8 @@ public sealed partial class KafkaConnection : IKafkaConnection
             throw new InvalidOperationException("Not connected");
 
         var correlationId = Interlocked.Increment(ref s_globalCorrelationId);
-        var headerVersion = TRequest.GetRequestHeaderVersion(apiVersion);
-        var responseHeaderVersion = TRequest.GetResponseHeaderVersion(apiVersion);
+        var headerVersion = MessageDispatch.GetRequestHeaderVersion<TRequest, TResponse>(apiVersion);
+        var responseHeaderVersion = MessageDispatch.GetResponseHeaderVersion<TRequest, TResponse>(apiVersion);
 
         await ReservePendingRequestSlotAsync(cancellationToken).ConfigureAwait(false);
         var pending = _pendingRequestPool.Rent();
@@ -512,7 +512,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
             var telemetryStartTimestamp = _telemetryMetricCollector is null ? 0 : Stopwatch.GetTimestamp();
 
             // Write phase
-            LogSendingRequest(TRequest.ApiKey, correlationId, apiVersion, _host, _port);
+            LogSendingRequest(MessageDispatch.GetApiKey<TRequest, TResponse>(), correlationId, apiVersion, _host, _port);
 
             await PreSerializeAndWriteAsync<TRequest, TResponse>(request, correlationId, apiVersion, headerVersion, cancellationToken)
                 .ConfigureAwait(false);
@@ -581,11 +581,11 @@ public sealed partial class KafkaConnection : IKafkaConnection
             throw new InvalidOperationException("Not connected");
 
         var correlationId = Interlocked.Increment(ref s_globalCorrelationId);
-        var headerVersion = TRequest.GetRequestHeaderVersion(apiVersion);
+        var headerVersion = MessageDispatch.GetRequestHeaderVersion<TRequest, TResponse>(apiVersion);
 
         // Don't register a pending request - we won't receive a response
 
-        LogSendingFireAndForgetRequest(TRequest.ApiKey, correlationId, apiVersion, _host, _port);
+        LogSendingFireAndForgetRequest(MessageDispatch.GetApiKey<TRequest, TResponse>(), correlationId, apiVersion, _host, _port);
 
         await PreSerializeAndWriteAsync<TRequest, TResponse>(request, correlationId, apiVersion, headerVersion, cancellationToken, callerOwnsTimeout)
             .ConfigureAwait(false);
@@ -635,8 +635,8 @@ public sealed partial class KafkaConnection : IKafkaConnection
             throw new InvalidOperationException("Not connected");
 
         var correlationId = Interlocked.Increment(ref s_globalCorrelationId);
-        var headerVersion = TRequest.GetRequestHeaderVersion(apiVersion);
-        var responseHeaderVersion = TRequest.GetResponseHeaderVersion(apiVersion);
+        var headerVersion = MessageDispatch.GetRequestHeaderVersion<TRequest, TResponse>(apiVersion);
+        var responseHeaderVersion = MessageDispatch.GetResponseHeaderVersion<TRequest, TResponse>(apiVersion);
 
         await ReservePendingRequestSlotAsync(cancellationToken).ConfigureAwait(false);
         var pending = _pendingRequestPool.Rent();
@@ -707,7 +707,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    throw CreateResponseTimeoutException(TRequest.ApiKey, correlationId);
+                    throw CreateResponseTimeoutException(MessageDispatch.GetApiKey<TRequest, TResponse>(), correlationId);
                 }
                 finally
                 {
@@ -733,7 +733,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
                 }
                 catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
                 {
-                    throw CreateResponseTimeoutException(TRequest.ApiKey, correlationId);
+                    throw CreateResponseTimeoutException(MessageDispatch.GetApiKey<TRequest, TResponse>(), correlationId);
                 }
                 finally
                 {
@@ -745,7 +745,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
             LogResponseReceived(correlationId);
 
-            var isFetchResponse = TRequest.ApiKey == ApiKey.Fetch;
+            var isFetchResponse = MessageDispatch.GetApiKey<TRequest, TResponse>() == ApiKey.Fetch;
 
             if (isFetchResponse)
             {
@@ -753,7 +753,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
                 using var parsingScope = ResponseParsingContext.SetPooledMemory(memoryOwner);
 
                 var reader = new KafkaProtocolReader(pooledBuffer.Data);
-                var response = (TResponse)TResponse.Read(ref reader, apiVersion);
+                var response = MessageDispatch.ReadResponse<TRequest, TResponse>(ref reader, apiVersion);
 
                 if (ResponseParsingContext.WasMemoryUsed)
                 {
@@ -779,7 +779,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
                 try
                 {
                     var reader = new KafkaProtocolReader(pooledBuffer.Data);
-                    return (TResponse)TResponse.Read(ref reader, apiVersion);
+                    return MessageDispatch.ReadResponse<TRequest, TResponse>(ref reader, apiVersion);
                 }
                 finally
                 {
@@ -835,7 +835,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
         var bodyWriter = new KafkaProtocolWriter(writer);
         var header = new RequestHeader
         {
-            ApiKey = TRequest.ApiKey,
+            ApiKey = MessageDispatch.GetApiKey<TRequest, TResponse>(),
             ApiVersion = apiVersion,
             CorrelationId = correlationId,
             ClientId = _clientId,
@@ -870,7 +870,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
         where TResponse : IKafkaResponse
     {
         var (serializedArray, serializedLength) = PreSerializeRequest<TRequest, TResponse>(request, correlationId, apiVersion, headerVersion);
-        var clearSerializedArray = TRequest.ApiKey == ApiKey.SaslAuthenticate;
+        var clearSerializedArray = MessageDispatch.GetApiKey<TRequest, TResponse>() == ApiKey.SaslAuthenticate;
         byte[]? arrayToReturn = serializedArray;
         try
         {
@@ -2147,7 +2147,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
             throw new InvalidOperationException("Not connected");
 
         var correlationId = Interlocked.Increment(ref s_globalCorrelationId);
-        var headerVersion = TRequest.GetRequestHeaderVersion(apiVersion);
+        var headerVersion = MessageDispatch.GetRequestHeaderVersion<TRequest, TResponse>(apiVersion);
 
         // Write to stream directly (no pipe yet). Use the pooled serializer path instead
         // of the thread-local SASL buffer so credential-bearing requests can be cleared.
@@ -2156,7 +2156,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
             correlationId,
             apiVersion,
             headerVersion);
-        var clearSerializedArray = TRequest.ApiKey == ApiKey.SaslAuthenticate;
+        var clearSerializedArray = MessageDispatch.GetApiKey<TRequest, TResponse>() == ApiKey.SaslAuthenticate;
         try
         {
             await _stream.WriteAsync(buffer.AsMemory(0, totalSize), cancellationToken).ConfigureAwait(false);
@@ -2188,7 +2188,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
                 }
 
                 // Skip response header and parse body
-                var responseHeaderVersion = TRequest.GetResponseHeaderVersion(apiVersion);
+                var responseHeaderVersion = MessageDispatch.GetResponseHeaderVersion<TRequest, TResponse>(apiVersion);
                 var offset = 4; // Correlation ID
 
                 if (responseHeaderVersion >= 1)
@@ -2226,7 +2226,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
                 }
 
                 var reader = new KafkaProtocolReader(responseBuffer.AsMemory(offset, responseSize - offset));
-                return (TResponse)TResponse.Read(ref reader, apiVersion);
+                return MessageDispatch.ReadResponse<TRequest, TResponse>(ref reader, apiVersion);
             }
             finally
             {
