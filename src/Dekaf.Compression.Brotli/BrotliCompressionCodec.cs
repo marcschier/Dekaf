@@ -36,7 +36,9 @@ namespace Dekaf.Compression.Brotli;
 /// </example>
 public sealed class BrotliCompressionCodec : ICompressionCodec
 {
+#if !NETSTANDARD2_0
     private readonly CompressionLevel _compressionLevel;
+#endif
 
     /// <summary>
     /// Creates a new Brotli compression codec with the specified .NET compression level.
@@ -44,7 +46,11 @@ public sealed class BrotliCompressionCodec : ICompressionCodec
     /// <param name="compressionLevel">The .NET <see cref="CompressionLevel"/> to use. Default is <see cref="CompressionLevel.Fastest"/>.</param>
     public BrotliCompressionCodec(CompressionLevel compressionLevel = CompressionLevel.Fastest)
     {
+#if !NETSTANDARD2_0
         _compressionLevel = compressionLevel;
+#else
+        _ = compressionLevel;
+#endif
     }
 
     /// <inheritdoc />
@@ -53,6 +59,12 @@ public sealed class BrotliCompressionCodec : ICompressionCodec
     /// <inheritdoc />
     public void Compress(ReadOnlySequence<byte> source, IBufferWriter<byte> destination)
     {
+#if NETSTANDARD2_0
+        _ = (source, destination);
+        throw new PlatformNotSupportedException(
+            "Brotli compression requires .NET Standard 2.1 or later " +
+            "(System.IO.Compression.BrotliStream is unavailable on netstandard2.0).");
+#else
         using var outputStream = new BufferWriterStream(destination);
         using var brotliStream = new BrotliStream(outputStream, _compressionLevel, leaveOpen: true);
 
@@ -62,15 +74,23 @@ public sealed class BrotliCompressionCodec : ICompressionCodec
         }
 
         brotliStream.Flush();
+#endif
     }
 
     /// <inheritdoc />
     public void Decompress(ReadOnlySequence<byte> source, IBufferWriter<byte> destination)
     {
+#if NETSTANDARD2_0
+        _ = (source, destination);
+        throw new PlatformNotSupportedException(
+            "Brotli decompression requires .NET Standard 2.1 or later " +
+            "(System.IO.Compression.BrotliStream is unavailable on netstandard2.0).");
+#else
         using var inputStream = new ReadOnlySequenceStream(source);
         using var brotliStream = new BrotliStream(inputStream, CompressionMode.Decompress);
 
         CompressionStreamCopy.CopyToBufferWriter(brotliStream, destination);
+#endif
     }
 }
 

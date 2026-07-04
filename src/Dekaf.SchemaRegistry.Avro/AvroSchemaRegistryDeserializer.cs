@@ -164,7 +164,7 @@ public sealed class AvroSchemaRegistryDeserializer<T> : IDeserializer<T>, IAsync
         // The Lazy ensures that only ONE thread ever blocks for a given schema ID.
         var task = lazyTask.Value;
 
-        if (task.IsCompletedSuccessfully)
+        if (task.Status == TaskStatus.RanToCompletion)
         {
             // Fast path: schema already cached, no blocking
             return task.Result;
@@ -239,6 +239,6 @@ public sealed class AvroSchemaRegistryDeserializer<T> : IDeserializer<T>, IAsync
     {
         if (_ownsClient)
             _schemaRegistry.Dispose();
-        return ValueTask.CompletedTask;
+        return default;
     }
 }

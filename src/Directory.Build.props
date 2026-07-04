@@ -7,17 +7,21 @@
   </PropertyGroup>
 
   <!-- Shared, #if-gated polyfills linked into every library assembly (compile to nothing on the
-       frameworks that already provide the API). -->
-  <ItemGroup>
+       frameworks that already provide the API). Projects that see Dekaf core's internals via
+       InternalsVisibleTo set $(DekafInheritCorePolyfills)=true and reuse core's copies instead
+       (compiling their own would duplicate the polyfill/Polyfill types across the IVT boundary). -->
+  <ItemGroup Condition="'$(DekafInheritCorePolyfills)' != 'true'">
     <Compile Include="$(MSBuildThisFileDirectory)../polyfills/*.cs"
              Link="Polyfills/%(Filename)%(Extension)" />
   </ItemGroup>
 
   <!-- Conditional package references filling BCL gaps on the lower TFMs.
        Span/Memory, ValueTask and IAsyncEnumerable flow transitively from
-       Microsoft.Extensions.Logging.Abstractions (which supports netstandard2.0). -->
+       Microsoft.Extensions.Logging.Abstractions (which supports netstandard2.0).
+       System.IO.Pipelines isn't in the ref pack until net9.0; 10.0.9 matches what the
+       Microsoft.Extensions.* / System.Text.Json graph pulls in (avoids NU1605 downgrades). -->
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1' or '$(TargetFramework)' == 'net8.0'">
-    <PackageReference Include="System.IO.Pipelines" Version="8.0.0" />
+    <PackageReference Include="System.IO.Pipelines" Version="10.0.9" />
   </ItemGroup>
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1'">
     <PackageReference Include="System.Threading.Channels" Version="8.0.0" />
@@ -27,11 +31,18 @@
        Socket async, System.Threading.Lock, Base64Url, etc.) on the sub-net9 TFMs. net8.0 is
        included because it still lacks several net9.0 APIs Dekaf uses. Compiles to nothing on
        net9.0+ (not referenced), so the modern fast paths are byte-for-byte unaffected. -->
-  <PropertyGroup Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1' or '$(TargetFramework)' == 'net8.0'">
+  <PropertyGroup Condition="('$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1' or '$(TargetFramework)' == 'net8.0') and '$(DekafInheritCorePolyfills)' != 'true'">
     <PolyArgumentExceptions>true</PolyArgumentExceptions>
   </PropertyGroup>
-  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1' or '$(TargetFramework)' == 'net8.0'">
+  <ItemGroup Condition="('$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1' or '$(TargetFramework)' == 'net8.0') and '$(DekafInheritCorePolyfills)' != 'true'">
     <PackageReference Include="Polyfill" Version="10.11.2" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Projects that inherit polyfills from an InternalsVisibleTo parent don't reference Polyfill, so
+       they need the Polyfills namespace imported to see its extension members (throw-helper guards,
+       Task.WaitAsync, etc.) on the TFMs where those aren't in-box (netstandard2.0/2.1). -->
+  <ItemGroup Condition="'$(DekafInheritCorePolyfills)' == 'true' and ('$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1')">
+    <Using Include="Polyfills" />
   </ItemGroup>
 
 </Project>

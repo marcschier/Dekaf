@@ -103,7 +103,10 @@ public sealed class AvroSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
     /// For best performance, use <see cref="WarmupAsync"/> before starting production.
     /// </remarks>
     public void Serialize<TWriter>(T value, ref TWriter destination, SerializationContext context)
-        where TWriter : IBufferWriter<byte>, allows ref struct
+        where TWriter : IBufferWriter<byte>
+#if NET9_0_OR_GREATER
+        , allows ref struct
+#endif
     {
         ArgumentNullException.ThrowIfNull(value);
 
@@ -187,7 +190,7 @@ public sealed class AvroSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
         // The Lazy ensures that only ONE thread ever blocks for a given subject.
         var task = lazyTask.Value;
 
-        if (task.IsCompletedSuccessfully)
+        if (task.Status == TaskStatus.RanToCompletion)
         {
             // Fast path: schema already cached, no blocking
             return task.Result;

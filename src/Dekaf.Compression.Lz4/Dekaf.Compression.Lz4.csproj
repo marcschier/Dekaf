@@ -4,6 +4,8 @@
     <PackageId>Dekaf.Compression.Lz4</PackageId>
     <Description>LZ4 compression codec for Dekaf Kafka client</Description>
     <PackageTags>kafka;compression;lz4</PackageTags>
+    <!-- Sees Dekaf core internals via InternalsVisibleTo; reuse core's polyfills to avoid duplicates. -->
+    <DekafInheritCorePolyfills>true</DekafInheritCorePolyfills>
   </PropertyGroup>
 
   <ItemGroup>

@@ -4,6 +4,8 @@
     <PackageId>Dekaf.Extensions.Hosting</PackageId>
     <Description>Microsoft.Extensions.Hosting integration for Dekaf Kafka client</Description>
     <PackageTags>kafka;hosting;background-service</PackageTags>
+    <!-- Sees Dekaf core internals via InternalsVisibleTo; reuse core's polyfills to avoid duplicates. -->
+    <DekafInheritCorePolyfills>true</DekafInheritCorePolyfills>
   </PropertyGroup>
 
   <ItemGroup>

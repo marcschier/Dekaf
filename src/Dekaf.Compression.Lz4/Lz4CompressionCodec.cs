@@ -42,7 +42,11 @@ public sealed class Lz4CompressionCodec : ICompressionCodec
 
         foreach (var segment in source)
         {
+#if NETSTANDARD2_0
+            lz4Stream.Write(segment.ToArray(), 0, segment.Length);
+#else
             lz4Stream.Write(segment.Span);
+#endif
         }
     }
 

@@ -105,12 +105,19 @@ public sealed class JsonSchemaRegistrySerializer<T> : ISerializer<T>, IAsyncDisp
     }
 
     public void Serialize<TWriter>(T value, ref TWriter destination, SerializationContext context)
-        where TWriter : IBufferWriter<byte>, allows ref struct
+        where TWriter : IBufferWriter<byte>
+#if NET9_0_OR_GREATER
+        , allows ref struct
+#endif
     {
         var schemaId = GetSchemaIdForContext(context.Topic, context.Component == SerializationComponent.Key);
 
         var payloadBuffer = SchemaRegistryBuffers.PayloadBuffer ??= new ArrayBufferWriter<byte>(initialCapacity: 4096);
+#if NET8_0_OR_GREATER
         payloadBuffer.ResetWrittenCount();
+#else
+        payloadBuffer.Clear();
+#endif
 
         var jsonWriter = t_jsonWriter;
         if (jsonWriter is null)

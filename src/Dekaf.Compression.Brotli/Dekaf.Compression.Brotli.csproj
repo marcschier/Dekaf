@@ -4,6 +4,8 @@
     <PackageId>Dekaf.Compression.Brotli</PackageId>
     <Description>Brotli compression codec for Dekaf Kafka client. Note: Brotli is NOT a standard Kafka compression type - both producer and consumer must have this codec installed.</Description>
     <PackageTags>kafka;compression;brotli</PackageTags>
+    <!-- Sees Dekaf core internals via InternalsVisibleTo; reuse core's polyfills to avoid duplicates. -->
+    <DekafInheritCorePolyfills>true</DekafInheritCorePolyfills>
   </PropertyGroup>
 
   <ItemGroup>

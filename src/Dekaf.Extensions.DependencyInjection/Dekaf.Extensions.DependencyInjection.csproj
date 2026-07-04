@@ -4,6 +4,8 @@
     <PackageId>Dekaf.Extensions.DependencyInjection</PackageId>
     <Description>Microsoft.Extensions.DependencyInjection integration for Dekaf Kafka client</Description>
     <PackageTags>kafka;dependency-injection;di</PackageTags>
+    <!-- Sees Dekaf core internals via InternalsVisibleTo; reuse core's polyfills to avoid duplicates. -->
+    <DekafInheritCorePolyfills>true</DekafInheritCorePolyfills>
   </PropertyGroup>
 
   <ItemGroup>

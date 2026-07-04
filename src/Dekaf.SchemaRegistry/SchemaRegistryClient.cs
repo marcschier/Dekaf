@@ -13,7 +13,9 @@ namespace Dekaf.SchemaRegistry;
 /// </summary>
 public sealed class SchemaRegistryClient : ISchemaRegistryClient, ISchemaRegistryCache
 {
+#if !NETSTANDARD
     private static readonly TimeSpan PooledConnectionLifetime = TimeSpan.FromMinutes(2);
+#endif
 
     private readonly HttpClient _httpClient;
     private readonly SchemaRegistryConfig _config;
@@ -55,10 +57,14 @@ public sealed class SchemaRegistryClient : ISchemaRegistryClient, ISchemaRegistr
     internal int CachedSchemaByIdCount => _schemaByIdCache.Count;
     internal int CachedSchemaIdCount => _idBySchemaCache.Count;
 
+#if NETSTANDARD
+    internal static HttpMessageHandler CreateHttpHandler() => new HttpClientHandler();
+#else
     internal static SocketsHttpHandler CreateHttpHandler() => new()
     {
         PooledConnectionLifetime = PooledConnectionLifetime
     };
+#endif
 
     public async Task<int> RegisterSchemaAsync(string subject, Schema schema, CancellationToken cancellationToken = default)
     {

@@ -138,6 +138,6 @@ public sealed class ProtobufSchemaRegistryDeserializer<T> : IDeserializer<T>, IA
     {
         if (_ownsClient)
             _schemaRegistry.Dispose();
-        return ValueTask.CompletedTask;
+        return default;
     }
 }

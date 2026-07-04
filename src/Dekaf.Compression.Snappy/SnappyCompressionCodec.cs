@@ -68,7 +68,7 @@ public sealed class SnappyCompressionCodec : ICompressionCodec
             {
                 var maxCompressedLength = Snappier.Snappy.GetMaxCompressedLength(blockLength);
                 var blockSpan = destination.GetSpan(4 + maxCompressedLength);
-                var compressedLength = Snappier.Snappy.Compress(blockSequence.FirstSpan, blockSpan[4..]);
+                var compressedLength = Snappier.Snappy.Compress(blockSequence.First.Span, blockSpan[4..]);
 
                 BinaryPrimitives.WriteInt32BigEndian(blockSpan, compressedLength);
                 destination.Advance(4 + compressedLength);
@@ -76,7 +76,11 @@ public sealed class SnappyCompressionCodec : ICompressionCodec
             else
             {
                 var compressedBuffer = t_compressedBuffer ??= new ArrayBufferWriter<byte>();
+#if NET8_0_OR_GREATER
                 compressedBuffer.ResetWrittenCount();
+#else
+                compressedBuffer.Clear();
+#endif
                 Snappier.Snappy.Compress(blockSequence, compressedBuffer);
                 var compressedLength = compressedBuffer.WrittenCount;
 
@@ -134,7 +138,7 @@ public sealed class SnappyCompressionCodec : ICompressionCodec
                 ReadOnlySpan<byte> compressedSpan;
                 if (compressedSequence.IsSingleSegment)
                 {
-                    compressedSpan = compressedSequence.FirstSpan;
+                    compressedSpan = compressedSequence.First.Span;
                 }
                 else
                 {

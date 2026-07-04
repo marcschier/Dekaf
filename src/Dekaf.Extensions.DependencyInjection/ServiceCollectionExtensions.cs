@@ -758,7 +758,7 @@ internal static class DekafConfigurationBinding
 
         if (!string.IsNullOrWhiteSpace(section.Value))
         {
-            servers = SplitBootstrapServers(section.Value);
+            servers = SplitBootstrapServers(section.Value!);
             return servers.Length > 0;
         }
 
@@ -770,8 +770,19 @@ internal static class DekafConfigurationBinding
         return servers.Length > 0;
     }
 
+#if !NET5_0_OR_GREATER
+    private static readonly char[] BootstrapServerSeparators = { ',' };
+#endif
+
     private static string[] SplitBootstrapServers(string value) =>
+#if NET5_0_OR_GREATER
         value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+#else
+        value.Split(BootstrapServerSeparators, StringSplitOptions.RemoveEmptyEntries)
+            .Select(server => server.Trim())
+            .Where(server => server.Length > 0)
+            .ToArray();
+#endif
 
     private static bool TryGetValue<T>(IConfiguration configuration, string key, out T value)
     {
@@ -850,7 +861,7 @@ internal static class DekafConfigurationBinding
             throw new InvalidOperationException($"{key} must specify a duration.");
         }
 
-        value = value.Trim();
+        value = value!.Trim();
         if (TryParseHoursMinutesSeconds(value, out var hoursMinutesSeconds))
         {
             AutoOffsetResetStrategy.ValidateDuration(hoursMinutesSeconds);

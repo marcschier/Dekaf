@@ -10,6 +10,9 @@ internal sealed class PooledMemoryStream : Stream
 {
     private static readonly byte[] EmptyBuffer = [];
 
+    // Array.MaxLength (net6.0+) is the documented maximum single-dimension array length.
+    private const int MaxArrayLength = 0X7FFFFFC7;
+
     private byte[] _buffer;
     private int _position;
     private int _length;
@@ -72,8 +75,8 @@ internal sealed class PooledMemoryStream : Stream
         get => _position;
         set
         {
-            if (value < 0 || value > Array.MaxLength)
-                throw new ArgumentOutOfRangeException(nameof(value), $"Position must be between 0 and {Array.MaxLength}.");
+            if (value < 0 || value > MaxArrayLength)
+                throw new ArgumentOutOfRangeException(nameof(value), $"Position must be between 0 and {MaxArrayLength}.");
             _position = (int)value;
         }
     }
@@ -88,8 +91,8 @@ internal sealed class PooledMemoryStream : Stream
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         var newPosition = (long)_position + count;
-        if (newPosition > Array.MaxLength)
-            throw new NotSupportedException($"PooledMemoryStream does not support streams larger than {Array.MaxLength} bytes.");
+        if (newPosition > MaxArrayLength)
+            throw new NotSupportedException($"PooledMemoryStream does not support streams larger than {MaxArrayLength} bytes.");
 
         EnsureCapacity((int)newPosition);
         Buffer.BlockCopy(buffer, offset, _buffer, _position, count);
@@ -102,8 +105,8 @@ internal sealed class PooledMemoryStream : Stream
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        if (_position == Array.MaxLength)
-            throw new NotSupportedException($"PooledMemoryStream does not support streams larger than {Array.MaxLength} bytes.");
+        if (_position == MaxArrayLength)
+            throw new NotSupportedException($"PooledMemoryStream does not support streams larger than {MaxArrayLength} bytes.");
 
         EnsureCapacity(_position + 1);
         _buffer[_position++] = value;
@@ -127,6 +130,7 @@ internal sealed class PooledMemoryStream : Stream
         return count;
     }
 
+#if !NETSTANDARD2_0
     public override int Read(Span<byte> buffer)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -140,6 +144,7 @@ internal sealed class PooledMemoryStream : Stream
         _position += count;
         return count;
     }
+#endif
 
     public override int ReadByte()
     {
@@ -163,8 +168,8 @@ internal sealed class PooledMemoryStream : Stream
             _ => throw new ArgumentOutOfRangeException(nameof(origin))
         };
 
-        if (newPosition < 0 || newPosition > Array.MaxLength)
-            throw new ArgumentOutOfRangeException(nameof(offset), $"Seek position must be between 0 and {Array.MaxLength}.");
+        if (newPosition < 0 || newPosition > MaxArrayLength)
+            throw new ArgumentOutOfRangeException(nameof(offset), $"Seek position must be between 0 and {MaxArrayLength}.");
 
         _position = (int)newPosition;
         return _position;
@@ -174,8 +179,8 @@ internal sealed class PooledMemoryStream : Stream
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        if (value < 0 || value > Array.MaxLength)
-            throw new ArgumentOutOfRangeException(nameof(value), $"Length must be between 0 and {Array.MaxLength}.");
+        if (value < 0 || value > MaxArrayLength)
+            throw new ArgumentOutOfRangeException(nameof(value), $"Length must be between 0 and {MaxArrayLength}.");
 
         EnsureCapacity((int)value);
         _length = (int)value;
@@ -191,8 +196,8 @@ internal sealed class PooledMemoryStream : Stream
             return;
 
         // Grow the buffer by at least doubling, but at least to the required capacity.
-        // Widen to long to detect overflow and cap at Array.MaxLength.
-        var doubled = Math.Min((long)_buffer.Length * 2, Array.MaxLength);
+        // Widen to long to detect overflow and cap at MaxArrayLength.
+        var doubled = Math.Min((long)_buffer.Length * 2, MaxArrayLength);
         var newCapacity = (int)Math.Max(doubled, requiredCapacity);
 
         if (newCapacity <= _buffer.Length)

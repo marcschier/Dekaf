@@ -4,6 +4,8 @@
     <PackageId>Dekaf.SchemaRegistry.Avro</PackageId>
     <Description>Apache Avro serialization with Schema Registry integration for Dekaf Kafka client</Description>
     <PackageTags>kafka;schema-registry;avro;serialization</PackageTags>
+    <!-- Sees Dekaf.SchemaRegistry internals via InternalsVisibleTo; reuse its polyfills to avoid duplicates. -->
+    <DekafInheritCorePolyfills>true</DekafInheritCorePolyfills>
   </PropertyGroup>
 
   <ItemGroup>

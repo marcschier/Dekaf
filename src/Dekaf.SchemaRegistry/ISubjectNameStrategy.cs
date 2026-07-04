@@ -82,7 +82,7 @@ public sealed class RecordNameStrategy : ISubjectNameStrategy
                 "Ensure the serialized type has a discoverable fully-qualified name.");
         }
 
-        return recordType;
+        return recordType!;
     }
 }
 

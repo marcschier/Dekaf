@@ -27,7 +27,10 @@ public sealed class JsonSerializer<T> : ISerde<T>
     }
 
     public void Serialize<TWriter>(T value, ref TWriter destination, SerializationContext context)
-        where TWriter : IBufferWriter<byte>, allows ref struct
+        where TWriter : IBufferWriter<byte>
+#if NET9_0_OR_GREATER
+        , allows ref struct
+#endif
     {
         // Utf8JsonWriter cannot accept the generic TWriter directly because the
         // 'allows ref struct' constraint prevents boxing to IBufferWriter<byte>.
@@ -35,7 +38,11 @@ public sealed class JsonSerializer<T> : ISerde<T>
         // This is safe because Serialize is fully synchronous (no await points),
         // so thread migration cannot occur mid-operation.
         var sharedBuffer = t_sharedBuffer ??= new ArrayBufferWriter<byte>();
+#if NET8_0_OR_GREATER
         sharedBuffer.ResetWrittenCount();
+#else
+        sharedBuffer.Clear();
+#endif
 
         var jsonWriter = t_jsonWriter;
         if (jsonWriter is null)
