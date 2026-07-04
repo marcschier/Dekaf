@@ -359,7 +359,7 @@ public sealed class AdminClient : IAdminClient
 
         var result = new Dictionary<string, TopicDescription>(StringComparer.Ordinal);
         var partitionAccumulator = new Dictionary<string, List<PartitionInfo>>(StringComparer.Ordinal);
-        var seenCursors = new HashSet<(string TopicName, int PartitionIndex)>();
+        var seenCursors = new DekafSet<(string TopicName, int PartitionIndex)>();
         DescribeTopicPartitionsCursor? cursor = null;
 
         do
@@ -752,7 +752,7 @@ public sealed class AdminClient : IAdminClient
             };
 
             // Query all brokers since each only knows about groups it coordinates
-            var seenGroupIds = new HashSet<string>();
+            var seenGroupIds = new DekafSet<string>();
             var result = new List<GroupListing>();
 
             foreach (var broker in brokers)
@@ -2823,7 +2823,7 @@ public sealed class AdminClient : IAdminClient
             })).ConfigureAwait(false);
 
             // Merge and deduplicate results
-            var seenGroupIds = new HashSet<string>();
+            var seenGroupIds = new DekafSet<string>();
             var result = new List<GroupListing>();
 
             foreach (var response in responses)

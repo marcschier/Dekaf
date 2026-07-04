@@ -786,7 +786,7 @@ public sealed partial class ConsumerCoordinator : IAsyncDisposable
     /// </summary>
     private ConsumerHeartbeatResult ProcessConsumerGroupAssignment(ConsumerGroupHeartbeatAssignment assignment)
     {
-        var newAssignment = new HashSet<TopicPartition>();
+        var newAssignment = new DekafSet<TopicPartition>();
 
         foreach (var tp in assignment.AssignedTopicPartitions)
         {

@@ -640,7 +640,7 @@ internal sealed partial class BrokerSender : IAsyncDisposable
         var eventReader = _eventChannel.Reader;
         var maxCoalesce = _options.MaxInFlightRequestsPerConnection * 4;
 
-        var coalescedPartitions = new HashSet<TopicPartition>();
+        var coalescedPartitions = new DekafSet<TopicPartition>();
         var carryOver = new PartitionCarryOver();
         var drainList = new List<ReadyBatch>();
 

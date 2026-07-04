@@ -2115,7 +2115,7 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
             _accumulator.RegisterWakeupShutdownToken(cancellationToken);
 
             // Allocate collections once and reuse across iterations to avoid per-iteration allocations
-            var readyNodes = new HashSet<int>();
+            var readyNodes = new DekafSet<int>();
             var drainResult = new Dictionary<int, List<ReadyBatch>>();
             var batchListPool = new Stack<List<ReadyBatch>>();
 

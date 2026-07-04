@@ -34,8 +34,8 @@ internal sealed partial class KafkaShareConsumer<TKey, TValue> : IKafkaShareCons
     [ThreadStatic]
     private static SerializationContext t_serializationContext;
 
-    private volatile IReadOnlySet<string> _subscriptionSnapshot = new HashSet<string>();
-    private volatile IReadOnlySet<TopicPartition> _assignmentSnapshot = new HashSet<TopicPartition>();
+    private volatile IReadOnlySet<string> _subscriptionSnapshot = new DekafSet<string>();
+    private volatile IReadOnlySet<TopicPartition> _assignmentSnapshot = new DekafSet<TopicPartition>();
 
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private volatile bool _initialized;
@@ -154,7 +154,7 @@ internal sealed partial class KafkaShareConsumer<TKey, TValue> : IKafkaShareCons
 
     public IKafkaShareConsumer<TKey, TValue> Subscribe(params string[] topics)
     {
-        _subscriptionSnapshot = new HashSet<string>(topics);
+        _subscriptionSnapshot = new DekafSet<string>(topics);
         return this;
     }
 
@@ -167,7 +167,7 @@ internal sealed partial class KafkaShareConsumer<TKey, TValue> : IKafkaShareCons
             ReleasePendingAcks();
         }
 
-        _subscriptionSnapshot = new HashSet<string>();
+        _subscriptionSnapshot = new DekafSet<string>();
         _sessionManager.ResetAll();
         return this;
     }

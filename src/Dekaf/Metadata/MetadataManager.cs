@@ -777,7 +777,7 @@ public sealed partial class MetadataManager : IAsyncDisposable
     /// </summary>
     internal async ValueTask<List<(string Host, int Port)>> ResolveBootstrapEndpointsAsync(CancellationToken cancellationToken)
     {
-        var seen = new HashSet<(string Host, int Port)>();
+        var seen = new DekafSet<(string Host, int Port)>();
         var resolved = new List<(string Host, int Port)>();
 
         foreach (var (host, port) in _bootstrapEndpoints)
@@ -924,7 +924,7 @@ public sealed partial class MetadataManager : IAsyncDisposable
                 currentBrokers.Count + _bootstrapEndpoints.Count);
 
             // First try known brokers, tracking seen endpoints for O(1) dedup
-            var seen = new HashSet<(string Host, int Port)>(
+            var seen = new DekafSet<(string Host, int Port)>(
                 currentBrokers.Count + _bootstrapEndpoints.Count);
 
             foreach (var broker in currentBrokers)

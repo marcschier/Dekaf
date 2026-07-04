@@ -598,10 +598,10 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
 
     private readonly ConcurrentDictionary<string, byte> _subscription = new();
     private readonly HashSet<TopicPartition> _assignment = [];
-    private volatile IReadOnlySet<TopicPartition> _assignmentSnapshot = new HashSet<TopicPartition>();
+    private volatile IReadOnlySet<TopicPartition> _assignmentSnapshot = new DekafSet<TopicPartition>();
     private readonly ConcurrentDictionary<TopicPartition, byte> _paused = new();
-    private volatile IReadOnlySet<string> _subscriptionSnapshot = new HashSet<string>();
-    private volatile IReadOnlySet<TopicPartition> _pausedSnapshot = new HashSet<TopicPartition>();
+    private volatile IReadOnlySet<string> _subscriptionSnapshot = new DekafSet<string>();
+    private volatile IReadOnlySet<TopicPartition> _pausedSnapshot = new DekafSet<TopicPartition>();
 
     // Pattern subscription support
     private volatile Func<string, bool>? _topicFilter;
@@ -2926,7 +2926,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         // Create a set for efficient lookup
         var removeSet = partitionsToRemove is HashSet<TopicPartition> set
             ? set
-            : new HashSet<TopicPartition>(partitionsToRemove);
+            : new DekafSet<TopicPartition>(partitionsToRemove);
 
         if (removeSet.Count == 0)
             return;
@@ -3231,7 +3231,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         var changed = false;
 
         // Build new subscription from matching topics
-        var newTopics = new HashSet<string>();
+        var newTopics = new DekafSet<string>();
         foreach (var topic in allTopics)
         {
             // Skip internal topics (e.g., __consumer_offsets, __transaction_state)
@@ -3718,7 +3718,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
     /// </summary>
     private void PublishAssignmentSnapshot()
     {
-        _assignmentSnapshot = new HashSet<TopicPartition>(_assignment);
+        _assignmentSnapshot = new DekafSet<TopicPartition>(_assignment);
         Interlocked.Increment(ref _assignmentEnsureVersion);
         Volatile.Write(ref _lastCoordinatorAssignmentVersion, -1);
     }
@@ -4432,7 +4432,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
 
     private void ClearFetchBufferForPartition(TopicPartition partition)
     {
-        var partitions = new HashSet<TopicPartition> { partition };
+        var partitions = new DekafSet<TopicPartition> { partition };
         ClearFetchBufferForPartitions(partitions);
     }
 
@@ -4715,7 +4715,7 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
         }
 
         // For larger lists, use HashSet for O(n) comparison
-        var setB = new HashSet<TopicPartition>(b);
+        var setB = new DekafSet<TopicPartition>(b);
         foreach (var partitionA in a)
         {
             if (!setB.Contains(partitionA))

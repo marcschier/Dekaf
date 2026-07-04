@@ -326,7 +326,7 @@ internal sealed partial class ShareConsumerCoordinator : IAsyncDisposable
     /// </summary>
     private void ProcessShareGroupAssignment(ShareGroupHeartbeatAssignment assignment)
     {
-        var newAssignment = new HashSet<TopicPartition>();
+        var newAssignment = new DekafSet<TopicPartition>();
 
         foreach (var tp in assignment.TopicPartitions)
         {
