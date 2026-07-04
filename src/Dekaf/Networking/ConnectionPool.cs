@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using Dekaf.Security.Sasl;
 using Dekaf.Telemetry;
 using Microsoft.Extensions.Logging;
+using Dekaf.Internal;
 
 namespace Dekaf.Networking;
 
@@ -401,7 +402,7 @@ public sealed partial class ConnectionPool : IConnectionPool
     {
         foreach (var task in tasks)
         {
-            if (task is not null && task.IsCompletedSuccessfully)
+            if (task is not null && BclCompat.IsCompletedSuccessfully(task))
             {
                 try { await task.Result.DisposeAsync().ConfigureAwait(false); }
                 catch { /* best-effort cleanup */ }

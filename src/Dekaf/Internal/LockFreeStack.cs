@@ -193,5 +193,5 @@ internal sealed class LockFreeStack<T> where T : class
     private int GetStartStripe()
         => _stripes.Length == 1
             ? 0
-            : (Thread.GetCurrentProcessorId() & int.MaxValue) % _stripes.Length;
+            : (BclCompat.GetCurrentProcessorId() & int.MaxValue) % _stripes.Length;
 }

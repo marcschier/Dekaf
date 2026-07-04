@@ -44,6 +44,36 @@ internal static class BclCompat
         GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
 #endif
 
+    /// <summary>The Unix epoch (<see cref="DateTime.UnixEpoch"/> on net2.1+).</summary>
+    public static readonly DateTime UnixEpoch =
+#if NETSTANDARD2_0
+        new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+#else
+        DateTime.UnixEpoch;
+#endif
+
+    /// <summary>Whether a double is finite (<see cref="double.IsFinite(double)"/> on net2.1+).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsFinite(double value)
+#if NETSTANDARD2_0
+        => !double.IsNaN(value) && !double.IsInfinity(value);
+#else
+        => double.IsFinite(value);
+#endif
+
+    /// <summary>Fills an array with a value (<see cref="Array.Fill{T}(T[], T)"/> on net2.1+).</summary>
+    public static void ArrayFill<T>(T[] array, T value)
+#if NETSTANDARD2_0
+    {
+        for (var i = 0; i < array.Length; i++)
+        {
+            array[i] = value;
+        }
+    }
+#else
+        => Array.Fill(array, value);
+#endif
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static ValueTask<T> FromException<T>(Exception exception)
 #if NETSTANDARD
@@ -167,7 +197,9 @@ internal static class BclCompat
 
     public static byte[] Pbkdf2(byte[] password, byte[] salt, int iterations, HashAlgorithmName hashAlgorithm, int outputLength)
     {
-#if NETSTANDARD
+#if NETSTANDARD2_0
+        return Pbkdf2Manual(password, salt, iterations, hashAlgorithm, outputLength);
+#elif NETSTANDARD2_1
         // The hash algorithm is an explicit SHA-256/384/512 supplied by the caller (SCRAM/admin),
         // so this is not a weak-hash use; the native Rfc2898DeriveBytes.Pbkdf2 is used on net8.0+.
 #pragma warning disable CA5379
@@ -178,6 +210,61 @@ internal static class BclCompat
         return Rfc2898DeriveBytes.Pbkdf2(password, salt, iterations, hashAlgorithm, outputLength);
 #endif
     }
+
+#if NETSTANDARD2_0
+    private static byte[] Pbkdf2Manual(
+        byte[] password, byte[] salt, int iterations, HashAlgorithmName hashAlgorithm, int outputLength)
+    {
+        using HMAC hmac = hashAlgorithm == HashAlgorithmName.SHA256
+            ? new HMACSHA256(password)
+            : new HMACSHA512(password);
+
+        var hashLength = hmac.HashSize / 8;
+        var blockCount = (outputLength + hashLength - 1) / hashLength;
+        var output = new byte[outputLength];
+        var saltAndIndex = new byte[salt.Length + 4];
+        Array.Copy(salt, saltAndIndex, salt.Length);
+        var offset = 0;
+
+        for (var block = 1; block <= blockCount; block++)
+        {
+            BinaryPrimitives.WriteInt32BigEndian(saltAndIndex.AsSpan(salt.Length), block);
+            var u = hmac.ComputeHash(saltAndIndex);
+            var t = (byte[])u.Clone();
+            for (var iteration = 1; iteration < iterations; iteration++)
+            {
+                u = hmac.ComputeHash(u);
+                for (var i = 0; i < t.Length; i++)
+                {
+                    t[i] ^= u[i];
+                }
+            }
+
+            var toCopy = Math.Min(hashLength, outputLength - offset);
+            Array.Copy(t, 0, output, offset, toCopy);
+            offset += toCopy;
+        }
+
+        return output;
+    }
+#endif
+
+    /// <summary>A best-effort current processor id (<see cref="Thread.GetCurrentProcessorId"/> on net2.1+).</summary>
+    public static int GetCurrentProcessorId()
+#if NETSTANDARD2_0
+        => Environment.CurrentManagedThreadId;
+#else
+        => Thread.GetCurrentProcessorId();
+#endif
+
+    /// <summary>Whether a task completed successfully (<c>Task.IsCompletedSuccessfully</c> on net2.1+).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsCompletedSuccessfully(Task task)
+#if NETSTANDARD2_0
+        => task.Status == TaskStatus.RanToCompletion;
+#else
+        => task.IsCompletedSuccessfully;
+#endif
 
     public static byte[] RandomBytes(int count)
     {

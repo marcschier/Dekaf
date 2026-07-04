@@ -378,7 +378,7 @@ public sealed partial class ConsumerCoordinator : IAsyncDisposable
 
                 var request = new OffsetCommitRequest
                 {
-                    GroupId = _options.GroupId,
+                    GroupId = _options.GroupId!,
                     GenerationIdOrMemberEpoch = _generationId,
                     MemberId = _memberId,
                     GroupInstanceId = _options.GroupInstanceId,
@@ -475,7 +475,7 @@ public sealed partial class ConsumerCoordinator : IAsyncDisposable
 
                 var request = new OffsetFetchRequest
                 {
-                    GroupId = _options.GroupId,
+                    GroupId = _options.GroupId!,
                     Topics = topicPartitions
                 };
 

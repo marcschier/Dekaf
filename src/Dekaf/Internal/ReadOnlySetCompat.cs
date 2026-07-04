@@ -77,6 +77,24 @@ namespace Dekaf
         /// </summary>
         public static DekafSet<T> ToDekafSet<T>(this IEnumerable<T> source) => new DekafSet<T>(source);
 
+        /// <summary>
+        /// Copies an <see cref="IReadOnlyDictionary{TKey,TValue}"/> into a mutable
+        /// <see cref="Dictionary{TKey,TValue}"/>. netstandard2.0's Dictionary has no ctor that
+        /// accepts an IReadOnlyDictionary/IEnumerable, so this bridges that gap uniformly.
+        /// </summary>
+        public static Dictionary<TKey, TValue> CopyToDictionary<TKey, TValue>(
+            this IReadOnlyDictionary<TKey, TValue> source, IEqualityComparer<TKey>? comparer = null)
+            where TKey : notnull
+        {
+            var result = new Dictionary<TKey, TValue>(source.Count, comparer);
+            foreach (var pair in source)
+            {
+                result[pair.Key] = pair.Value;
+            }
+
+            return result;
+        }
+
 #if NETSTANDARD
         /// <summary>
         /// Polyfill for <c>ConcurrentDictionary.TryRemove(KeyValuePair)</c> (net5.0+): removes the

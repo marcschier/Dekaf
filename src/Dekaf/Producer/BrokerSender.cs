@@ -2775,7 +2775,7 @@ internal sealed partial class BrokerSender : IAsyncDisposable
         // After the send loop exits, these won't be polled by MaybeScaleConnections.
         if (_pendingShrinkTask is not null)
         {
-            if (_pendingShrinkTask.IsCompletedSuccessfully)
+            if (BclCompat.IsCompletedSuccessfully(_pendingShrinkTask))
             {
                 var removedConn = _pendingShrinkTask.Result;
                 if (removedConn is not null)
@@ -2869,7 +2869,7 @@ internal sealed partial class BrokerSender : IAsyncDisposable
             var task = _pendingScaleTask;
             _pendingScaleTask = null;
 
-            if (task.IsCompletedSuccessfully)
+            if (BclCompat.IsCompletedSuccessfully(task))
             {
                 var actualCount = task.Result;
                 if (actualCount > _connectionCount)
@@ -2894,7 +2894,7 @@ internal sealed partial class BrokerSender : IAsyncDisposable
             var task = _pendingShrinkTask;
             _pendingShrinkTask = null;
 
-            if (task.IsCompletedSuccessfully)
+            if (BclCompat.IsCompletedSuccessfully(task))
             {
                 var removedConnection = task.Result;
                 if (removedConnection is not null)

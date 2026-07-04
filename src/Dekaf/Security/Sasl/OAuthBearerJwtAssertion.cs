@@ -73,7 +73,7 @@ internal static class OAuthBearerJwtAssertion
     {
         if (string.IsNullOrWhiteSpace(value))
             throw new InvalidOperationException(message);
-        return value;
+        return value!;
     }
 
     private static void ValidateAdditionalClaims(IReadOnlyDictionary<string, object?>? claims)

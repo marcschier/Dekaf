@@ -547,7 +547,7 @@ internal sealed partial class ShareConsumerCoordinator : IAsyncDisposable
             var request = new ShareGroupHeartbeatRequest
             {
                 GroupId = _options.GroupId,
-                MemberId = _memberId,
+                MemberId = _memberId!,
                 MemberEpoch = -1
             };
 

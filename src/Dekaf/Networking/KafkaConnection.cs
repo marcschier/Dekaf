@@ -1414,7 +1414,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
         correlationId = 0;
         responseData = default;
 
-        var span = buffer.FirstSpan;
+        var span = buffer.First.Span;
 
         // Read size prefix directly from span
         var size = BinaryPrimitives.ReadInt32BigEndian(span);
@@ -2627,7 +2627,7 @@ public sealed partial class KafkaConnection : IKafkaConnection
             var destination = context.Buffer.AsSpan(context.Offset, available);
 
             if (buffer.IsSingleSegment)
-                buffer.FirstSpan.Slice(0, available).CopyTo(destination);
+                buffer.First.Span.Slice(0, available).CopyTo(destination);
             else
                 buffer.Slice(0, available).CopyTo(destination);
 

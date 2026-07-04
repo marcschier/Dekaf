@@ -102,7 +102,8 @@ namespace System.Buffers
                 newSize = currentLength + sizeHint;
                 if ((uint)newSize > int.MaxValue)
                 {
-                    throw new OutOfMemoryException();
+                    throw new InvalidOperationException(
+                        "Buffer writer cannot grow beyond the maximum array length.");
                 }
             }
 

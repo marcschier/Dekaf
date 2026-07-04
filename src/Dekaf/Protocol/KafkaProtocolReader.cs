@@ -69,7 +69,7 @@ public ref struct KafkaProtocolReader
         if (buffer.IsSingleSegment)
         {
             // Fast path: Single segment - use direct span access
-            _span = buffer.FirstSpan;
+            _span = buffer.First.Span;
             _memory = buffer.First;
             _hasMemory = true;
             _position = 0;

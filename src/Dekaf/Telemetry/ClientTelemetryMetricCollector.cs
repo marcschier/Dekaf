@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using Dekaf.Internal;
 
 namespace Dekaf.Telemetry;
 
@@ -262,7 +263,7 @@ internal sealed class ClientTelemetryMetricCollector
                 continue;
             }
 
-            if (!double.IsFinite(value))
+            if (!BclCompat.IsFinite(value))
             {
                 continue;
             }

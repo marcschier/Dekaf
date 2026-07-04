@@ -112,8 +112,8 @@ public sealed class OAuthBearerJwtBearerOptions
         Subject = Subject,
         KeyId = KeyId,
         Scopes = Scopes is null ? null : Scopes.ToArray(),
-        AdditionalClaims = AdditionalClaims is null ? null : new Dictionary<string, object?>(AdditionalClaims, StringComparer.Ordinal),
-        AdditionalParameters = AdditionalParameters is null ? null : new Dictionary<string, string>(AdditionalParameters, StringComparer.Ordinal),
+        AdditionalClaims = AdditionalClaims is null ? null : AdditionalClaims.CopyToDictionary(StringComparer.Ordinal),
+        AdditionalParameters = AdditionalParameters is null ? null : AdditionalParameters.CopyToDictionary(StringComparer.Ordinal),
         AssertionLifetime = AssertionLifetime,
         TokenRefreshBufferSeconds = TokenRefreshBufferSeconds,
         SigningAlgorithm = SigningAlgorithm

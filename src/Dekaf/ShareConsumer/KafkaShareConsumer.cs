@@ -8,6 +8,7 @@ using Dekaf.Protocol.Messages;
 using Dekaf.Protocol.Records;
 using Dekaf.Serialization;
 using Microsoft.Extensions.Logging;
+using Dekaf.Internal;
 
 namespace Dekaf.ShareConsumer;
 
@@ -504,7 +505,7 @@ internal sealed partial class KafkaShareConsumer<TKey, TValue> : IKafkaShareCons
             foreach (var batch in batches)
             {
                 var types = new byte[batch.AcknowledgeTypes.Length];
-                Array.Fill(types, (byte)AcknowledgeType.Release);
+                BclCompat.ArrayFill(types, (byte)AcknowledgeType.Release);
                 releasedBatches.Add(new AcknowledgementBatchData(batch.FirstOffset, batch.LastOffset, types));
             }
             released[tp] = releasedBatches;

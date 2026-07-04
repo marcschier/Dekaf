@@ -1,5 +1,6 @@
 using System.IO.Pipelines;
 using System.Net.Sockets;
+using Dekaf.Internal;
 
 namespace Dekaf.Networking;
 

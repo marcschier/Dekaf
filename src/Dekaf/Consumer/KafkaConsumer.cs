@@ -968,9 +968,9 @@ public sealed partial class KafkaConsumer<TKey, TValue> :
 
             return new ConsumerGroupMetadata
             {
-                GroupId = _options.GroupId,
+                GroupId = _options.GroupId!,
                 GenerationId = _coordinator.GenerationId,
-                MemberId = _coordinator.MemberId,
+                MemberId = _coordinator.MemberId!,
                 GroupInstanceId = _options.GroupInstanceId
             };
         }

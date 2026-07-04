@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using Dekaf.Compression;
 using CompressionType = Dekaf.Protocol.Records.CompressionType;
+using Dekaf.Internal;
 
 namespace Dekaf.Telemetry;
 
@@ -201,7 +202,7 @@ internal sealed class ClientTelemetryPayloadProvider : IClientTelemetryPayloadPr
 
     private static long GetUnixTimeNanoseconds()
     {
-        var ticksSinceUnixEpoch = DateTimeOffset.UtcNow.UtcTicks - DateTime.UnixEpoch.Ticks;
+        var ticksSinceUnixEpoch = DateTimeOffset.UtcNow.UtcTicks - BclCompat.UnixEpoch.Ticks;
         return checked(ticksSinceUnixEpoch * 100);
     }
 }
