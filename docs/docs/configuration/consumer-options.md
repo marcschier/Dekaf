@@ -256,11 +256,18 @@ Server-side pattern subscription requires Kafka 4.1+ brokers with `ConsumerGroup
 
 ### WithRebalanceListener
 
-Get notified of partition changes:
+Get notified of partition changes. If the listener also implements
+`IPartitionStopListener`, `OnPartitionsStoppedAsync` runs during graceful
+`CloseAsync` or `DisposeAsync` with the current assignment before final
+auto-commit, `LeaveGroup`, assignment cleanup, and resource disposal:
 
 ```csharp
 .WithRebalanceListener(new MyRebalanceListener())
 ```
+
+The stop callback is best-effort and bounded to five seconds. If it observes
+shutdown cancellation, Dekaf still completes local cleanup before rethrowing the
+cancellation from `CloseAsync`.
 
 ## Networking
 
