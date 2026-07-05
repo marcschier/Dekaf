@@ -520,7 +520,8 @@ public sealed partial class KafkaConnection : IKafkaConnection
             var telemetryStartTimestamp = _telemetryMetricCollector is null ? 0 : Stopwatch.GetTimestamp();
 
             // Write phase
-            LogSendingRequest(MessageDispatch.GetApiKey<TRequest, TResponse>(), correlationId, apiVersion, _host, _port);
+            var apiKey = MessageDispatch.GetApiKey<TRequest, TResponse>();
+            LogSendingRequest(apiKey, correlationId, apiVersion, _host, _port);
 
             await PreSerializeAndWriteAsync<TRequest, TResponse>(request, correlationId, apiVersion, headerVersion, cancellationToken)
                 .ConfigureAwait(false);
@@ -593,7 +594,8 @@ public sealed partial class KafkaConnection : IKafkaConnection
 
         // Don't register a pending request - we won't receive a response
 
-        LogSendingFireAndForgetRequest(MessageDispatch.GetApiKey<TRequest, TResponse>(), correlationId, apiVersion, _host, _port);
+        var apiKey = MessageDispatch.GetApiKey<TRequest, TResponse>();
+        LogSendingFireAndForgetRequest(apiKey, correlationId, apiVersion, _host, _port);
 
         await PreSerializeAndWriteAsync<TRequest, TResponse>(request, correlationId, apiVersion, headerVersion, cancellationToken, callerOwnsTimeout)
             .ConfigureAwait(false);
