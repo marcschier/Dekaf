@@ -531,6 +531,43 @@ public sealed class PartitionedConsumerRuntimeTests
     }
 
     [Test]
+    public async Task RunPartitionedAsync_RejectsZeroKeyHandlerConcurrency()
+    {
+        var consumer = new TestConsumer();
+
+        async Task Act()
+        {
+            await consumer.RunPartitionedAsync(
+                static (_, _, _) => ValueTask.CompletedTask,
+                new PartitionedProcessingOptions
+                {
+                    Ordering = PartitionedProcessingOrder.Key,
+                    MaxConcurrentHandlersPerPartition = 0
+                });
+        }
+
+        await Assert.That(Act).Throws<ArgumentOutOfRangeException>();
+    }
+
+    [Test]
+    public async Task RunPartitionedBatchesAsync_RejectsZeroHandlerBatchSize()
+    {
+        var consumer = new TestConsumer();
+
+        async Task Act()
+        {
+            await consumer.RunPartitionedBatchesAsync(
+                static (_, _, _) => ValueTask.CompletedTask,
+                new PartitionedProcessingOptions
+                {
+                    MaxHandlerBatchSize = 0
+                });
+        }
+
+        await Assert.That(Act).Throws<ArgumentOutOfRangeException>();
+    }
+
+    [Test]
     public async Task RunPartitionedAsync_StopTimeoutOnRevokePropagates()
     {
         var partition = new TopicPartition("topic-a", 0);
@@ -647,6 +684,278 @@ public sealed class PartitionedConsumerRuntimeTests
         await StopRuntimeAsync(cts, runTask).ConfigureAwait(false);
     }
 
+    [Test]
+    public async Task RunPartitionedAsync_KeyOrderingHandlerFailurePropagates()
+    {
+        var partition = new TopicPartition("topic-a", 0);
+        var consumer = new TestConsumer();
+        consumer.SetAssignment(partition);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var runTask = consumer.RunPartitionedAsync<string, string>(
+            static (_, _, _) => throw new InvalidOperationException("key handler failed"),
+            new PartitionedProcessingOptions
+            {
+                Ordering = PartitionedProcessingOrder.Key,
+                MaxConcurrentHandlersPerPartition = 2,
+                MaxBufferedRecordsPerPartition = 8
+            },
+            cts.Token).AsTask();
+
+        consumer.Enqueue(CreateResult(partition, 0, key: "a"));
+
+        await Assert.That(async () => await runTask.WaitAsync(cts.Token).ConfigureAwait(false))
+            .Throws<InvalidOperationException>();
+    }
+
+    [Test]
+    public async Task RunPartitionedAsync_KeyOrderingRunsDifferentKeysConcurrently()
+    {
+        var partition = new TopicPartition("topic-a", 0);
+        var consumer = new TestConsumer();
+        consumer.SetAssignment(partition);
+
+        var firstKeyStarted = NewCompletionSource();
+        var releaseFirstKey = NewCompletionSource();
+        var otherKeyProcessed = NewCompletionSource();
+        var secondSameKeyStarted = NewCompletionSource();
+        var processed = new ConcurrentDictionary<string, List<long>>();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var runTask = consumer.RunPartitionedAsync(
+            async (_, message, cancellationToken) =>
+            {
+                var key = message.Key!;
+
+                if (key == "a" && message.Offset == 0)
+                {
+                    firstKeyStarted.SetResult();
+                    await releaseFirstKey.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                if (key == "a" && message.Offset == 1)
+                    secondSameKeyStarted.SetResult();
+
+                var offsets = processed.GetOrAdd(key, static _ => []);
+                lock (offsets)
+                    offsets.Add(message.Offset);
+
+                if (key == "b")
+                    otherKeyProcessed.SetResult();
+            },
+            new PartitionedProcessingOptions
+            {
+                Ordering = PartitionedProcessingOrder.Key,
+                MaxConcurrentHandlersPerPartition = 2,
+                MaxBufferedRecordsPerPartition = 8
+            },
+            cts.Token).AsTask();
+
+        consumer.Enqueue(
+            CreateResult(partition, 0, key: "a"),
+            CreateResult(partition, 1, key: "a"),
+            CreateResult(partition, 2, key: "b"));
+
+        await firstKeyStarted.Task.WaitAsync(cts.Token).ConfigureAwait(false);
+        await otherKeyProcessed.Task.WaitAsync(cts.Token).ConfigureAwait(false);
+        await Task.Delay(100, cts.Token).ConfigureAwait(false);
+
+        await Assert.That(secondSameKeyStarted.Task.IsCompleted).IsFalse();
+
+        releaseFirstKey.SetResult();
+        await secondSameKeyStarted.Task.WaitAsync(cts.Token).ConfigureAwait(false);
+
+        await Assert.That(() => Snapshot(processed, "a"))
+            .Eventually(offsets => offsets.IsEquivalentTo(new long[] { 0, 1 }), TimeSpan.FromSeconds(5));
+        await Assert.That(Snapshot(processed, "b")).IsEquivalentTo(new long[] { 2 });
+
+        await StopRuntimeAsync(cts, runTask).ConfigureAwait(false);
+    }
+
+    [Test]
+    public async Task RunPartitionedAsync_KeyOrderingCommitsOnlyContiguousCompletedOffsets()
+    {
+        var partition = new TopicPartition("topic-a", 0);
+        var consumer = new TestConsumer();
+        consumer.SetAssignment(partition);
+
+        var firstKeyStarted = NewCompletionSource();
+        var releaseFirstKey = NewCompletionSource();
+        var otherKeyProcessed = NewCompletionSource();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var runTask = consumer.RunPartitionedAsync(
+            async (_, message, cancellationToken) =>
+            {
+                if (message.Key == "a")
+                {
+                    firstKeyStarted.SetResult();
+                    await releaseFirstKey.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+
+                if (message.Key == "b")
+                    otherKeyProcessed.SetResult();
+            },
+            new PartitionedProcessingOptions
+            {
+                Ordering = PartitionedProcessingOrder.Key,
+                MaxConcurrentHandlersPerPartition = 2,
+                MaxBufferedRecordsPerPartition = 8,
+                CommitPolicy = PartitionCommitPolicy.CommitCompletedPeriodically,
+                CommitInterval = TimeSpan.FromMilliseconds(50)
+            },
+            cts.Token).AsTask();
+
+        consumer.Enqueue(
+            CreateResult(partition, 0, key: "a"),
+            CreateResult(partition, 1, key: "b"));
+
+        await firstKeyStarted.Task.WaitAsync(cts.Token).ConfigureAwait(false);
+        await otherKeyProcessed.Task.WaitAsync(cts.Token).ConfigureAwait(false);
+
+        await Task.Delay(250, cts.Token).ConfigureAwait(false);
+        await Assert.That(consumer.CommitCalls).IsEmpty();
+
+        releaseFirstKey.SetResult();
+
+        await Assert.That(() => consumer.CommitCalls.SelectMany(static offsets => offsets).ToArray())
+            .Eventually(offsets => offsets.IsEquivalentTo(new[] { new TopicPartitionOffset("topic-a", 0, 2) }), TimeSpan.FromSeconds(5));
+
+        await StopRuntimeAsync(cts, runTask).ConfigureAwait(false);
+    }
+
+    [Test]
+    public async Task RunPartitionedAsync_KeyOrderingDrainsInFlightOnRevoke()
+    {
+        var partition = new TopicPartition("topic-a", 0);
+        var consumer = new TestConsumer();
+        consumer.SetAssignment(partition);
+
+        var handlerStarted = NewCompletionSource();
+        var releaseHandler = NewCompletionSource();
+        var handlerFinished = NewCompletionSource();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var runTask = consumer.RunPartitionedAsync(
+            async (_, _, cancellationToken) =>
+            {
+                handlerStarted.SetResult();
+                await releaseHandler.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+                handlerFinished.SetResult();
+            },
+            new PartitionedProcessingOptions
+            {
+                Ordering = PartitionedProcessingOrder.Key,
+                CommitPolicy = PartitionCommitPolicy.CommitCompletedOnRevoke,
+                StopTimeout = TimeSpan.FromSeconds(5)
+            },
+            cts.Token).AsTask();
+
+        consumer.Enqueue(CreateResult(partition, 0, leaderEpoch: 3, key: "a"));
+
+        await handlerStarted.Task.WaitAsync(cts.Token).ConfigureAwait(false);
+        consumer.RevokeFromCoordinator(partition);
+        await Task.Delay(100, cts.Token).ConfigureAwait(false);
+
+        await Assert.That(handlerFinished.Task.IsCompleted).IsFalse();
+        await Assert.That(consumer.CommitCalls).IsEmpty();
+
+        releaseHandler.SetResult();
+        await handlerFinished.Task.WaitAsync(cts.Token).ConfigureAwait(false);
+
+        await Assert.That(() => consumer.CommitCalls.SingleOrDefault())
+            .Eventually(offsets => offsets!.IsEquivalentTo(
+            [
+                new TopicPartitionOffset("topic-a", 0, 1, 3)
+            ]), TimeSpan.FromSeconds(5));
+
+        await StopRuntimeAsync(cts, runTask).ConfigureAwait(false);
+    }
+
+    [Test]
+    public async Task KeyOrderedPartitionDispatcher_RemovesIdleLanesAfterProcessing()
+    {
+        var partition = new TopicPartition("topic-a", 0);
+        var lane = new PartitionLane<string, string>(
+            partition,
+            capacity: 32,
+            static (_, _) => ValueTask.CompletedTask,
+            static _ => { },
+            static (_, exception) => throw exception);
+        var context = new PartitionProcessorContext<string, string>(lane);
+        var processedCount = 0;
+        var dispatcher = new KeyOrderedPartitionDispatcher<string, string>(
+            context,
+            maxBatchSize: 1,
+            maxConcurrentHandlers: 4,
+            maxBufferedRecords: 32,
+            (records, _) =>
+            {
+                for (var i = 0; i < records.Count; i++)
+                    context.MarkProcessed(records[i]);
+
+                Interlocked.Add(ref processedCount, records.Count);
+                return ValueTask.CompletedTask;
+            });
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var runTask = dispatcher.RunAsync(cts.Token).AsTask();
+
+        for (var i = 0; i < 20; i++)
+            lane.TryEnqueue(CreateResult(partition, i, key: $"key-{i}"));
+
+        await Assert.That(() => Volatile.Read(ref processedCount))
+            .Eventually(count => count.IsEqualTo(20), TimeSpan.FromSeconds(5));
+        await Assert.That(() => dispatcher.LaneCount)
+            .Eventually(count => count.IsEqualTo(0), TimeSpan.FromSeconds(5));
+
+        await cts.CancelAsync().ConfigureAwait(false);
+        await Assert.ThrowsAsync<OperationCanceledException>(async () => await runTask.ConfigureAwait(false));
+    }
+
+    [Test]
+    public async Task RunPartitionedBatchesAsync_ProcessesBatchesAndMarksOffsets()
+    {
+        var partition = new TopicPartition("topic-a", 0);
+        var consumer = new TestConsumer();
+        consumer.SetAssignment(partition);
+
+        var batches = new ConcurrentQueue<long[]>();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var runTask = consumer.RunPartitionedBatchesAsync(
+            (_, messages, _) =>
+            {
+                batches.Enqueue(messages.Select(static message => message.Offset).ToArray());
+                return ValueTask.CompletedTask;
+            },
+            new PartitionedProcessingOptions
+            {
+                MaxHandlerBatchSize = 3,
+                CommitPolicy = PartitionCommitPolicy.CommitCompletedOnRevoke
+            },
+            cts.Token).AsTask();
+
+        consumer.Enqueue(
+            CreateResult(partition, 0),
+            CreateResult(partition, 1),
+            CreateResult(partition, 2),
+            CreateResult(partition, 3),
+            CreateResult(partition, 4),
+            CreateResult(partition, 5));
+
+        await Assert.That(() => batches.Sum(static batch => batch.Length))
+            .Eventually(count => count.IsEqualTo(6), TimeSpan.FromSeconds(5));
+        await Assert.That(batches.Select(static batch => batch.Length).All(static length => length <= 3)).IsTrue();
+
+        await StopRuntimeAsync(cts, runTask).ConfigureAwait(false);
+
+        await Assert.That(consumer.CommitCalls.Single()).IsEquivalentTo(
+        [
+            new TopicPartitionOffset("topic-a", 0, 6)
+        ]);
+    }
+
     private static async ValueTask StopRuntimeAsync(
         CancellationTokenSource cancellationTokenSource,
         Task runTask)
@@ -676,24 +985,40 @@ public sealed class PartitionedConsumerRuntimeTests
             return offsets.ToArray();
     }
 
+    private static long[] Snapshot(
+        ConcurrentDictionary<string, List<long>> processed,
+        string key)
+    {
+        if (!processed.TryGetValue(key, out var offsets))
+            return [];
+
+        lock (offsets)
+            return offsets.ToArray();
+    }
+
     private static ConsumeResult<string, string> CreateResult(
         TopicPartition partition,
         long offset,
-        int? leaderEpoch = null)
+        int? leaderEpoch = null,
+        string? key = null)
     {
+        var keyData = key is null
+            ? ReadOnlyMemory<byte>.Empty
+            : System.Text.Encoding.UTF8.GetBytes(key);
+
         return new ConsumeResult<string, string>(
             topic: partition.Topic,
             partition: partition.Partition,
             offset: offset,
-            keyData: default,
-            isKeyNull: true,
+            keyData: keyData,
+            isKeyNull: key is null,
             valueData: default,
             isValueNull: true,
             headers: null,
             timestampMs: 0,
             timestampType: TimestampType.NotAvailable,
             leaderEpoch: leaderEpoch,
-            keyDeserializer: null,
+            keyDeserializer: Serializers.String,
             valueDeserializer: null);
     }
 
@@ -1124,11 +1449,15 @@ public sealed class PartitionedConsumerRuntimeTests
             for (var i = 0; i < results.Count; i++)
             {
                 var result = results[i];
+                var isKeyNull = result.Key is null;
                 records[i] = new Record
                 {
                     OffsetDelta = checked((int)(result.Offset - baseOffset)),
                     TimestampDelta = result.TimestampMs - baseTimestamp,
-                    IsKeyNull = true,
+                    Key = isKeyNull
+                        ? ReadOnlyMemory<byte>.Empty
+                        : System.Text.Encoding.UTF8.GetBytes(result.Key!),
+                    IsKeyNull = isKeyNull,
                     IsValueNull = true
                 };
             }
