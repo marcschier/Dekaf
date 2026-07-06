@@ -471,7 +471,7 @@ internal sealed class PartitionedConsumerRuntime<TKey, TValue>
         {
             cancellationToken.ThrowIfCancellationRequested();
             runtime.QueueAssignedPartitions(partitions);
-            return ValueTaskCompatibility.CompletedTask;
+            return default;
         }
 
         public ValueTask OnPartitionsRevokedAsync(
@@ -480,7 +480,7 @@ internal sealed class PartitionedConsumerRuntime<TKey, TValue>
         {
             cancellationToken.ThrowIfCancellationRequested();
             runtime.QueueStoppedPartitions(partitions, PartitionStopReason.Revoke);
-            return ValueTaskCompatibility.CompletedTask;
+            return default;
         }
 
         public ValueTask OnPartitionsLostAsync(
@@ -489,7 +489,7 @@ internal sealed class PartitionedConsumerRuntime<TKey, TValue>
         {
             cancellationToken.ThrowIfCancellationRequested();
             runtime.QueueStoppedPartitions(partitions, PartitionStopReason.Lost);
-            return ValueTaskCompatibility.CompletedTask;
+            return default;
         }
     }
 
@@ -498,13 +498,16 @@ internal sealed class PartitionedConsumerRuntime<TKey, TValue>
         CancellationToken cancellationToken)
     {
         if (cancellationToken.IsCancellationRequested)
-            return ValueTaskCompatibility.FromCanceled(cancellationToken);
+            return new ValueTask(Task.FromCanceled(cancellationToken));
 
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var command = RuntimeCommand<TKey, TValue>.Commit(lane, completion, cancellationToken);
 
         if (!_commands.Writer.TryWrite(command))
-            return ValueTaskCompatibility.FromException(new InvalidOperationException("Partitioned processing runtime is not accepting commit requests."));
+        {
+            var exception = new InvalidOperationException("Partitioned processing runtime is not accepting commit requests.");
+            return new ValueTask(Task.FromException(exception));
+        }
 
         return new ValueTask(completion.Task.WaitAsync(cancellationToken));
     }

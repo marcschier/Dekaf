@@ -2335,7 +2335,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
             key.Return();
             value.Return();
             ReturnPooledHeaders(headers);
-            return ValueTaskCompatibility.FromException<bool>(new ObjectDisposedException(nameof(RecordAccumulator)));
+            return new ValueTask<bool>(Task.FromException<bool>(new ObjectDisposedException(nameof(RecordAccumulator))));
         }
 
         if (cancellationToken.IsCancellationRequested)
@@ -2343,7 +2343,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
             key.Return();
             value.Return();
             ReturnPooledHeaders(headers);
-            return ValueTaskCompatibility.FromException<bool>(new OperationCanceledException(cancellationToken));
+            return new ValueTask<bool>(Task.FromException<bool>(new OperationCanceledException(cancellationToken)));
         }
 
         var (startTicks, deadline) = BeginReservationWait(recordSize);
@@ -2365,7 +2365,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                 // Caller gets a pre-built exception ValueTask, so nobody will call GetResult
                 // on this op. Manually return it to the pool to avoid leaking.
                 op.ReturnToPoolAfterTryFail();
-                return ValueTaskCompatibility.FromException<bool>(disposedException);
+                return new ValueTask<bool>(Task.FromException<bool>(disposedException));
             }
         }
 
@@ -3026,7 +3026,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         var currentBufferedBytes = Volatile.Read(ref _bufferedBytes);
         var currentMaxBufferMemory = (ulong)Volatile.Read(ref _maxBufferMemory);
         LogBufferMemoryWaiting(recordSize, currentBufferedBytes, currentMaxBufferMemory);
-        var currentTicks = Dekaf.Compatibility.EnvironmentCompat.TickCount64;
+        var currentTicks = Dekaf.MonotonicClock.GetMilliseconds();
         var deadline = (long.MaxValue - currentTicks > _options.MaxBlockMs)
             ? currentTicks + _options.MaxBlockMs
             : long.MaxValue;
@@ -3056,7 +3056,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            var remainingMs = deadline - Dekaf.Compatibility.EnvironmentCompat.TickCount64;
+            var remainingMs = deadline - Dekaf.MonotonicClock.GetMilliseconds();
             if (remainingMs <= 0)
                 ThrowBufferMemoryTimeout(recordSize, startTicks);
 
@@ -3135,7 +3135,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
     private void ThrowBufferMemoryTimeout(int recordSize, long startTicks)
     {
         var configured = TimeSpan.FromMilliseconds(_options.MaxBlockMs);
-        var elapsed = TimeSpan.FromMilliseconds(Dekaf.Compatibility.EnvironmentCompat.TickCount64 - startTicks);
+        var elapsed = TimeSpan.FromMilliseconds(Dekaf.MonotonicClock.GetMilliseconds() - startTicks);
         throw new KafkaTimeoutException(
             TimeoutKind.MaxBlock,
             elapsed,
@@ -3256,7 +3256,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         {
             // Reset oldest batch tracking since there are no batches
             Volatile.Write(ref _oldestBatchCreatedTicks, long.MaxValue);
-            return ValueTaskCompatibility.CompletedTask;
+            return default;
         }
 
         // Fast path 2: if the oldest batch hasn't reached linger time yet AND there are no
@@ -3271,7 +3271,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                 if (millisSinceOldest < _options.LingerMs)
                 {
                     // No batch is old enough to flush yet.
-                    return ValueTaskCompatibility.CompletedTask;
+                    return default;
                 }
             }
         }
@@ -3955,7 +3955,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         // Fast path: no unsealed batches AND no in-flight batches - avoid async overhead entirely
         if (!HasUnsealedBatches() && Volatile.Read(ref _inFlightBatchCount) == 0)
         {
-            return ValueTaskCompatibility.CompletedTask;
+            return default;
         }
 
         return FlushAsyncCore(cancellationToken);
