@@ -171,6 +171,24 @@ public sealed class InMemoryProducer<TKey, TValue> : IKafkaProducer<TKey, TValue
         return ValueTask.CompletedTask;
     }
 
+    public ValueTask InitTransactionsAsync(bool keepPreparedTransaction, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ThrowIfDisposed();
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask CompletePreparedTransactionAsync(
+        PreparedTransactionState preparedState,
+        bool committed,
+        CancellationToken cancellationToken = default)
+    {
+        _ = committed;
+        cancellationToken.ThrowIfCancellationRequested();
+        ThrowIfDisposed();
+        throw new NotSupportedException("In-memory producer transactions are not supported.");
+    }
+
     public ITopicProducer<TKey, TValue> ForTopic(string topic)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(topic);

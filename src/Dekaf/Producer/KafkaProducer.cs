@@ -86,6 +86,7 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
     private volatile bool _idempotentInitialized;
     private int _transactionCoordinatorId = -1;
     internal volatile TransactionState _transactionState = TransactionState.Uninitialized;
+    internal PreparedTransactionState _preparedTransactionState = PreparedTransactionState.Empty;
     // The error code that drove the transaction into AbortableError/FatalError, surfaced by
     // the fail-fast produce guard for context. ErrorCode is short-backed, so volatile is valid.
     internal volatile ErrorCode _lastTransactionError = ErrorCode.None;
@@ -1503,6 +1504,7 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
 
         var transactionState = _transactionState;
         if (transactionState is TransactionState.InTransaction
+            or TransactionState.PreparedTransaction
             or TransactionState.CommittingTransaction
             or TransactionState.AbortingTransaction
             or TransactionState.AbortableError)
@@ -1561,6 +1563,12 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
                 "A transaction is already in progress. Commit or abort it before starting a new one.");
         }
 
+        if (_transactionState == TransactionState.PreparedTransaction)
+        {
+            throw new InvalidOperationException(
+                "A prepared transaction is waiting for completion. Complete, commit, or abort it before starting a new one.");
+        }
+
         if (_transactionState != TransactionState.Ready)
         {
             throw new InvalidOperationException(
@@ -1568,6 +1576,7 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         }
 
         _transactionState = TransactionState.InTransaction;
+        _preparedTransactionState = PreparedTransactionState.Empty;
         _lastTransactionError = ErrorCode.None;
         _currentTransactionUsesTV2 = _metadataManager.GetFinalizedFeatureVersion(TransactionVersionFeature) >= 2;
         lock (_partitionsInTransactionLock)
@@ -1578,7 +1587,12 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         return new Transaction<TKey, TValue>(this);
     }
 
-    public async ValueTask InitTransactionsAsync(CancellationToken cancellationToken = default)
+    public ValueTask InitTransactionsAsync(CancellationToken cancellationToken = default)
+        => InitTransactionsAsync(keepPreparedTransaction: false, cancellationToken);
+
+    public async ValueTask InitTransactionsAsync(
+        bool keepPreparedTransaction,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(_options.TransactionalId))
         {
@@ -1587,6 +1601,7 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         }
 
         ThrowIfNotInitialized();
+        ThrowIfTwoPhaseCommitUnsupported(keepPreparedTransaction);
 
         await SemaphoreHelper.AcquireOrThrowDisposedAsync(_transactionLock, nameof(KafkaProducer<TKey, TValue>), cancellationToken).ConfigureAwait(false);
         try
@@ -1596,13 +1611,154 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
             await FindTransactionCoordinatorAsync(cancellationToken).ConfigureAwait(false);
 
             // Step 2: Initialize the producer ID via the coordinator
-            await ReinitializeProducerIdAsync(cancellationToken).ConfigureAwait(false);
+            _currentTransactionUsesTV2 = _metadataManager.GetFinalizedFeatureVersion(TransactionVersionFeature) >= 2;
+            await ReinitializeProducerIdAsync(cancellationToken, keepPreparedTransaction).ConfigureAwait(false);
 
-            _transactionState = TransactionState.Ready;
+            _transactionState = _preparedTransactionState.HasTransaction
+                ? TransactionState.PreparedTransaction
+                : TransactionState.Ready;
         }
         finally
         {
             SemaphoreHelper.ReleaseSafely(_transactionLock);
+        }
+    }
+
+    public async ValueTask CompletePreparedTransactionAsync(
+        PreparedTransactionState preparedState,
+        bool committed,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(_options.TransactionalId))
+        {
+            throw new InvalidOperationException(
+                "Cannot complete a prepared transaction: TransactionalId is not set in producer options.");
+        }
+
+        if (!preparedState.HasTransaction)
+            throw new ArgumentException("Prepared transaction state must identify a transaction.", nameof(preparedState));
+
+        ThrowIfNotInitialized();
+
+        if (_transactionState != TransactionState.PreparedTransaction)
+        {
+            throw new TransactionException(ErrorCode.InvalidTxnState,
+                $"Cannot complete prepared transaction in state: {_transactionState}")
+            {
+                TransactionalId = _options.TransactionalId
+            };
+        }
+
+        var transactionToComplete = _preparedTransactionState;
+        if (preparedState != transactionToComplete)
+        {
+            throw new TransactionException(ErrorCode.InvalidTxnState,
+                "Prepared transaction state does not match the pending prepared transaction.")
+            {
+                TransactionalId = _options.TransactionalId
+            };
+        }
+
+        _transactionState = committed
+            ? TransactionState.CommittingTransaction
+            : TransactionState.AbortingTransaction;
+
+        try
+        {
+            var applyResponseProducerState =
+                transactionToComplete.ProducerId == _producerId
+                && transactionToComplete.ProducerEpoch == _producerEpoch;
+
+            await EndTransactionAsync(
+                    committed,
+                    transactionToComplete.ProducerId,
+                    transactionToComplete.ProducerEpoch,
+                    applyResponseProducerState,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!committed && !_currentTransactionUsesTV2)
+            {
+                await ReinitializeProducerIdAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            FinalizeCompletedTransactionState();
+        }
+    }
+
+    private void ThrowIfTwoPhaseCommitUnsupported(bool keepPreparedTransaction)
+    {
+        if (!_options.EnableTwoPhaseCommit && !keepPreparedTransaction)
+            return;
+
+        var transactionVersion = _metadataManager.GetFinalizedFeatureVersion(TransactionVersionFeature);
+        if (transactionVersion < 3)
+        {
+            throw new BrokerVersionException(
+                "Broker does not support KIP-939 two-phase commit (transaction.version >= 3 required).");
+        }
+    }
+
+    internal PreparedTransactionState PrepareCurrentTransaction()
+    {
+        if (!_options.EnableTwoPhaseCommit)
+        {
+            throw new TransactionException(ErrorCode.InvalidTxnState,
+                "Cannot prepare a transaction when two-phase commit is not enabled.")
+            {
+                TransactionalId = _options.TransactionalId
+            };
+        }
+
+        ThrowIfTwoPhaseCommitUnsupported(keepPreparedTransaction: false);
+
+        if (_transactionState != TransactionState.InTransaction)
+        {
+            throw new TransactionException(ErrorCode.InvalidTxnState,
+                $"Cannot prepare transaction in state: {_transactionState}")
+            {
+                TransactionalId = _options.TransactionalId
+            };
+        }
+
+        var preparedState = new PreparedTransactionState(_producerId, _producerEpoch);
+        if (!preparedState.HasTransaction)
+        {
+            throw new TransactionException(ErrorCode.InvalidTxnState,
+                "Cannot prepare transaction before InitTransactionsAsync has assigned a producer ID.")
+            {
+                TransactionalId = _options.TransactionalId
+            };
+        }
+
+        _preparedTransactionState = preparedState;
+        _transactionState = TransactionState.PreparedTransaction;
+        return preparedState;
+    }
+
+    internal void ThrowIfInPreparedTransaction()
+    {
+        if (_transactionState == TransactionState.PreparedTransaction)
+        {
+            throw new InvalidOperationException(
+                "Cannot perform this operation while the transaction is prepared. Only commit, abort, dispose, or complete are permitted.");
+        }
+    }
+
+    internal void FinalizeCompletedTransactionState()
+    {
+        lock (_partitionsInTransactionLock)
+        {
+            _partitionsInTransaction.Clear();
+        }
+
+        _preparedTransactionState = PreparedTransactionState.Empty;
+
+        if (_transactionState is not (TransactionState.AbortableError or TransactionState.FatalError))
+        {
+            _transactionState = TransactionState.Ready;
         }
     }
 
@@ -1650,7 +1806,9 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         throw CreateTransactionException(errorCode, classification, $"{operation} failed: {errorCode}");
     }
 
-    internal async ValueTask ReinitializeProducerIdAsync(CancellationToken cancellationToken)
+    internal async ValueTask ReinitializeProducerIdAsync(
+        CancellationToken cancellationToken,
+        bool keepPreparedTransaction = false)
     {
         const int maxRetries = 10;
         var retryDelayMs = 100;
@@ -1665,12 +1823,20 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
                 InitProducerIdRequest.LowestSupportedVersion,
                 InitProducerIdRequest.HighestSupportedVersion);
 
+            if ((_options.EnableTwoPhaseCommit || keepPreparedTransaction) && initProducerIdVersion < 6)
+            {
+                throw new BrokerVersionException(
+                    "Broker does not support InitProducerId v6 required for KIP-939 two-phase commit.");
+            }
+
             var request = new InitProducerIdRequest
             {
                 TransactionalId = _options.TransactionalId,
                 TransactionTimeoutMs = _options.TransactionTimeoutMs,
                 ProducerId = _producerId,
-                ProducerEpoch = _producerEpoch
+                ProducerEpoch = _producerEpoch,
+                EnableTwoPhaseCommit = _options.EnableTwoPhaseCommit,
+                KeepPreparedTransaction = keepPreparedTransaction
             };
 
             var response = (InitProducerIdResponse)await connection
@@ -1720,6 +1886,12 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
             _accumulator.IsTransactional = true;
 
             _accumulator.ResetSequenceNumbers();
+            _preparedTransactionState = response.OngoingTransactionProducerId >= 0
+                && response.OngoingTransactionProducerEpoch >= 0
+                    ? new PreparedTransactionState(
+                        response.OngoingTransactionProducerId,
+                        response.OngoingTransactionProducerEpoch)
+                    : PreparedTransactionState.Empty;
 
             LogTransactionsInitialized(_producerId, _producerEpoch);
             return;
@@ -1919,7 +2091,20 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         };
     }
 
-    internal async ValueTask EndTransactionAsync(bool committed, CancellationToken cancellationToken)
+    internal ValueTask EndTransactionAsync(bool committed, CancellationToken cancellationToken)
+        => EndTransactionAsync(
+            committed,
+            _producerId,
+            _producerEpoch,
+            applyResponseProducerState: true,
+            cancellationToken);
+
+    private async ValueTask EndTransactionAsync(
+        bool committed,
+        long producerId,
+        short producerEpoch,
+        bool applyResponseProducerState,
+        CancellationToken cancellationToken)
     {
         const int maxRetries = 5;
         var retryDelayMs = 100;
@@ -1937,8 +2122,8 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
             var request = new EndTxnRequest
             {
                 TransactionalId = _options.TransactionalId!,
-                ProducerId = _producerId,
-                ProducerEpoch = _producerEpoch,
+                ProducerId = producerId,
+                ProducerEpoch = producerEpoch,
                 Committed = committed
             };
 
@@ -1954,7 +2139,7 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
                 // a separate InitProducerId round-trip.
                 // Safe without _epochBumpLock: EndTxn is called only after FlushAsync
                 // drains all in-flight batches, so no BrokerSender is active.
-                if (_currentTransactionUsesTV2 && response.ProducerId >= 0)
+                if (applyResponseProducerState && _currentTransactionUsesTV2 && response.ProducerId >= 0)
                 {
                     _producerId = response.ProducerId;
                     _producerEpoch = response.ProducerEpoch;
@@ -2626,6 +2811,15 @@ public sealed partial class KafkaProducer<TKey, TValue> : IKafkaProducer<TKey, T
         {
             throw new FatalTransactionException(_lastTransactionError,
                 "Cannot produce: the producer is in a fatal error state and must be closed.")
+            {
+                TransactionalId = _options.TransactionalId
+            };
+        }
+
+        if (txnState == TransactionState.PreparedTransaction)
+        {
+            throw new TransactionException(ErrorCode.InvalidTxnState,
+                "Cannot produce: the current transaction is prepared. Only commit, abort, or complete are permitted.")
             {
                 TransactionalId = _options.TransactionalId
             };
@@ -3609,6 +3803,8 @@ internal sealed class Transaction<TKey, TValue> : ITransaction<TKey, TValue>
         if (_committed || _aborted)
             throw new InvalidOperationException("Transaction is already completed");
 
+        _producer.ThrowIfInPreparedTransaction();
+
         // Partition registration with AddPartitionsToTxn is handled automatically
         // by BrokerSender before the ProduceRequest is sent to the broker.
         return await _producer.ProduceAsync(message, cancellationToken).ConfigureAwait(false);
@@ -3637,6 +3833,17 @@ internal sealed class Transaction<TKey, TValue> : ITransaction<TKey, TValue>
         }
     }
 
+    public async ValueTask<PreparedTransactionState> PrepareAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfProducerDisposed();
+
+        if (_committed || _aborted)
+            throw new InvalidOperationException("Transaction is already completed");
+
+        await _producer.FlushAsync(cancellationToken).ConfigureAwait(false);
+        return _producer.PrepareCurrentTransaction();
+    }
+
     /// <summary>
     /// Clears the transaction's partition set and returns the producer to
     /// <see cref="TransactionState.Ready"/> for the next transaction — unless ending the transaction
@@ -3644,15 +3851,7 @@ internal sealed class Transaction<TKey, TValue> : ITransaction<TKey, TValue>
     /// </summary>
     private void FinalizeTransactionState()
     {
-        lock (_producer._partitionsInTransactionLock)
-        {
-            _producer._partitionsInTransaction.Clear();
-        }
-
-        if (_producer._transactionState is not (TransactionState.AbortableError or TransactionState.FatalError))
-        {
-            _producer._transactionState = TransactionState.Ready;
-        }
+        _producer.FinalizeCompletedTransactionState();
     }
 
     public async ValueTask AbortAsync(CancellationToken cancellationToken = default)
@@ -3693,6 +3892,8 @@ internal sealed class Transaction<TKey, TValue> : ITransaction<TKey, TValue>
 
         if (_committed || _aborted)
             throw new InvalidOperationException("Transaction is already completed");
+
+        _producer.ThrowIfInPreparedTransaction();
 
         await _producer.SendOffsetsToTransactionInternalAsync(offsets, consumerGroupId, cancellationToken)
             .ConfigureAwait(false);

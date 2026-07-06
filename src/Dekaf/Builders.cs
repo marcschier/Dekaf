@@ -31,6 +31,7 @@ public sealed class ProducerBuilder<TKey, TValue>
     private int _batchSize = 1048576;
     private string? _transactionalId;
     private int? _transactionTimeoutMs;
+    private bool _enableTwoPhaseCommit;
     private Protocol.Records.CompressionType _compressionType = Protocol.Records.CompressionType.None;
     private int? _compressionLevel;
     private int _maxInFlightRequestsPerConnection = 5;
@@ -182,6 +183,17 @@ public sealed class ProducerBuilder<TKey, TValue>
     public ProducerBuilder<TKey, TValue> WithTransactionalId(string transactionalId)
     {
         _transactionalId = transactionalId;
+        return this;
+    }
+
+    /// <summary>
+    /// Enables or disables KIP-939 two-phase commit participation.
+    /// Requires a transactional producer and broker support for <c>transaction.version</c> 3.
+    /// </summary>
+    /// <param name="enable">Whether to enable two-phase commit participation.</param>
+    public ProducerBuilder<TKey, TValue> WithTwoPhaseCommit(bool enable = true)
+    {
+        _enableTwoPhaseCommit = enable;
         return this;
     }
 
@@ -1057,6 +1069,9 @@ public sealed class ProducerBuilder<TKey, TValue>
                 "Transaction coordination requests require a single connection per broker. " +
                 "Either remove WithTransactionalId() or use ConnectionsPerBroker = 1.");
 
+        if (_enableTwoPhaseCommit && string.IsNullOrEmpty(_transactionalId))
+            throw new InvalidOperationException("Two-phase commit requires TransactionalId to be set.");
+
         if (_enableIdempotence && _acks == Acks.None)
             throw new InvalidOperationException("Acks.None is incompatible with idempotence because the broker cannot acknowledge sequence numbers without sending a response.");
 
@@ -1115,6 +1130,7 @@ public sealed class ProducerBuilder<TKey, TValue>
             EnableIdempotence = _enableIdempotence,
             ConnectionsPerBroker = _connectionsPerBroker,
             TransactionalId = _transactionalId,
+            EnableTwoPhaseCommit = _enableTwoPhaseCommit,
             TransactionTimeoutMs = _transactionTimeoutMs ?? 60000,
             CloseTimeoutMs = _closeTimeoutMs,
             MaxRequestSize = _maxRequestSize,
