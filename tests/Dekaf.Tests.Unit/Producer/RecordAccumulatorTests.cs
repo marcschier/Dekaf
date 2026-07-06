@@ -215,6 +215,45 @@ public class RecordAccumulatorTests
     }
 
     [Test]
+    public async Task Purge_Queue_CompleteFailure_ReleasesReservedMemory()
+    {
+        var options = CreateTestOptions();
+        var accumulator = new RecordAccumulator(options);
+        var topicPartition = new TopicPartition("test-topic", 0);
+
+        try
+        {
+            var appended = await accumulator.AppendAsync(
+                topicPartition.Topic,
+                topicPartition.Partition,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                PooledMemory.Null,
+                PooledMemory.Null,
+                headers: null,
+                headerCount: 0,
+                completionSource: null,
+                callback: null,
+                CancellationToken.None);
+
+            await Assert.That(appended).IsTrue();
+
+            var currentBatch = GetCurrentPartitionBatch(accumulator, topicPartition);
+            ForceSealOverestimateForTest(accumulator, currentBatch);
+
+            PoisonBatchArena(currentBatch);
+
+            var purged = accumulator.Purge(PurgeOptions.Queue, CreatePurgedException());
+
+            await Assert.That(purged).IsEqualTo(1);
+            await Assert.That(accumulator.BufferedBytes).IsEqualTo(0);
+        }
+        finally
+        {
+            await accumulator.DisposeAsync();
+        }
+    }
+
+    [Test]
     public async Task Purge_Queue_WaitsForInProgressSpanAppendBeforeReturningCurrentBatch()
     {
         var options = CreateTestOptions();
@@ -262,6 +301,108 @@ public class RecordAccumulatorTests
     }
 
     [Test]
+    public async Task Purge_Queue_CompleteFailure_ReleasesPendingAwaitedProduceCount()
+    {
+        var options = CreateTestOptions();
+        var accumulator = new RecordAccumulator(options);
+        var pool = new ValueTaskSourcePool<RecordMetadata>();
+        var topicPartition = new TopicPartition("test-topic", 0);
+
+        try
+        {
+            var completion = pool.Rent();
+            var completionTask = completion.Task;
+
+            var appended = await accumulator.AppendAsync(
+                topicPartition.Topic,
+                topicPartition.Partition,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                PooledMemory.Null,
+                PooledMemory.Null,
+                headers: null,
+                headerCount: 0,
+                completion,
+                callback: null,
+                CancellationToken.None);
+
+            await Assert.That(appended).IsTrue();
+            await Assert.That(GetPrivateField<int>(accumulator, "_pendingAwaitedProduceCount")).IsEqualTo(1);
+
+            var currentBatch = GetCurrentPartitionBatch(accumulator, topicPartition);
+            PoisonBatchArena(currentBatch);
+
+            var purged = accumulator.Purge(PurgeOptions.Queue, CreatePurgedException());
+
+            await Assert.That(purged).IsEqualTo(1);
+            await Assert.That(GetPrivateField<int>(accumulator, "_pendingAwaitedProduceCount")).IsEqualTo(0);
+            await Assert.ThrowsAsync<NullReferenceException>(async () => await completionTask);
+            await Assert.That(accumulator.BufferedBytes).IsEqualTo(0);
+        }
+        finally
+        {
+            await accumulator.DisposeAsync();
+            await pool.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task Purge_Queue_CompleteFailure_ContinuesToLaterPartitions()
+    {
+        var options = CreateTestOptions();
+        var accumulator = new RecordAccumulator(options);
+        var pool = new ValueTaskSourcePool<RecordMetadata>();
+        var poisonedPartition = new TopicPartition("test-topic", 0);
+        var healthyPartition = new TopicPartition("test-topic", 1);
+
+        try
+        {
+            var poisonedCompletion = pool.Rent();
+            var poisonedTask = poisonedCompletion.Task;
+            var healthyCompletion = pool.Rent();
+            var healthyTask = healthyCompletion.Task;
+
+            await Assert.That(await accumulator.AppendAsync(
+                poisonedPartition.Topic,
+                poisonedPartition.Partition,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                PooledMemory.Null,
+                PooledMemory.Null,
+                headers: null,
+                headerCount: 0,
+                poisonedCompletion,
+                callback: null,
+                CancellationToken.None)).IsTrue();
+
+            await Assert.That(await accumulator.AppendAsync(
+                healthyPartition.Topic,
+                healthyPartition.Partition,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                PooledMemory.Null,
+                PooledMemory.Null,
+                headers: null,
+                headerCount: 0,
+                healthyCompletion,
+                callback: null,
+                CancellationToken.None)).IsTrue();
+
+            PoisonBatchArena(GetCurrentPartitionBatch(accumulator, poisonedPartition));
+
+            var purged = accumulator.Purge(PurgeOptions.Queue, CreatePurgedException());
+
+            await Assert.That(purged).IsEqualTo(2);
+            await Assert.ThrowsAsync<NullReferenceException>(async () => await poisonedTask);
+            var healthyException = await Assert.ThrowsAsync<ProduceException>(async () => await healthyTask);
+            await Assert.That(healthyException!.Kind).IsEqualTo(ProduceErrorKind.Purged);
+            await Assert.That(accumulator.BufferedBytes).IsEqualTo(0);
+        }
+        finally
+        {
+            await accumulator.DisposeAsync();
+            await pool.DisposeAsync();
+        }
+    }
+
+    [Test]
     public async Task DisposeAsync_WaitsForInProgressSpanAppendBeforeReturningCurrentBatch()
     {
         var options = CreateTestOptions();
@@ -289,6 +430,9 @@ public class RecordAccumulatorTests
         try
         {
             await headerValue.WaitUntilEnteredAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            await WaitUntilAsync(
+                () => IsAppendInProgress(accumulator, topicPartition),
+                TimeSpan.FromSeconds(5));
 
             var disposeTask = Task.Run(async () => await accumulator.DisposeAsync());
             await WaitUntilAsync(
@@ -355,6 +499,102 @@ public class RecordAccumulatorTests
         finally
         {
             await accumulator.DisposeAsync();
+            await pool.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task DisposeAsync_CompleteFailure_ReleasesReservedMemory()
+    {
+        var options = CreateTestOptions();
+        var accumulator = new RecordAccumulator(options);
+        var pool = new ValueTaskSourcePool<RecordMetadata>();
+        var topicPartition = new TopicPartition("test-topic", 0);
+
+        try
+        {
+            var completion = pool.Rent();
+            var completionTask = completion.Task;
+
+            var appended = await accumulator.AppendAsync(
+                topicPartition.Topic,
+                topicPartition.Partition,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                PooledMemory.Null,
+                PooledMemory.Null,
+                headers: null,
+                headerCount: 0,
+                completion,
+                callback: null,
+                CancellationToken.None);
+
+            await Assert.That(appended).IsTrue();
+
+            var currentBatch = GetCurrentPartitionBatch(accumulator, topicPartition);
+            ForceSealOverestimateForTest(accumulator, currentBatch);
+
+            PoisonBatchArena(currentBatch);
+
+            await accumulator.DisposeAsync();
+            await Assert.ThrowsAsync<NullReferenceException>(async () => await completionTask);
+            await Assert.That(accumulator.BufferedBytes).IsEqualTo(0);
+        }
+        finally
+        {
+            await pool.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task DisposeAsync_CompleteFailure_ContinuesToLaterPartitions()
+    {
+        var options = CreateTestOptions();
+        var accumulator = new RecordAccumulator(options);
+        var pool = new ValueTaskSourcePool<RecordMetadata>();
+        var poisonedPartition = new TopicPartition("test-topic", 0);
+        var healthyPartition = new TopicPartition("test-topic", 1);
+
+        try
+        {
+            var poisonedCompletion = pool.Rent();
+            var poisonedTask = poisonedCompletion.Task;
+            var healthyCompletion = pool.Rent();
+            var healthyTask = healthyCompletion.Task;
+
+            await Assert.That(await accumulator.AppendAsync(
+                poisonedPartition.Topic,
+                poisonedPartition.Partition,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                PooledMemory.Null,
+                PooledMemory.Null,
+                headers: null,
+                headerCount: 0,
+                poisonedCompletion,
+                callback: null,
+                CancellationToken.None)).IsTrue();
+
+            await Assert.That(await accumulator.AppendAsync(
+                healthyPartition.Topic,
+                healthyPartition.Partition,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                PooledMemory.Null,
+                PooledMemory.Null,
+                headers: null,
+                headerCount: 0,
+                healthyCompletion,
+                callback: null,
+                CancellationToken.None)).IsTrue();
+
+            PoisonBatchArena(GetCurrentPartitionBatch(accumulator, poisonedPartition));
+
+            await accumulator.DisposeAsync();
+
+            await Assert.ThrowsAsync<NullReferenceException>(async () => await poisonedTask);
+            await Assert.ThrowsAsync<ObjectDisposedException>(async () => await healthyTask);
+            await Assert.That(accumulator.BufferedBytes).IsEqualTo(0);
+        }
+        finally
+        {
             await pool.DisposeAsync();
         }
     }
@@ -874,12 +1114,14 @@ public class RecordAccumulatorTests
                 headers,
                 headerCount: 1,
                 completionSource: null,
-                callback: null))
+                callback: null,
+                estimatedSize: 128))
             .Throws<InvalidOperationException>();
 
         await Assert.That(batch.Arena!.Position).IsEqualTo(0);
         await Assert.That(batch.RecordCount).IsEqualTo(0);
 
+        var estimatedSize = PartitionBatch.EstimateRecordSize(0, 1, null, 0);
         var result = batch.TryAppendFromSpans(
             timestamp + 1,
             ReadOnlySpan<byte>.Empty,
@@ -889,11 +1131,13 @@ public class RecordAccumulatorTests
             headers: null,
             headerCount: 0,
             completionSource: null,
-            callback: null);
+            callback: null,
+            estimatedSize);
 
         await Assert.That(result.Success).IsTrue();
         await Assert.That(batch.RecordCount).IsEqualTo(1);
-        await Assert.That(batch.Arena!.Position).IsEqualTo(result.ActualSizeAdded);
+        await Assert.That(batch.Arena!.Position).IsEqualTo(batch.EstimatedSize);
+        await Assert.That(batch.ReservedSize).IsEqualTo(estimatedSize);
 
         var readyBatch = batch.Complete();
         readyBatch!.CompleteSend(baseOffset: 0, DateTimeOffset.UtcNow);
@@ -1079,6 +1323,89 @@ public class RecordAccumulatorTests
         }
         finally
         {
+            await accumulator.DisposeAsync();
+            await pool.DisposeAsync();
+        }
+    }
+
+    [Test]
+    public async Task TryAppendFromSpansWithCompletion_MultipleAwaitedRecords_CountsPendingBatchOnce()
+    {
+        var options = CreateTestOptions();
+        var accumulator = new RecordAccumulator(options);
+        var pool = new ValueTaskSourcePool<RecordMetadata>();
+        var topicPartition = new TopicPartition("test-topic", 0);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        ReadyBatch? drainedBatch = null;
+
+        try
+        {
+            var firstCompletion = pool.Rent();
+            var secondCompletion = pool.Rent();
+            var firstCompletionTask = firstCompletion.Task;
+            var secondCompletionTask = secondCompletion.Task;
+
+            var firstResult = accumulator.TryAppendFromSpansWithCompletion(
+                topicPartition.Topic,
+                topicPartition.Partition,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                ReadOnlySpan<byte>.Empty,
+                keyIsNull: true,
+                "first"u8,
+                valueIsNull: false,
+                headers: null,
+                headerCount: 0,
+                firstCompletion);
+
+            var secondResult = accumulator.TryAppendFromSpansWithCompletion(
+                topicPartition.Topic,
+                topicPartition.Partition,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                ReadOnlySpan<byte>.Empty,
+                keyIsNull: true,
+                "second"u8,
+                valueIsNull: false,
+                headers: null,
+                headerCount: 0,
+                secondCompletion);
+
+            await Assert.That(firstResult).IsTrue();
+            await Assert.That(secondResult).IsTrue();
+            await Assert.That(GetPrivateField<int>(accumulator, "_pendingAwaitedProduceCount")).IsEqualTo(1);
+
+            var drainTask = Task.Run(async () =>
+            {
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    if (accumulator.TryDrainBatch(out var batch))
+                    {
+                        drainedBatch = batch;
+                        batch.CompleteSend(baseOffset: 20, DateTimeOffset.UtcNow);
+                        accumulator.OnBatchExitsPipeline(batch);
+                        return;
+                    }
+
+                    await accumulator.WaitForWakeupAsync(100).ConfigureAwait(false);
+                }
+            }, cts.Token);
+
+            await accumulator.FlushAsync(cts.Token);
+            await drainTask;
+
+            await Assert.That(GetPrivateField<int>(accumulator, "_pendingAwaitedProduceCount")).IsEqualTo(0);
+            await Assert.That(drainedBatch).IsNotNull();
+            await Assert.That(drainedBatch!.CompletionSourcesCount).IsEqualTo(2);
+
+            var firstMetadata = await firstCompletionTask;
+            var secondMetadata = await secondCompletionTask;
+
+            await Assert.That(firstMetadata.Offset).IsEqualTo(20L);
+            await Assert.That(secondMetadata.Offset).IsEqualTo(21L);
+        }
+        finally
+        {
+            if (drainedBatch is not null)
+                accumulator.ReturnReadyBatch(drainedBatch);
             await accumulator.DisposeAsync();
             await pool.DisposeAsync();
         }
@@ -1935,9 +2262,10 @@ public class RecordAccumulatorTests
 
         // Call TryAppend with null completionSource and null callback (fire-and-forget)
         var tryAppendMethod = partitionBatchType.GetMethods()
-            .Single(m => m.Name == "TryAppend" && m.GetParameters().Length == 7);
+            .Single(m => m.Name == "TryAppend" && m.GetParameters().Length == 8);
         var pooledKey = new PooledMemory(null, 0, isNull: true);
         var pooledValue = new PooledMemory(null, 0, isNull: true);
+        var estimatedSize = PartitionBatch.EstimateRecordSize(0, 0, null, 0);
 
         var result = tryAppendMethod.Invoke(partitionBatch, new object?[]
         {
@@ -1945,9 +2273,10 @@ public class RecordAccumulatorTests
             pooledKey,
             pooledValue,
             null,   // headers
-            null,   // headerCount (coerced to 0)
+            0,      // headerCount
             null,   // completionSource
-            null    // callback
+            null,   // callback
+            estimatedSize
         });
 
         // Verify append succeeded
@@ -2839,8 +3168,8 @@ public class RecordAccumulatorTests
 
             await Assert.That(appendTask.IsCompleted).IsFalse();
 
-            // Release exactly the pending append's estimated reservation. DrainPendingAppends
-            // will reserve it, append it, then refund the estimate-vs-actual difference.
+            // Release exactly the pending append's estimated reservation so DrainPendingAppends
+            // can reserve it and append it. Estimate-vs-actual refund now happens at seal time.
             accumulator.ReleaseMemory(recordSize);
             remainingSyntheticReservation -= recordSize;
 
@@ -2860,7 +3189,7 @@ public class RecordAccumulatorTests
     }
 
     [Test]
-    public async Task AppendFromSpansAsync_HotPathRefund_DrainsPendingAppendAfterPartitionLockReleased()
+    public async Task AppendFromSpansAsync_SealRefund_DrainsPendingAppendAfterPartitionLockReleased()
     {
         var options = new ProducerOptions
         {
@@ -2872,6 +3201,7 @@ public class RecordAccumulatorTests
         };
         var accumulator = new RecordAccumulator(options);
         var topicPartition = new TopicPartition("test-topic", 0);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
 
         try
         {
@@ -2903,8 +3233,8 @@ public class RecordAccumulatorTests
 
             await Assert.That(pendingAppendTask.IsCompleted).IsFalse();
 
-            // Free memory without draining. The next hot-path overestimate refund should
-            // drain the pending append, but only after the partition SpinLock is released.
+            // Free memory without draining. Hot append no longer refunds per-record
+            // overestimates; the pending append should wait for the seal-time refund.
             SetBufferedBytesForTest(accumulator, 3000);
 
             var hotResult = await accumulator.AppendFromSpansAsync(
@@ -2915,6 +3245,26 @@ public class RecordAccumulatorTests
                 null, 0, null, CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
 
             await Assert.That(hotResult).IsTrue();
+            await Assert.That(pendingAppendTask.IsCompleted).IsFalse();
+
+            var drainTask = Task.Run(async () =>
+            {
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    if (accumulator.TryDrainBatch(out var batch))
+                    {
+                        batch.CompleteDelivery();
+                        accumulator.OnBatchExitsPipeline(batch);
+                        accumulator.ReturnReadyBatch(batch);
+                        return;
+                    }
+
+                    await accumulator.WaitForWakeupAsync(100).ConfigureAwait(false);
+                }
+            }, cts.Token);
+
+            await accumulator.FlushAsync(cts.Token);
+            await drainTask;
 
             var pendingResult = await pendingAppendTask.WaitAsync(TimeSpan.FromSeconds(5));
             await Assert.That(pendingResult).IsTrue();
@@ -2922,7 +3272,7 @@ public class RecordAccumulatorTests
         finally
         {
             var currentBatch = GetCurrentPartitionBatch(accumulator, topicPartition);
-            SetBufferedBytesForTest(accumulator, currentBatch.EstimatedSize);
+            SetBufferedBytesForTest(accumulator, currentBatch.ReservedSize);
             await accumulator.DisposeAsync();
         }
     }
@@ -2973,6 +3323,13 @@ public class RecordAccumulatorTests
             throw new InvalidOperationException("Partition deque was not found.");
 
         return parameters[1]!;
+    }
+
+    private static bool IsAppendInProgress(RecordAccumulator accumulator, TopicPartition topicPartition)
+    {
+        var partitionDeque = GetPartitionDeque(accumulator, topicPartition);
+        var appendInProgressField = partitionDeque.GetType().GetField("AppendInProgress");
+        return (bool)appendInProgressField!.GetValue(partitionDeque)!;
     }
 
     private static void EnableThreadOwnerTrackingForPartitionLock(
@@ -3028,6 +3385,23 @@ public class RecordAccumulatorTests
         var bufferedBytesField = typeof(RecordAccumulator).GetField("_bufferedBytes",
             BindingFlags.NonPublic | BindingFlags.Instance);
         bufferedBytesField!.SetValue(accumulator, value);
+    }
+
+    private static int ForceSealOverestimateForTest(RecordAccumulator accumulator, PartitionBatch batch)
+    {
+        const int overestimatedBytes = 123;
+        SetPrivateField(batch, "_reservedSize", batch.EstimatedSize + overestimatedBytes);
+        SetBufferedBytesForTest(accumulator, batch.ReservedSize);
+        return overestimatedBytes;
+    }
+
+    private static void PoisonBatchArena(PartitionBatch batch) =>
+        SetPrivateField<BatchArena?>(batch, "_arena", null);
+
+    private static void SetPrivateField<T>(object instance, string fieldName, T value)
+    {
+        var field = instance.GetType().GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Instance);
+        field!.SetValue(instance, value);
     }
 
     private static T GetPrivateField<T>(object instance, string fieldName)
