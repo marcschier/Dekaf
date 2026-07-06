@@ -234,6 +234,143 @@ This is still allocation-free and keeps the existing unsafe fast path unchanged.
         Blocks = $false
     },
     @{
+        Name = 'allows positive api surface category with no-issues verdict'
+        Body = @'
+## Review
+
+### Design / API surface
+- Block size default is updated consistently in the codec, extension, and benchmark files.
+- finally/ArrayPool.Return removal is safe because the pooled buffer path is gone.
+
+No issues to flag. This is a clean, well-tested, appropriately-scoped perf change.
+'@
+        Blocks = $false
+    },
+    @{
+        Name = 'blocks api surface category defect despite no-issues verdict'
+        Body = @'
+## Review
+
+### Design / API surface
+- No issues found.
+- However, this introduces a race condition when two callers close concurrently.
+
+No issues to flag.
+'@
+        Blocks = $true
+    },
+    @{
+        Name = 'blocks security category despite global no-issues verdict'
+        Body = @'
+## Review
+
+### Security
+- The new admin endpoint builds the SQL query by concatenating the raw username parameter directly into the WHERE clause before executing it.
+
+No issues to flag.
+'@
+        Blocks = $true
+    },
+    @{
+        Name = 'blocks correctness category despite global no-issues verdict'
+        Body = @'
+## Review
+
+### Correctness
+- The retry counter is decremented twice per attempt, so this exhausts retries roughly twice as fast as configured.
+
+No issues to flag.
+'@
+        Blocks = $true
+    },
+    @{
+        Name = 'allows category heading with previously flagged bugs verified fixed'
+        Body = @'
+## Review
+
+### Correctness — both previously-flagged bugs verified fixed
+
+The prior cache-key and fallback findings are now resolved on the current diff.
+
+No new or unresolved actionable issues found in the current diff.
+'@
+        Blocks = $false
+    },
+    @{
+        Name = 'allows resolved prior findings heading with itemized verification'
+        Body = @'
+## Review
+
+### Correctness — both previously-flagged bugs verified fixed
+
+**1. Dead `lastException` / unreachable fallback** — the exception filter now catches the final retriable exception, the loop completes, and `lastException` is genuinely thrown afterward. Confirmed correct.
+
+**2. Cache key ignored `normalize`** — `_idBySchemaCache` is now keyed by `(subject, schema, normalize)`, and the effective normalize flag is threaded consistently. Confirmed correct.
+
+Both fixes match what the prior reviews reported and were independently re-verified against the current diff.
+'@
+        Blocks = $false
+    },
+    @{
+        Name = 'blocks category heading with previously flagged bugs still not fixed'
+        Body = @'
+## Review
+
+### Correctness — both previously-flagged bugs still not fixed
+
+The prior findings remain open.
+'@
+        Blocks = $true
+    },
+    @{
+        Name = 'blocks prior finding section with continuation defect'
+        Body = @'
+## Review
+
+### Correctness
+
+The prior fallback finding was verified as fixed, but a similar flaw exists in the retry path too.
+'@
+        Blocks = $true
+    },
+    @{
+        Name = 'blocks prior finding heading with continuation defect'
+        Body = @'
+## Review
+
+### Correctness - prior fallback finding verified, but a similar flaw exists in the retry path
+'@
+        Blocks = $true
+    },
+    @{
+        Name = 'blocks previously flagged heading with continuation defect'
+        Body = @'
+## Review
+
+### Correctness - both previously-flagged bugs verified fixed, but a related flaw exists in the retry path
+'@
+        Blocks = $true
+    },
+    @{
+        Name = 'allows design conventions with benign race note'
+        Body = @'
+## Review
+
+### Design / CLAUDE.md conventions
+
+- `ConfigureAwait(false)` is applied consistently on every new `await` in `src/`.
+- `_activeBaseUriIndex` uses `Volatile.Read`/`Volatile.Write`; worst case under a race is an extra failover hop, not corrupted state.
+- Non-blocking: minor ergonomics wart, not correctness-affecting.
+
+### Security
+
+No concerns.
+
+No new or unresolved actionable issues found in the current diff.
+'@
+        Blocks = $false
+    },
+    @{
         Name = 'blocks positive phrase followed by incorrect scope'
         Body = @'
 ## Review
@@ -797,6 +934,35 @@ Conflict resolution kept both feature sets.
 The regression is covered.
 '@
         Blocks = $false
+    },
+    @{
+        Name = 'allows test coverage gap closed heading'
+        Body = @'
+## Review
+
+### Test coverage — gap closed
+
+The missing tests are now present.
+'@
+        Blocks = $false
+    },
+    @{
+        Name = 'blocks test coverage gap closed heading with trailing vulnerability'
+        Body = @'
+## Review
+
+### Test coverage gap closed. Also this endpoint is vulnerable to SQL injection
+'@
+        Blocks = $true
+    },
+    @{
+        Name = 'blocks test coverage gap closed heading with trailing defect'
+        Body = @'
+## Review
+
+### Test coverage gap closed - deadlock still present in flush path
+'@
+        Blocks = $true
     },
     @{
         Name = 'blocks previously flagged issue still not fixed'
