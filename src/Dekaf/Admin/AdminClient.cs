@@ -177,11 +177,20 @@ public sealed class AdminClient : IAdminClient
                 CreateTopicsRequest.LowestSupportedVersion,
                 CreateTopicsRequest.HighestSupportedVersion);
 
-            createMayHaveApplied = !opts.ValidateOnly;
-            var response = await controller.SendAsync<CreateTopicsRequest, CreateTopicsResponse>(
-                request,
-                apiVersion,
-                cancellationToken).ConfigureAwait(false);
+            CreateTopicsResponse response;
+            try
+            {
+                response = await controller.SendAsync<CreateTopicsRequest, CreateTopicsResponse>(
+                    request,
+                    apiVersion,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                if (!opts.ValidateOnly)
+                    createMayHaveApplied = true;
+                throw;
+            }
 
             // Check for errors
             var createdTopicNames = new List<string>(response.Topics.Count);
@@ -204,6 +213,7 @@ public sealed class AdminClient : IAdminClient
             // MetadataManager.GetTopicMetadataSlowAsync.
             if (!opts.ValidateOnly)
             {
+                createMayHaveApplied = true;
                 await WaitForTopicLeadersAsync(createdTopicNames, cancellationToken).ConfigureAwait(false);
             }
         }, cancellationToken).ConfigureAwait(false);
@@ -258,6 +268,20 @@ public sealed class AdminClient : IAdminClient
             $"Topic(s) {string.Join(", ", topicNames)} did not have all partition leaders elected after {leaderWaitRetries * RetryHelper.RetryDelayMs}ms");
     }
 
+    private async ValueTask<bool> TopicHasAtLeastPartitionCountAsync(
+        string topicName,
+        int partitionCount,
+        CancellationToken cancellationToken)
+    {
+        await _metadataManager.RefreshMetadataAsync(
+            [topicName],
+            forceRefresh: true,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+
+        var topic = _metadataManager.Metadata.GetTopic(topicName);
+        return topic is { ErrorCode: Protocol.ErrorCode.None } && topic.PartitionCount >= partitionCount;
+    }
+
     public async ValueTask DeleteTopicsAsync(
         IEnumerable<string> topicNames,
         DeleteTopicsOptions? options = null,
@@ -267,9 +291,11 @@ public sealed class AdminClient : IAdminClient
 
         var opts = options ?? new DeleteTopicsOptions();
         var names = topicNames.ToList();
+        var deleteMayHaveApplied = false;
 
         await WithRetryAsync(async () =>
         {
+            var isRetryAttempt = deleteMayHaveApplied;
             var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
 
             var apiVersion = _metadataManager.GetNegotiatedApiVersion(
@@ -297,15 +323,25 @@ public sealed class AdminClient : IAdminClient
                 };
             }
 
-            var response = await controller.SendAsync<DeleteTopicsRequest, DeleteTopicsResponse>(
-                request,
-                apiVersion,
-                cancellationToken).ConfigureAwait(false);
+            DeleteTopicsResponse response;
+            try
+            {
+                response = await controller.SendAsync<DeleteTopicsRequest, DeleteTopicsResponse>(
+                    request,
+                    apiVersion,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                deleteMayHaveApplied = true;
+                throw;
+            }
 
             // Check for errors
             foreach (var topic in response.Responses)
             {
-                if (topic.ErrorCode != Protocol.ErrorCode.None)
+                if (topic.ErrorCode != Protocol.ErrorCode.None &&
+                    !(isRetryAttempt && topic.ErrorCode == Protocol.ErrorCode.UnknownTopicOrPartition))
                 {
                     throw new KafkaException(topic.ErrorCode,
                         $"Failed to delete topic '{topic.Name}': {topic.ErrorMessage ?? topic.ErrorCode.ToString()}");
@@ -1284,9 +1320,11 @@ public sealed class AdminClient : IAdminClient
         await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
 
         var groupIdList = groupIds.ToList();
+        var deleteMayHaveApplied = false;
 
         await WithRetryAsync(async () =>
         {
+            var isRetryAttempt = deleteMayHaveApplied;
             // Find coordinator for each group and batch by coordinator
             var groupsByCoordinator = new Dictionary<int, List<string>>();
             foreach (var groupId in groupIdList)
@@ -1314,14 +1352,24 @@ public sealed class AdminClient : IAdminClient
                     GroupsNames = groups
                 };
 
-                var response = await connection.SendAsync<DeleteGroupsRequest, DeleteGroupsResponse>(
-                    request,
-                    apiVersion,
-                    cancellationToken).ConfigureAwait(false);
+                DeleteGroupsResponse response;
+                try
+                {
+                    response = await connection.SendAsync<DeleteGroupsRequest, DeleteGroupsResponse>(
+                        request,
+                        apiVersion,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    deleteMayHaveApplied = true;
+                    throw;
+                }
 
                 foreach (var groupResult in response.Results)
                 {
-                    if (groupResult.ErrorCode != Protocol.ErrorCode.None)
+                    if (groupResult.ErrorCode != Protocol.ErrorCode.None &&
+                        !(isRetryAttempt && groupResult.ErrorCode == Protocol.ErrorCode.GroupIdNotFound))
                     {
                         throw new Errors.GroupException(groupResult.ErrorCode,
                             $"DeleteConsumerGroups failed for group '{groupResult.GroupId}': {groupResult.ErrorCode}")
@@ -1550,9 +1598,11 @@ public sealed class AdminClient : IAdminClient
             Name = kvp.Key,
             Count = kvp.Value
         }).ToList();
+        var createPartitionsMayHaveApplied = false;
 
         await WithRetryAsync(async () =>
         {
+            var isRetryAttempt = createPartitionsMayHaveApplied;
             var controller = await GetControllerAsync(cancellationToken).ConfigureAwait(false);
 
             var request = new CreatePartitionsRequest
@@ -1565,15 +1615,34 @@ public sealed class AdminClient : IAdminClient
                 CreatePartitionsRequest.LowestSupportedVersion,
                 CreatePartitionsRequest.HighestSupportedVersion);
 
-            var response = await controller.SendAsync<CreatePartitionsRequest, CreatePartitionsResponse>(
-                request,
-                apiVersion,
-                cancellationToken).ConfigureAwait(false);
+            CreatePartitionsResponse response;
+            try
+            {
+                response = await controller.SendAsync<CreatePartitionsRequest, CreatePartitionsResponse>(
+                    request,
+                    apiVersion,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                createPartitionsMayHaveApplied = true;
+                throw;
+            }
 
             foreach (var topicResult in response.Results)
             {
                 if (topicResult.ErrorCode != Protocol.ErrorCode.None)
                 {
+                    if (isRetryAttempt &&
+                        topicResult.ErrorCode == Protocol.ErrorCode.InvalidPartitions &&
+                        await TopicHasAtLeastPartitionCountAsync(
+                            topicResult.Name,
+                            newPartitionCounts[topicResult.Name],
+                            cancellationToken).ConfigureAwait(false))
+                    {
+                        continue;
+                    }
+
                     throw new KafkaException(topicResult.ErrorCode,
                         $"CreatePartitions failed for topic '{topicResult.Name}': {topicResult.ErrorMessage ?? topicResult.ErrorCode.ToString()}");
                 }
@@ -1619,11 +1688,19 @@ public sealed class AdminClient : IAdminClient
                 AlterPartitionReassignmentsRequest.LowestSupportedVersion,
                 AlterPartitionReassignmentsRequest.HighestSupportedVersion);
 
-            alterMayHaveApplied = true;
-            var response = await controller.SendAsync<AlterPartitionReassignmentsRequest, AlterPartitionReassignmentsResponse>(
-                request,
-                apiVersion,
-                cancellationToken).ConfigureAwait(false);
+            AlterPartitionReassignmentsResponse response;
+            try
+            {
+                response = await controller.SendAsync<AlterPartitionReassignmentsRequest, AlterPartitionReassignmentsResponse>(
+                    request,
+                    apiVersion,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                alterMayHaveApplied = true;
+                throw;
+            }
 
             if (response.ErrorCode != Protocol.ErrorCode.None)
             {
@@ -2760,9 +2837,11 @@ public sealed class AdminClient : IAdminClient
                 }).ToList()
             })
             .ToList();
+        var deleteMayHaveApplied = false;
 
         await WithRetryAsync(async () =>
         {
+            var isRetryAttempt = deleteMayHaveApplied;
             var coordinatorId = await FindGroupCoordinatorAsync(groupId, cancellationToken).ConfigureAwait(false);
             var connection = await _connectionPool.GetConnectionAsync(coordinatorId, cancellationToken).ConfigureAwait(false);
 
@@ -2777,14 +2856,26 @@ public sealed class AdminClient : IAdminClient
                 OffsetDeleteRequest.LowestSupportedVersion,
                 OffsetDeleteRequest.HighestSupportedVersion);
 
-            var response = await connection.SendAsync<OffsetDeleteRequest, OffsetDeleteResponse>(
-                request,
-                apiVersion,
-                cancellationToken).ConfigureAwait(false);
+            OffsetDeleteResponse response;
+            try
+            {
+                response = await connection.SendAsync<OffsetDeleteRequest, OffsetDeleteResponse>(
+                    request,
+                    apiVersion,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                deleteMayHaveApplied = true;
+                throw;
+            }
 
             // Check for top-level error
             if (response.ErrorCode != Protocol.ErrorCode.None)
             {
+                if (isRetryAttempt && response.ErrorCode == Protocol.ErrorCode.GroupIdNotFound)
+                    return;
+
                 throw new Errors.GroupException(response.ErrorCode,
                     $"DeleteConsumerGroupOffsets failed for group '{groupId}': {response.ErrorCode}")
                 {
@@ -2984,11 +3075,15 @@ public sealed class AdminClient : IAdminClient
                 foreach (var partition in topic.PartitionResult)
                 {
                     var tp = new TopicPartition(topic.Topic, partition.PartitionId);
+                    var errorCode = partition.ErrorCode == Protocol.ErrorCode.ElectionNotNeeded
+                        ? Protocol.ErrorCode.None
+                        : partition.ErrorCode;
+
                     results[tp] = new ElectLeadersResultInfo
                     {
                         TopicPartition = tp,
-                        ErrorCode = partition.ErrorCode,
-                        ErrorMessage = partition.ErrorMessage
+                        ErrorCode = errorCode,
+                        ErrorMessage = errorCode == Protocol.ErrorCode.None ? null : partition.ErrorMessage
                     };
                 }
             }
@@ -3855,9 +3950,11 @@ public sealed class AdminClient : IAdminClient
         var topicData = topics
             .Select(t => new DeleteShareGroupOffsetsRequestTopic { TopicName = t })
             .ToList();
+        var deleteMayHaveApplied = false;
 
         await WithRetryAsync(async () =>
         {
+            var isRetryAttempt = deleteMayHaveApplied;
             var coordinatorId = await FindGroupCoordinatorAsync(groupId, cancellationToken).ConfigureAwait(false);
             var connection = await _connectionPool.GetConnectionAsync(coordinatorId, cancellationToken).ConfigureAwait(false);
 
@@ -3872,13 +3969,25 @@ public sealed class AdminClient : IAdminClient
                 DeleteShareGroupOffsetsRequest.LowestSupportedVersion,
                 DeleteShareGroupOffsetsRequest.HighestSupportedVersion);
 
-            var response = await connection.SendAsync<DeleteShareGroupOffsetsRequest, DeleteShareGroupOffsetsResponse>(
-                request,
-                apiVersion,
-                cancellationToken).ConfigureAwait(false);
+            DeleteShareGroupOffsetsResponse response;
+            try
+            {
+                response = await connection.SendAsync<DeleteShareGroupOffsetsRequest, DeleteShareGroupOffsetsResponse>(
+                    request,
+                    apiVersion,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                deleteMayHaveApplied = true;
+                throw;
+            }
 
             if (response.ErrorCode != Protocol.ErrorCode.None)
             {
+                if (isRetryAttempt && response.ErrorCode == Protocol.ErrorCode.GroupIdNotFound)
+                    return;
+
                 throw new Errors.GroupException(response.ErrorCode,
                     $"DeleteShareGroupOffsets failed for group '{groupId}': {response.ErrorCode}")
                 {
