@@ -915,7 +915,9 @@ internal sealed class PartitionedConsumerRuntime<TKey, TValue>
             return;
 
         if (_pausedByRuntime.Add(lane.TopicPartition))
+        {
             _consumer.Partitions.Pause(lane.TopicPartition);
+        }
     }
 
     private void ResumeIfNeeded(PartitionLane<TKey, TValue> lane)
@@ -924,11 +926,16 @@ internal sealed class PartitionedConsumerRuntime<TKey, TValue>
             return;
 
         if (_pausedByRuntime.Remove(lane.TopicPartition))
+        {
             _consumer.Partitions.Resume(lane.TopicPartition);
+        }
     }
 
     private void OnLaneCapacityAvailable(PartitionLane<TKey, TValue> lane)
     {
+        if (_options.BackpressureMode != PartitionBackpressureMode.PauseResume)
+            return;
+
         _commands.Writer.TryWrite(RuntimeCommand<TKey, TValue>.Resume(lane));
     }
 
@@ -1444,13 +1451,12 @@ internal sealed class PartitionLane<TKey, TValue>
         if (Volatile.Read(ref _completed) != 0)
             return false;
 
+        if (!_channel.Writer.TryWrite(result))
+            return false;
+
         TrackPending(result);
         Interlocked.Increment(ref _bufferedCount);
-        if (_channel.Writer.TryWrite(result))
-            return true;
-
-        Interlocked.Decrement(ref _bufferedCount);
-        return false;
+        return true;
     }
 
     public ValueTask<bool> WaitToWriteAsync(CancellationToken cancellationToken)
@@ -1468,8 +1474,10 @@ internal sealed class PartitionLane<TKey, TValue>
         if (!_channel.Reader.TryRead(out message))
             return false;
 
-        Interlocked.Decrement(ref _bufferedCount);
-        _capacityAvailable(this);
+        var bufferedCount = Interlocked.Decrement(ref _bufferedCount);
+        if (bufferedCount == _capacity - 1)
+            _capacityAvailable(this);
+
         return true;
     }
 
