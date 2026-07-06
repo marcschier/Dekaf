@@ -10,11 +10,16 @@ internal sealed class MockSchemaRegistryClient : ISchemaRegistryClient, ISchemaR
 {
     private readonly Dictionary<int, Schema> _schemasById = new();
     private readonly Dictionary<string, List<(int Version, int Id, Schema Schema)>> _schemasBySubject = new();
+    private TaskCompletionSource? _getOrRegisterSchemaEntered;
+    private TaskCompletionSource? _getOrRegisterSchemaRelease;
     private int _nextId = 1;
     private bool _disposed;
 
     public int GetSchemaCallCount { get; private set; }
+    public int GetOrRegisterSchemaCallCount { get; private set; }
     public int TryGetCachedSchemaCallCount { get; private set; }
+    public int GetSchemaFailuresRemaining { get; set; }
+    public int GetOrRegisterSchemaFailuresRemaining { get; set; }
 
     /// <summary>
     /// Normalizes a JSON schema string by parsing and re-serializing.
@@ -37,6 +42,27 @@ internal sealed class MockSchemaRegistryClient : ISchemaRegistryClient, ISchemaR
     private static bool SchemasAreEquivalent(string schema1, string schema2)
     {
         return NormalizeJsonSchema(schema1) == NormalizeJsonSchema(schema2);
+    }
+
+    public void BlockNextGetOrRegisterSchema()
+    {
+        _getOrRegisterSchemaEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _getOrRegisterSchemaRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    public async Task WaitForBlockedGetOrRegisterSchemaAsync(TimeSpan timeout)
+    {
+        var entered = _getOrRegisterSchemaEntered
+            ?? throw new InvalidOperationException("No blocked GetOrRegisterSchemaAsync call was configured.");
+
+        await entered.Task.WaitAsync(timeout).ConfigureAwait(false);
+    }
+
+    public void ReleaseBlockedGetOrRegisterSchema()
+    {
+        _getOrRegisterSchemaRelease?.TrySetResult();
+        _getOrRegisterSchemaEntered = null;
+        _getOrRegisterSchemaRelease = null;
     }
 
     public Task<int> RegisterSchemaAsync(string subject, Schema schema, CancellationToken cancellationToken = default)
@@ -62,6 +88,12 @@ internal sealed class MockSchemaRegistryClient : ISchemaRegistryClient, ISchemaR
     {
         ThrowIfDisposed();
         GetSchemaCallCount++;
+
+        if (GetSchemaFailuresRemaining > 0)
+        {
+            GetSchemaFailuresRemaining--;
+            throw new SchemaRegistryException(50001, "Transient schema fetch failure");
+        }
 
         if (_schemasById.TryGetValue(id, out var schema))
             return Task.FromResult(schema);
@@ -99,20 +131,33 @@ internal sealed class MockSchemaRegistryClient : ISchemaRegistryClient, ISchemaR
         });
     }
 
-    public Task<int> GetOrRegisterSchemaAsync(string subject, Schema schema, CancellationToken cancellationToken = default)
+    public async Task<int> GetOrRegisterSchemaAsync(string subject, Schema schema, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        GetOrRegisterSchemaCallCount++;
+
+        if (_getOrRegisterSchemaRelease is { } release)
+        {
+            _getOrRegisterSchemaEntered!.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (GetOrRegisterSchemaFailuresRemaining > 0)
+        {
+            GetOrRegisterSchemaFailuresRemaining--;
+            throw new SchemaRegistryException(50002, "Transient schema registration failure");
+        }
 
         // Check if schema already exists (using semantic comparison for JSON schemas)
         if (_schemasBySubject.TryGetValue(subject, out var list))
         {
             var existing = list.FirstOrDefault(e => SchemasAreEquivalent(e.Schema.SchemaString, schema.SchemaString));
             if (existing != default)
-                return Task.FromResult(existing.Id);
+                return existing.Id;
         }
 
         // Register new schema
-        return RegisterSchemaAsync(subject, schema, cancellationToken);
+        return await RegisterSchemaAsync(subject, schema, cancellationToken).ConfigureAwait(false);
     }
 
     public Task<IReadOnlyList<string>> GetAllSubjectsAsync(CancellationToken cancellationToken = default)

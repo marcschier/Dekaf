@@ -504,6 +504,86 @@ public sealed class AvroSerializerTests
     }
 
     [Test]
+    public async Task Serializer_WarmupAsync_RetriesAfterTransientSchemaIdFailure()
+    {
+        using var schemaRegistry = new MockSchemaRegistryClient
+        {
+            GetOrRegisterSchemaFailuresRemaining = 1
+        };
+        await using var serializer = new AvroSchemaRegistrySerializer<GenericRecord>(schemaRegistry);
+
+        var schema = AvroSchema.Parse(SimpleRecordSchema) as Avro.RecordSchema;
+        var record = new GenericRecord(schema!);
+        record.Add("id", 1);
+        record.Add("name", "retry");
+
+        await Assert.That(async () => await serializer.WarmupAsync("retry-topic", record))
+            .Throws<SchemaRegistryException>();
+
+        var schemaId = await serializer.WarmupAsync("retry-topic", record);
+
+        await Assert.That(schemaId).IsGreaterThan(0);
+        await Assert.That(schemaRegistry.GetOrRegisterSchemaCallCount).IsEqualTo(2);
+    }
+
+    [Test]
+    public async Task Serializer_WarmupAsync_DoesNotBindSharedFetchToFirstCallerCancellation()
+    {
+        using var schemaRegistry = new MockSchemaRegistryClient();
+        schemaRegistry.BlockNextGetOrRegisterSchema();
+        await using var serializer = new AvroSchemaRegistrySerializer<GenericRecord>(schemaRegistry);
+
+        var schema = AvroSchema.Parse(SimpleRecordSchema) as Avro.RecordSchema;
+        var record = new GenericRecord(schema!);
+        record.Add("id", 1);
+        record.Add("name", "shared-cancellation");
+
+        using var firstWaiterCts = new CancellationTokenSource();
+        var firstWaiter = serializer.WarmupAsync("shared-topic", record, cancellationToken: firstWaiterCts.Token);
+        await schemaRegistry.WaitForBlockedGetOrRegisterSchemaAsync(TimeSpan.FromSeconds(2));
+
+        var secondWaiter = serializer.WarmupAsync("shared-topic", record);
+        try
+        {
+            firstWaiterCts.Cancel();
+
+            await Assert.That(async () => await firstWaiter).Throws<OperationCanceledException>();
+        }
+        finally
+        {
+            schemaRegistry.ReleaseBlockedGetOrRegisterSchema();
+        }
+
+        var schemaId = await secondWaiter.WaitAsync(TimeSpan.FromSeconds(10));
+
+        await Assert.That(schemaId).IsGreaterThan(0);
+        await Assert.That(schemaRegistry.GetOrRegisterSchemaCallCount).IsEqualTo(1);
+    }
+
+    [Test]
+    public async Task Deserializer_WarmupAsync_RetriesAfterTransientSchemaFetchFailure()
+    {
+        using var schemaRegistry = new MockSchemaRegistryClient
+        {
+            GetSchemaFailuresRemaining = 1
+        };
+        var schemaId = await schemaRegistry.RegisterSchemaAsync("retry-topic-value", new RegistrySchema
+        {
+            SchemaType = SchemaType.Avro,
+            SchemaString = SimpleRecordSchema
+        });
+        await using var deserializer = new AvroSchemaRegistryDeserializer<GenericRecord>(schemaRegistry);
+
+        await Assert.That(async () => await deserializer.WarmupAsync(schemaId))
+            .Throws<SchemaRegistryException>();
+
+        var schema = await deserializer.WarmupAsync(schemaId);
+
+        await Assert.That(schema.Fullname).IsEqualTo("test.SimpleRecord");
+        await Assert.That(schemaRegistry.GetSchemaCallCount).IsEqualTo(2);
+    }
+
+    [Test]
     public async Task Deserializer_CachesGenericDatumReader_ForSameSchemaPair()
     {
         using var schemaRegistry = new MockSchemaRegistryClient();

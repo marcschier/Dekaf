@@ -277,7 +277,7 @@ public sealed class AvroSchemaRegistrySerializer<
 
     private int GetSchemaIdCached(string subject, RegistrySchema schema)
     {
-        var lazyTask = GetOrAddSchemaIdLazy(subject, schema, cancellationToken: default);
+        var lazyTask = GetOrAddSchemaIdLazy(subject, schema);
 
         // If the task is already completed, this returns immediately without blocking.
         // If this is the first access, it will block waiting for the schema fetch.
@@ -301,54 +301,62 @@ public sealed class AvroSchemaRegistrySerializer<
         RegistrySchema schema,
         CancellationToken cancellationToken = default)
     {
-        var lazyTask = GetOrAddSchemaIdLazy(subject, schema, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
 
-        return await lazyTask.Value.ConfigureAwait(false);
+        var lazyTask = GetOrAddSchemaIdLazy(subject, schema);
+
+        return await lazyTask.Value.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private Lazy<Task<int>> GetOrAddSchemaIdLazy(string subject, RegistrySchema schema, CancellationToken cancellationToken)
+    private Lazy<Task<int>> GetOrAddSchemaIdLazy(string subject, RegistrySchema schema)
     {
         if (_schemaIdCache.TryGetValue(subject, out var cached))
             return cached;
 
         return _schemaIdCache.GetOrAdd(
             subject,
-            static (key, state) => state.Serializer.CreateSchemaIdLazy(key, state.Schema, state.CancellationToken),
-            new SchemaIdFetchState(this, schema, cancellationToken));
+            static (key, state) => state.Serializer.CreateSchemaIdLazy(key, state.Schema),
+            new SchemaIdFetchState(this, schema));
     }
 
-    private Lazy<Task<int>> CreateSchemaIdLazy(string subject, RegistrySchema schema, CancellationToken cancellationToken) =>
-        new(() => FetchSchemaIdAsync(subject, schema, cancellationToken));
+    private Lazy<Task<int>> CreateSchemaIdLazy(string subject, RegistrySchema schema) =>
+        new(() => FetchSchemaIdAsync(subject, schema));
 
     private readonly record struct SchemaIdFetchState(
         AvroSchemaRegistrySerializer<T> Serializer,
-        RegistrySchema Schema,
-        CancellationToken CancellationToken);
+        RegistrySchema Schema);
 
     private async Task<int> FetchSchemaIdAsync(
         string subject,
-        RegistrySchema registrySchema,
-        CancellationToken cancellationToken = default)
+        RegistrySchema registrySchema)
     {
-        if (_config.UseLatestVersion)
+        try
         {
-            // Use latest schema from registry
-            var registered = await _schemaRegistry.GetSchemaBySubjectAsync(subject, "latest", cancellationToken)
-                .ConfigureAwait(false);
-            return registered.Id;
-        }
+            if (_config.UseLatestVersion)
+            {
+                // Use latest schema from registry
+                var registered = await _schemaRegistry.GetSchemaBySubjectAsync(subject, "latest", CancellationToken.None)
+                    .ConfigureAwait(false);
+                return registered.Id;
+            }
 
-        if (_config.AutoRegisterSchemas)
+            if (_config.AutoRegisterSchemas)
+            {
+                // Register schema if auto-register is enabled
+                return await _schemaRegistry.GetOrRegisterSchemaAsync(subject, registrySchema, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+
+            // Get existing schema ID from registry
+            var existing = await _schemaRegistry.GetSchemaBySubjectAsync(subject, "latest", CancellationToken.None)
+                .ConfigureAwait(false);
+            return existing.Id;
+        }
+        catch
         {
-            // Register schema if auto-register is enabled
-            return await _schemaRegistry.GetOrRegisterSchemaAsync(subject, registrySchema, cancellationToken)
-                .ConfigureAwait(false);
+            _schemaIdCache.TryRemove(subject, out _);
+            throw;
         }
-
-        // Get existing schema ID from registry
-        var existing = await _schemaRegistry.GetSchemaBySubjectAsync(subject, "latest", cancellationToken)
-            .ConfigureAwait(false);
-        return existing.Id;
     }
 
     private RegistrySchema CreateRegistrySchema(T value)
