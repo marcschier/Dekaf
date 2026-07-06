@@ -1277,11 +1277,10 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                 continue;
             }
 
-            // Pre-serialize only batches that will actually drain this cycle — batches
-            // deferred above (backoff, unknown leader) would waste the encode and hold
-            // the pooled buffer for the whole deferral window.
+            // Pre-serialization runs on a worker after seal. If the notification arrives
+            // before that worker finishes, leave the batch queued; completion re-notifies.
             if (!head.IsPreSerialized)
-                PreSerializeBatch(head);
+                continue;
 
             // Sealed batches in the deque are always sendable. The linger/micro-linger
             // timer already determined readiness when it sealed the batch, so re-checking
@@ -1797,6 +1796,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         if (Interlocked.Exchange(ref batch._returnedToPool, 1) != 0)
             return;
 
+        batch.WaitForPreSerializationIfStarted();
         batch.WaitForCleanupIfStarted();
         _readyBatchPool.Return(batch);
     }
@@ -2265,7 +2265,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                 }
 
                 if (batchToPublish is not null)
-                    PublishSealedBatch(batchToPublish);
+                    StartPreSerialization(batchToPublish);
 
                 if (batchToReturn is not null)
                     _batchPool.Return(batchToReturn);
@@ -2618,7 +2618,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
                 }
 
                 if (batchToPublish is not null)
-                    PublishSealedBatch(batchToPublish);
+                    StartPreSerialization(batchToPublish);
 
                 if (batchToReturn is not null)
                     _batchPool.Return(batchToReturn);
@@ -2870,7 +2870,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
     /// <summary>
     /// Completes and returns a detached batch outside the partition SpinLock.
     /// </summary>
-    private ReadyBatch? CompleteDetachedBatch(PartitionBatch currentBatch)
+    private ReadyBatch? CompleteDetachedBatch(PartitionBatch currentBatch, bool preSerialize = true)
     {
         var readyBatch = currentBatch.Complete();
         if (readyBatch is not null)
@@ -2880,6 +2880,13 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
             ProducerDebugCounters.RecordBatchCompleted(readyBatch.CompletionSourcesCount);
             if (currentBatch.PartitionCount > 1)
                 _onBatchComplete?.Invoke(readyBatch.TopicPartition.Topic, currentBatch.PartitionCount);
+            if (preSerialize)
+            {
+                if (_options.CompressionType == CompressionType.None)
+                    PrepareBatchForPublish(readyBatch);
+                else
+                    readyBatch.SetPreSerializationTask(CreatePreSerializationTask(readyBatch));
+            }
         }
 
         _batchPool.Return(currentBatch);
@@ -2924,9 +2931,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
     }
 
     /// <summary>
-    /// Publishes a sealed batch to the sender loop. Record serialization (and compression,
-    /// when enabled) is deferred to <see cref="Ready"/> so the append caller only pays the
-    /// queue notification cost.
+    /// Publishes a sealed, wire-ready batch to the sender loop.
     /// </summary>
     private void PublishSealedBatch(ReadyBatch readyBatch, bool signalWakeup = true)
     {
@@ -2936,17 +2941,62 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
     }
 
     /// <summary>
-    /// Prepares a sealed batch's records for send, compressing when configured. Called by the
-    /// sender thread from <see cref="Ready"/>, outside the partition SpinLock, before the
-    /// batch can drain. Record bytes are already encoded at append time, so this step either
-    /// leaves the arena-backed records in place or compresses those encoded bytes.
-    ///
-    /// Thread safety: the batch is already sealed and in the deque; no other thread can
-    /// modify it. The drain loop skips batches where <see cref="ReadyBatch.IsPreSerialized"/>
-    /// is false, so the sender won't pick it up until we finish and set the flag.
+    /// Starts pre-serialization after the batch is visible in its partition deque, so the
+    /// worker cannot publish a notification before the sender can observe the batch.
     /// </summary>
-    private void PreSerializeBatch(ReadyBatch readyBatch)
+    private void StartPreSerialization(ReadyBatch readyBatch)
     {
+        if (readyBatch.IsPreSerialized)
+        {
+            PublishSealedBatch(readyBatch);
+            return;
+        }
+
+        readyBatch.StartPreSerializationTask();
+    }
+
+    private Task CreatePreSerializationTask(ReadyBatch readyBatch)
+    {
+        return new Task(
+            static state =>
+            {
+                var workItem = (PreSerializationWorkItem)state!;
+                workItem.Accumulator.PreSerializeAndPublishBatch(workItem.Batch);
+            },
+            new PreSerializationWorkItem(this, readyBatch),
+            CancellationToken.None,
+            TaskCreationOptions.DenyChildAttach);
+    }
+
+    private void PreSerializeAndPublishBatch(ReadyBatch readyBatch)
+    {
+        if (PrepareBatchForPublish(readyBatch) && !readyBatch.IsReturnedToPool)
+            PublishSealedBatch(readyBatch);
+    }
+
+    private sealed class PreSerializationWorkItem(
+        RecordAccumulator accumulator,
+        ReadyBatch batch)
+    {
+        public RecordAccumulator Accumulator { get; } = accumulator;
+
+        public ReadyBatch Batch { get; } = batch;
+    }
+
+    /// <summary>
+    /// Prepares a sealed batch's records for send, compressing when configured. Runs on a
+    /// worker after the batch is enqueued, outside producer caller threads and outside the
+    /// partition rotation gate. Record bytes are already encoded at append time, so this step
+    /// either leaves the arena-backed records in place or compresses those encoded bytes.
+    ///
+    /// Thread safety: the batch is already sealed and detached from its mutable
+    /// <see cref="PartitionBatch"/>, so no append thread can modify it. The drain loop skips
+    /// batches where <see cref="ReadyBatch.IsPreSerialized"/> is false, so the sender only
+    /// picks up wire-ready batches.
+    /// </summary>
+    private bool PrepareBatchForPublish(ReadyBatch readyBatch)
+    {
+        Exception? failure = null;
         try
         {
             readyBatch.RecordBatch.PreCompress(_options.CompressionType, _compressionCodecs);
@@ -2954,13 +3004,15 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            // Fail delivery tasks so callers aren't stuck waiting, then mark ready
-            // so subsequent batches in this partition aren't permanently blocked.
-            readyBatch.Fail(ex);
+            failure = ex;
         }
 
         // Mark pre-serialization complete so the drain loop can pick up this batch.
         readyBatch.MarkPreSerialized();
+        if (failure is null)
+            return !readyBatch.IsSendCompleted;
+
+        return readyBatch.FailFromPreSerialization(failure);
     }
 
     /// <summary>
@@ -3521,7 +3573,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         if (sealedBatch is null)
             return false;
 
-        PublishSealedBatch(sealedBatch, signalWakeup: false);
+        StartPreSerialization(sealedBatch);
         return true;
     }
 
@@ -3851,7 +3903,7 @@ public sealed partial class RecordAccumulator : IAsyncDisposable
         {
             foreach (var currentBatch in currentBatches)
             {
-                var readyBatch = CompleteDetachedBatch(currentBatch);
+                var readyBatch = CompleteDetachedBatch(currentBatch, preSerialize: false);
                 if (readyBatch is not null)
                 {
                     readyBatches ??= new List<ReadyBatch>();
@@ -5138,7 +5190,7 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
 
     /// <summary>
     /// Whether the batch's records have been pre-serialized (and compressed, when
-    /// configured). Set after <see cref="RecordAccumulator.PreSerializeBatch"/> finishes.
+    /// configured). Set after <see cref="RecordAccumulator.PrepareBatchForPublish"/> finishes.
     /// The drain loop skips batches where this is false so the per-broker send loop
     /// only ever handles wire-ready payloads.
     /// Uses Volatile reads for lock-free checking from the sender thread.
@@ -5152,11 +5204,33 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
 
     /// <summary>
     /// Marks pre-serialization as complete. Called by
-    /// <see cref="RecordAccumulator.PreSerializeBatch"/> after the records are encoded
+    /// <see cref="RecordAccumulator.PrepareBatchForPublish"/> after the records are encoded
     /// (and compressed, when configured).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void MarkPreSerialized() => Volatile.Write(ref _preSerialized, 1);
+
+    internal void SetPreSerializationTask(Task task)
+    {
+        Volatile.Write(ref _preSerializationTask, task);
+    }
+
+    internal void StartPreSerializationTask()
+    {
+        var task = Volatile.Read(ref _preSerializationTask)
+            ?? throw new InvalidOperationException("Pre-serialization task was not created.");
+
+        task.Start(TaskScheduler.Default);
+    }
+
+    internal void WaitForPreSerializationIfStarted()
+    {
+        var task = Volatile.Read(ref _preSerializationTask);
+        if (task is null || task.IsCompleted)
+            return;
+
+        task.GetAwaiter().GetResult();
+    }
 
     /// <summary>
     /// Whether BufferMemory has already been released for this batch.
@@ -5227,12 +5301,15 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
     private int _sendCompleted; // 0 = not done, 1 = done (prevents concurrent CompleteSend/Fail)
     internal int _returnedToPool; // 0 = not returned, 1 = returned (prevents double pool return)
     private int _generation; // Incremented on each Initialize() — detects batch object recycling
+    private Task? _preSerializationTask;
 
     /// <summary>
     /// True when this batch has been returned to the pool. The authoritative signal for
     /// "batch is no longer live" — set atomically by ReturnReadyBatch before Reset() runs.
     /// </summary>
     internal bool IsReturnedToPool => Volatile.Read(ref _returnedToPool) != 0;
+
+    internal bool IsSendCompleted => Volatile.Read(ref _sendCompleted) != 0;
 
     /// <summary>
     /// Monotonically increasing counter, incremented on each Initialize(). Used to detect
@@ -5275,6 +5352,7 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
         Interlocked.Exchange(ref _returnedToPool, 0);
         Interlocked.Exchange(ref _memoryReleased, 0);
         Volatile.Write(ref _preSerialized, 0);
+        Volatile.Write(ref _preSerializationTask, null);
         Interlocked.Increment(ref _generation);
 
         _topicPartition = topicPartition;
@@ -5472,11 +5550,20 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
     /// DoneTask completes with false (no exception) to avoid UnobservedTaskException.
     /// </summary>
     public void Fail(Exception exception)
+        => FailCore(exception, waitForPreSerialization: true);
+
+    internal bool FailFromPreSerialization(Exception exception)
+        => FailCore(exception, waitForPreSerialization: false);
+
+    private bool FailCore(Exception exception, bool waitForPreSerialization)
     {
         // Atomic entry guard: only one thread can execute Fail/CompleteSend.
         // Separate from _cleanedUp so Cleanup() in the finally block still runs.
         if (Interlocked.Exchange(ref _sendCompleted, 1) != 0)
-            return;
+            return false;
+
+        if (waitForPreSerialization)
+            WaitForPreSerializationIfStarted();
 
         try
         {
@@ -5534,6 +5621,8 @@ internal sealed class ReadyBatch : IValueTaskSource<bool>
         {
             Cleanup();
         }
+
+        return true;
     }
 
     /// <summary>
