@@ -250,6 +250,7 @@ internal sealed partial class KafkaShareConsumer<TKey, TValue> : IKafkaShareCons
                     MaxBytes = _options.FetchMaxBytes,
                     MaxRecords = maxRecords,
                     BatchSize = maxRecords,
+                    ShareAcquireMode = (sbyte)_options.ShareAcquireMode,
                     Topics = topics
                 };
 
@@ -345,9 +346,12 @@ internal sealed partial class KafkaShareConsumer<TKey, TValue> : IKafkaShareCons
                             if (recordCount >= _options.MaxPollRecords)
                                 break;
 
-                            // Track only records actually yielded to the consumer so we don't
-                            // silently acknowledge offsets truncated by MaxPollRecords.
-                            _ackTracker.TrackDeliveredRecords(tp, result.Offset, result.Offset);
+                            // Track only records actually yielded to the consumer so implicit
+                            // acknowledgements do not include offsets truncated by MaxPollRecords.
+                            if (_options.AcknowledgementMode == ShareAcknowledgementMode.Implicit)
+                            {
+                                _ackTracker.TrackDeliveredRecords(tp, result.Offset, result.Offset);
+                            }
 
                             recordCount++;
                             yield return result;
@@ -367,7 +371,11 @@ internal sealed partial class KafkaShareConsumer<TKey, TValue> : IKafkaShareCons
 
         record.AcknowledgeType = type;
         var tp = new TopicPartition(record.Topic, record.Partition);
-        _ackTracker.Acknowledge(tp, record.Offset, type);
+        _ackTracker.Acknowledge(
+            tp,
+            record.Offset,
+            type,
+            requireTracked: _options.AcknowledgementMode == ShareAcknowledgementMode.Implicit);
     }
 
     public async ValueTask CommitAsync(CancellationToken cancellationToken = default)
@@ -616,6 +624,7 @@ internal sealed partial class KafkaShareConsumer<TKey, TValue> : IKafkaShareCons
                 MinBytes = 0,
                 MaxBytes = 0,
                 MaxRecords = shareFetchVersion >= 1 ? 1 : 0,
+                ShareAcquireMode = (sbyte)_options.ShareAcquireMode,
                 Topics = topics
             };
 
