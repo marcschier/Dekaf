@@ -1,8 +1,10 @@
 using System.Diagnostics;
+#if NET10_0_OR_GREATER
 using Dekaf.Compression;
 using Dekaf.Compression.Lz4;
 using Dekaf.Compression.Snappy;
 using Dekaf.Compression.Zstd;
+#endif
 using Microsoft.Extensions.Logging;
 
 [assembly: Timeout(300_000)] // 5 minutes per test — prevents indefinite hangs
@@ -26,9 +28,11 @@ internal sealed class GlobalTestSetup
         // causing tests to hang until the orphan sweep (360s) fires.
         ThreadPool.SetMinThreads(32, 32);
 
+#if NET10_0_OR_GREATER
         CompressionCodecRegistry.Default.AddLz4();
         CompressionCodecRegistry.Default.AddSnappy();
         CompressionCodecRegistry.Default.AddZstd();
+#endif
 
 #if DEBUG
         // Enable Debug.WriteLine output on Linux (where no default trace listener writes to console).

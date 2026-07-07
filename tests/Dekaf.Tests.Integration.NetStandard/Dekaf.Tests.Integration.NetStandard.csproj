@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- net8.0 host consuming Dekaf's netstandard2.0 asset: exercises the ns2.0 core at runtime.
+         This project deliberately does NOT receive InternalsVisibleTo, so it consumes Dekaf exactly
+         as an external net8 package consumer would (no ns2.0 polyfill types leaking in via IVT). -->
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>net8.0</TargetFrameworks>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- Root namespace/assembly kept distinct from the net10 integration project. -->
+    <AssemblyName>Dekaf.Tests.Integration.NetStandard</AssemblyName>
+    <RootNamespace>Dekaf.Tests.Integration</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Dekaf core resolves to the netstandard2.0 asset for a net8 consumer. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Dekaf\Dekaf.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="TUnit" Version="1.58.0" />
+    <PackageReference Include="TUnit.Logging.Microsoft" Version="1.58.0" />
+    <PackageReference Include="Testcontainers.Kafka" Version="4.13.0" />
+    <PackageReference Include="Microsoft.Testing.Extensions.HangDump" Version="2.2.3" />
+    <!-- Dekaf's netstandard2.0 public API surfaces IAsyncDisposable/IAsyncEnumerable via
+         Microsoft.Bcl.AsyncInterfaces; a net8 consumer must reference it (it type-forwards to the BCL). -->
+    <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Version="10.0.9" />
+  </ItemGroup>
+
+  <!-- Shared test infrastructure + the end-to-end round-trip test, linked from the net10 project. -->
+  <ItemGroup>
+    <Compile Include="..\Dekaf.Tests.Integration\GlobalTestSetup.cs" Link="GlobalTestSetup.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\LoggerFactoryFixture.cs" Link="LoggerFactoryFixture.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\SupportsKafkaAttribute.cs" Link="SupportsKafkaAttribute.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\SkipWhenNativeAotAttribute.cs" Link="SkipWhenNativeAotAttribute.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\KafkaTestContainer.cs" Link="KafkaTestContainer.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\KafkaContainer40.cs" Link="KafkaContainer40.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\KafkaContainer41.cs" Link="KafkaContainer41.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\KafkaContainer42.cs" Link="KafkaContainer42.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\KafkaIntegrationTest.cs" Link="KafkaIntegrationTest.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\RoundTripTests.cs" Link="RoundTripTests.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\ProducerTestExtensions.cs" Link="ProducerTestExtensions.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\ProducerTests.cs" Link="ProducerTests.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\ConsumerTests.cs" Link="ConsumerTests.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\ConsumerGroupTests.cs" Link="ConsumerGroupTests.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\AdminClientTests.cs" Link="AdminClientTests.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\HeaderRoundTripTests.cs" Link="HeaderRoundTripTests.cs" />
+    <Compile Include="..\Dekaf.Tests.Integration\MultiPartitionTests.cs" Link="MultiPartitionTests.cs" />
+  </ItemGroup>
+
+</Project>
